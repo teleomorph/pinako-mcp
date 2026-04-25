@@ -1,0 +1,27 @@
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+installer/node_modules/
+
+# Tauri build artifacts
+installer/src-tauri/target/
+
+# Transient build files
+setup/_service-embedded.js
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log

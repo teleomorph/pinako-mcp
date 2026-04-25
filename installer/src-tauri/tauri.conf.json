@@ -1,0 +1,27 @@
+{
+  "productName": "Pinako AI Bridge",
+  "version": "1.0.0",
+  "identifier": "pro.pinako.installer",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Pinako AI Bridge Setup",
+        "width": 700,
+        "height": 520,
+        "resizable": false,
+        "center": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

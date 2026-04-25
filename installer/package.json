@@ -1,0 +1,12 @@
+{
+  "name": "pinako-installer",
+  "version": "1.0.0",
+  "scripts": {
+    "tauri": "tauri",
+    "build": "tauri build",
+    "dev": "tauri dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pinako AI Bridge Setup</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #1a1a1a;
+      --surface:     #222222;
+      --border:      #4c2392;
+      --accent:      #3d9f8e;
+      --accent-dim:  rgba(61,159,142,0.12);
+      --text:        #cbcbcb;
+      --sub:         #888888;
+      --success:     #57b57a;
+      --warn:        #d4953a;
+    }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      user-select: none;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    /* ── Header ──────────────────────────────────────────────────────────── */
+    header {
+      flex-shrink: 0;
+      height: 108px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-bottom: 1px solid var(--border);
+      padding: 0 40px;
+    }
+
+    #wordmark-wrap {
+      position: relative;
+      display: inline-block;
+      overflow: visible;
+    }
+
+    #wordmark {
+      max-width: 200px;
+      display: block;
+      position: relative;
+      z-index: 2;
+      filter: drop-shadow(0 0 0 rgba(165,44,221,0));
+      transition: filter 1300ms ease;
+    }
+
+    #streak-line {
+      position: absolute;
+      left: 0; top: 50%;
+      width: 100%; height: 0.8px;
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(-50%);
+      z-index: 1;
+      background: linear-gradient(90deg,
+        transparent,
+        rgba(165,44,221,0.22) 30%,
+        rgba(165,44,221,0.48) 50%,
+        rgba(165,44,221,0.22) 70%,
+        transparent);
+      transition: opacity 220ms ease;
+    }
+
+    #streak-dot {
+      position: absolute;
+      left: 0; top: 50%;
+      width: 38px; height: 3px;
+      pointer-events: none;
+      opacity: 0;
+      transform: translate(-115%, -50%);
+      z-index: 1;
+      border-radius: 999px;
+      background: radial-gradient(ellipse at center,
+        rgba(255,255,255,0.92) 0%,
+        rgba(165,44,221,0.82) 42%,
+        rgba(165,44,221,0) 78%);
+      filter: drop-shadow(0 0 4px rgba(255,255,255,0.5))
+              drop-shadow(0 0 10px rgba(165,44,221,0.65));
+    }
+
+    /* ── Content area ─────────────────────────────────────────────────────── */
+    main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 44px 24px;
+    }
+
+    .screen { display: none; }
+    .screen.active { display: block; }
+
+    h2 {
+      font-size: 19px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 14px;
+    }
+
+    p {
+      color: var(--sub);
+      margin-bottom: 10px;
+    }
+
+    p.lead { color: var(--text); font-size: 14.5px; }
+    p.terms { font-size: 12px; margin-top: 18px; }
+    p.terms a { color: var(--accent); text-decoration: none; cursor: pointer; }
+    p.terms a:hover { text-decoration: underline; }
+
+    /* ── App list ──────────────────────────────────────────────────────────── */
+    .app-list { margin-top: 4px; }
+
+    .app-item {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 11px 16px;
+      margin-bottom: 7px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      cursor: pointer;
+      transition: border-color 0.14s;
+    }
+
+    .app-item:hover { border-color: var(--accent); }
+
+    .app-item input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .app-item .app-body { flex: 1; }
+    .app-item .app-name { color: var(--text); font-size: 14px; }
+    .app-item .app-note { color: var(--sub); font-size: 11px; margin-top: 2px; }
+
+    /* ── Install log ──────────────────────────────────────────────────────── */
+    .log-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px 18px;
+      font-family: 'Consolas', 'Cascadia Code', 'Courier New', monospace;
+      font-size: 12.5px;
+      min-height: 140px;
+      line-height: 2;
+    }
+
+    .log-line          { color: var(--sub); }
+    .log-line.success  { color: var(--success); }
+    .log-line.warn     { color: var(--warn); }
+
+    /* ── Done screen ──────────────────────────────────────────────────────── */
+    .mcp-box {
+      margin: 20px 0 14px;
+      padding: 14px 18px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      border-radius: 6px;
+    }
+
+    .mcp-label {
+      display: block;
+      font-size: 10.5px;
+      color: var(--sub);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+
+    .mcp-url {
+      font-family: 'Consolas', 'Cascadia Code', 'Courier New', monospace;
+      font-size: 14px;
+      color: var(--accent);
+    }
+
+    .docs-btn {
+      display: inline-block;
+      margin-top: 16px;
+      padding: 8px 20px;
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      border-radius: 5px;
+      font-size: 13.5px;
+      cursor: pointer;
+      transition: background 0.14s;
+    }
+
+    .docs-btn:hover { background: var(--accent-dim); }
+
+    /* ── Footer ───────────────────────────────────────────────────────────── */
+    footer {
+      flex-shrink: 0;
+      height: 62px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 44px;
+      border-top: 1px solid var(--border);
+    }
+
+    .dots { display: flex; gap: 7px; align-items: center; }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--border);
+      transition: background 0.2s;
+    }
+
+    .dot.active { background: var(--accent); }
+
+    .nav { display: flex; gap: 10px; }
+
+    button.btn {
+      padding: 7px 22px;
+      border-radius: 5px;
+      font-size: 13.5px;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      transition: background 0.14s, opacity 0.14s;
+    }
+
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover { background: #2a2a2a; }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .btn-primary:hover { background: #46b5a3; }
+    .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+  <!-- ── Header ────────────────────────────────────────────────────────────── -->
+  <header>
+    <div id="wordmark-wrap">
+      <img id="wordmark" src="images/wordmark.png" alt="Pinako">
+      <div id="streak-line"></div>
+      <div id="streak-dot"></div>
+    </div>
+  </header>
+
+  <!-- ── Wizard screens ────────────────────────────────────────────────────── -->
+  <main>
+
+    <!-- Screen 0: Welcome -->
+    <div class="screen" id="s-welcome">
+      <h2>Welcome to Pinako AI Bridge</h2>
+      <p class="lead">
+        This connects your AI apps to your Pinako tab trees.
+      </p>
+      <p>
+        Your AI assistant will be able access and navigate your tabs,
+        libraries, notes, tags, memos and chronology, all through natural language.
+      </p>
+      <p>
+        The installer will detect your AI apps, write their MCP config files,
+        and install the Pinako MCP service to
+        <code style="font-size:12px;color:var(--sub)" id="install-path">%APPDATA%\Pinako\</code>.
+      </p>
+      <p class="terms">
+        By clicking Next, you agree to
+        <a onclick="openLink('https://pinako.pro/terms')">pinako.pro/terms</a>.
+      </p>
+    </div>
+
+    <!-- Screen 1: App selection -->
+    <div class="screen" id="s-apps">
+      <h2>Configure AI Apps</h2>
+      <div id="apps-detected">
+        <p>The following apps were detected. Select which to configure:</p>
+        <div class="app-list" id="app-list"></div>
+      </div>
+      <div id="apps-none" class="hidden">
+        <p class="lead">No supported AI apps found on this computer.</p>
+        <p>
+          Pinako AI Bridge will still be installed. After setting up a supported app
+          (Claude Code, Cursor, Windsurf, Cline, Roo Code, or Continue.dev),
+          re-run this installer to configure it.
+        </p>
+      </div>
+    </div>
+
+    <!-- Screen 2: Installing -->
+    <div class="screen" id="s-installing">
+      <h2>Installing…</h2>
+      <div class="log-box" id="install-log"></div>
+    </div>
+
+    <!-- Screen 3: Done -->
+    <div class="screen" id="s-done">
+      <h2>Installation Complete</h2>
+      <p class="lead">Pinako AI Bridge has been installed successfully.</p>
+      <div class="mcp-box">
+        <span class="mcp-label">MCP Server URL</span>
+        <span class="mcp-url">http://localhost:37421/mcp</span>
+      </div>
+      <p>Restart any configured AI apps to pick up the new settings.</p>
+      <p>If your AI app doesn't see your Pinako trees right away, click the
+      Pinako icon in your browser toolbar to activate the connection.</p>
+      <button class="docs-btn" onclick="openLink('https://pinako.pro/docs/ai-connect')">
+        Open Documentation
+      </button>
+    </div>
+
+  </main>
+
+  <!-- ── Footer ────────────────────────────────────────────────────────────── -->
+  <footer>
+    <div class="dots">
+      <div class="dot" id="dot-0"></div>
+      <div class="dot" id="dot-1"></div>
+      <div class="dot" id="dot-2"></div>
+    </div>
+    <div class="nav">
+      <button id="btn-back" class="btn btn-secondary hidden" onclick="back()">Back</button>
+      <button id="btn-next" class="btn btn-primary" onclick="next()">Next</button>
+    </div>
+  </footer>
+
+  <script src="wizard.js"></script>
+</body>
+</html>

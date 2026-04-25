@@ -1,0 +1,19 @@
+{
+  "name": "pinako-mcp",
+  "version": "1.0.0",
+  "description": "MCP server bridge for Pinako browser extension (read-only)",
+  "type": "module",
+  "scripts": {
+    "install-host": "node install.js",
+    "build": "node setup/build.js",
+    "build:all": "node setup/build.js --all"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.25.67"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "pkg": "^5.8.1"
+  }
+}
