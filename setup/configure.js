@@ -8,8 +8,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { SERVICE_PATH } from './paths.js';
 
-const MCP_URL = 'http://localhost:37421/mcp';
+const MCP_URL = 'http://127.0.0.1:37421/mcp';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -54,10 +55,12 @@ const writers = {
     const config = readJson(configPath);
     config.mcpServers = config.mcpServers || {};
     // Claude Desktop only supports stdio MCP servers (command + args).
-    // mcp-remote is the official Anthropic-recommended bridge from stdio to HTTP.
+    // Use the bundled pinako-mcp-service binary in --stdio-mcp mode as a
+    // self-contained stdio↔HTTP bridge — no Node.js dependency on the
+    // end user's machine.
     config.mcpServers.pinako = {
-      command: 'npx',
-      args: ['-y', 'mcp-remote', MCP_URL],
+      command: SERVICE_PATH,
+      args: ['--stdio-mcp', MCP_URL],
     };
     writeJson(configPath, config);
   },

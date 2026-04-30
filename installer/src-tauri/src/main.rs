@@ -4,7 +4,7 @@
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-const MCP_URL:   &str = "http://localhost:37421/mcp";
+const MCP_URL:   &str = "http://127.0.0.1:37421/mcp";
 const HOST_NAME: &str = "com.pinako.mcp";
 
 // Hardcode once the extension is published to the Chrome Web Store.
@@ -136,10 +136,13 @@ fn write_claude_desktop_config(path: &Path) -> Result<(), String> {
     let mut cfg = read_json(path);
     ensure_obj(&mut cfg, "mcpServers");
     // Claude Desktop only supports stdio MCP servers (command + args).
-    // mcp-remote is the official Anthropic-recommended bridge from stdio to HTTP.
+    // Use the bundled pinako-mcp-service binary in --stdio-mcp mode as a
+    // self-contained stdio↔HTTP bridge — no Node.js dependency on the
+    // end user's machine.
+    let service_path = pinako_dir().join(service_binary_name());
     cfg["mcpServers"]["pinako"] = serde_json::json!({
-        "command": "npx",
-        "args": ["-y", "mcp-remote", MCP_URL],
+        "command": service_path.to_string_lossy(),
+        "args": ["--stdio-mcp", MCP_URL],
     });
     write_json(path, &cfg)
 }

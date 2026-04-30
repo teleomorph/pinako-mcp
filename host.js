@@ -14,6 +14,8 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { z } from 'zod';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -69,6 +71,22 @@ function logRequest(label, req, body) {
 const MCP_PORT = 37421;
 const STDIN_GRACE_MS = 30_000;
 
+// ─── Mode detection ───────────────────────────────────────────────────────────
+// --stdio-mcp <URL>: act as a stdio MCP server that proxies to a local HTTP MCP
+// server. Used by Claude Desktop, whose mcpServers schema only accepts
+// command + args (no direct HTTP URLs). Same binary, different mode.
+const BRIDGE_URL = (() => {
+  const idx = process.argv.indexOf('--stdio-mcp');
+  if (idx === -1) return null;
+  const url = process.argv[idx + 1];
+  if (!url) {
+    process.stderr.write('Error: --stdio-mcp requires a URL argument\n');
+    process.stderr.write('Usage: pinako-mcp-service --stdio-mcp http://localhost:37421/mcp\n');
+    process.exit(1);
+  }
+  return url;
+})();
+
 // ─── In-memory cache ─────────────────────────────────────────────────────────
 let cachedData = null; // { tree, libraries, globalNotes, updatedAt }
 let extensionConnected = false;
@@ -112,30 +130,35 @@ function handleNmMessage(msg) {
   }
 }
 
-process.stdin.on('data', (chunk) => {
-  stdinBuf = Buffer.concat([stdinBuf, chunk]);
-  // Drain complete messages from the buffer
-  while (stdinBuf.length >= 4) {
-    const msgLen = stdinBuf.readUInt32LE(0);
-    if (stdinBuf.length < 4 + msgLen) break;
-    const msgBody = stdinBuf.slice(4, 4 + msgLen);
-    stdinBuf = stdinBuf.slice(4 + msgLen);
-    try {
-      handleNmMessage(JSON.parse(msgBody.toString('utf8')));
-    } catch (e) {
-      process.stderr.write(`[pinako-mcp] Bad message: ${e.message}\n`);
+// Native messaging stdin handlers run only in default mode (Chrome NM host).
+// In stdio-bridge mode, stdin carries MCP JSON-RPC and is owned by
+// StdioServerTransport, not by Chrome's length-prefixed protocol.
+if (!BRIDGE_URL) {
+  process.stdin.on('data', (chunk) => {
+    stdinBuf = Buffer.concat([stdinBuf, chunk]);
+    // Drain complete messages from the buffer
+    while (stdinBuf.length >= 4) {
+      const msgLen = stdinBuf.readUInt32LE(0);
+      if (stdinBuf.length < 4 + msgLen) break;
+      const msgBody = stdinBuf.slice(4, 4 + msgLen);
+      stdinBuf = stdinBuf.slice(4 + msgLen);
+      try {
+        handleNmMessage(JSON.parse(msgBody.toString('utf8')));
+      } catch (e) {
+        process.stderr.write(`[pinako-mcp] Bad message: ${e.message}\n`);
+      }
     }
-  }
-});
+  });
 
-process.stdin.on('end', () => {
-  extensionConnected = false;
-  process.stderr.write('[pinako-mcp] Extension disconnected. Serving stale cache for 30s.\n');
-  shutdownTimer = setTimeout(() => {
-    process.stderr.write('[pinako-mcp] Grace period expired. Exiting.\n');
-    process.exit(0);
-  }, STDIN_GRACE_MS);
-});
+  process.stdin.on('end', () => {
+    extensionConnected = false;
+    process.stderr.write('[pinako-mcp] Extension disconnected. Serving stale cache for 30s.\n');
+    shutdownTimer = setTimeout(() => {
+      process.stderr.write('[pinako-mcp] Grace period expired. Exiting.\n');
+      process.exit(0);
+    }, STDIN_GRACE_MS);
+  });
+}
 
 // ─── Data helpers ─────────────────────────────────────────────────────────────
 const STRIP_KEYS = new Set([
@@ -403,28 +426,110 @@ const httpServer = http.createServer(async (req, res) => {
   }
 });
 
-httpServer.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') {
-    process.stderr.write(`[pinako-mcp] Port ${MCP_PORT} in use — relaying to existing instance.\n`);
-    forwardToExisting = (data) => {
-      const body = JSON.stringify({ data });
-      const r = http.request(
-        { hostname: '127.0.0.1', port: MCP_PORT, path: '/update', method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
-        () => { process.stderr.write('[pinako-mcp] Relayed tree update.\n'); }
-      );
-      r.on('error', (err) => { process.stderr.write(`[pinako-mcp] Relay error: ${err.message}\n`); });
-      r.write(body); r.end();
-    };
-    nmWrite({ type: 'getTree' });
-  } else {
-    process.stderr.write(`[pinako-mcp] HTTP error: ${e.message}\n`);
-    process.exit(1);
-  }
-});
+// HTTP server only listens in default mode. The bridge mode is purely a
+// stdio↔HTTP proxy and never opens a port itself.
+if (!BRIDGE_URL) {
+  httpServer.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      process.stderr.write(`[pinako-mcp] Port ${MCP_PORT} in use — relaying to existing instance.\n`);
+      forwardToExisting = (data) => {
+        const body = JSON.stringify({ data });
+        const r = http.request(
+          { hostname: '127.0.0.1', port: MCP_PORT, path: '/update', method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+          () => { process.stderr.write('[pinako-mcp] Relayed tree update.\n'); }
+        );
+        r.on('error', (err) => { process.stderr.write(`[pinako-mcp] Relay error: ${err.message}\n`); });
+        r.write(body); r.end();
+      };
+      nmWrite({ type: 'getTree' });
+    } else {
+      process.stderr.write(`[pinako-mcp] HTTP error: ${e.message}\n`);
+      process.exit(1);
+    }
+  });
 
-httpServer.listen(MCP_PORT, '127.0.0.1', () => {
-  extensionConnected = true;
-  process.stderr.write(`[pinako-mcp] Listening on http://127.0.0.1:${MCP_PORT}/mcp\n`);
-  nmWrite({ type: 'getTree' });
-});
+  httpServer.listen(MCP_PORT, '127.0.0.1', () => {
+    extensionConnected = true;
+    process.stderr.write(`[pinako-mcp] Listening on http://127.0.0.1:${MCP_PORT}/mcp\n`);
+    nmWrite({ type: 'getTree' });
+  });
+}
+
+// ─── Stdio MCP bridge mode ────────────────────────────────────────────────────
+// When invoked with `--stdio-mcp <URL>`, act as a stdio MCP server that proxies
+// every JSON-RPC message to a local HTTP MCP server. Used by Claude Desktop,
+// whose mcpServers config only accepts stdio subprocesses (command + args).
+// Replaces the need for `npx mcp-remote` and the Node.js dependency on the
+// end user's machine.
+async function runStdioBridge(httpUrl) {
+  const stdio  = new StdioServerTransport();
+  const remote = new StreamableHTTPClientTransport(new URL(httpUrl));
+
+  // stdio (from Claude Desktop) → remote (HTTP MCP server)
+  stdio.onmessage = async (msg) => {
+    try {
+      await remote.send(msg);
+    } catch (err) {
+      process.stderr.write(`[stdio-mcp] forward error: ${err.message}\n`);
+      // Return a JSON-RPC error if this was a request (has id)
+      if (msg && msg.id !== undefined && msg.id !== null) {
+        try {
+          await stdio.send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: {
+              code: -32603,
+              message: `Pinako bridge: ${err.message}. Make sure the Pinako extension is open.`,
+            },
+          });
+        } catch (_) { /* stdio gone, give up */ }
+      }
+    }
+  };
+
+  // remote → stdio (forward responses back to Claude Desktop)
+  remote.onmessage = async (msg) => {
+    try {
+      await stdio.send(msg);
+    } catch (err) {
+      process.stderr.write(`[stdio-mcp] reply error: ${err.message}\n`);
+    }
+  };
+
+  remote.onerror = (err) => {
+    process.stderr.write(`[stdio-mcp] remote transport error: ${err.message}\n`);
+  };
+  stdio.onerror = (err) => {
+    process.stderr.write(`[stdio-mcp] stdio transport error: ${err.message}\n`);
+  };
+
+  // Start stdio first (always succeeds — local pipes only).
+  await stdio.start();
+
+  // Try to connect to the remote, but stay alive even if the extension
+  // isn't open yet. Per-call errors give a useful message; restarting
+  // Claude Desktop after opening Pinako isn't required.
+  try {
+    await remote.start();
+    process.stderr.write(`[stdio-mcp] connected to ${httpUrl}\n`);
+  } catch (err) {
+    process.stderr.write(`[stdio-mcp] could not connect to ${httpUrl} yet: ${err.message}\n`);
+    process.stderr.write(`[stdio-mcp] open the Pinako extension and tools will start working.\n`);
+  }
+
+  // Shut down cleanly when Claude Desktop closes the stdio pipe.
+  process.stdin.on('end', async () => {
+    process.stderr.write('[stdio-mcp] stdin closed, shutting down\n');
+    try { await stdio.close();  } catch (_) {}
+    try { await remote.close(); } catch (_) {}
+    process.exit(0);
+  });
+}
+
+if (BRIDGE_URL) {
+  runStdioBridge(BRIDGE_URL).catch((err) => {
+    process.stderr.write(`[pinako-mcp stdio bridge] fatal: ${err.message}\n`);
+    process.exit(1);
+  });
+}
