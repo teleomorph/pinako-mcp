@@ -10,6 +10,15 @@
  * Extension ID:
  *   - Production: hardcode PROD_EXT_ID once published to Chrome Web Store
  *   - Development: pass via PINAKO_EXT_ID env var or --ext-id CLI arg
+ *
+ * Allow additional extension IDs alongside the primary one (e.g. to keep both
+ * a dev unpacked install and the prod CWS install working on the same
+ * machine):
+ *   - PINAKO_DEV_EXT_ID env var (single extra ID)
+ *   - --also-allow=<id> CLI arg (repeatable)
+ *
+ * Re-installs merge into the existing manifest rather than replacing it, so
+ * previously-granted IDs are preserved.
  */
 
 import fs from 'node:fs';
@@ -45,6 +54,41 @@ function getExtId() {
   return null;
 }
 
+// Additional extension IDs to keep allowed alongside the primary one.
+// Useful when the developer wants both their dev unpacked extension and
+// the prod CWS extension to access the host on the same machine.
+//   PINAKO_DEV_EXT_ID=<id>            (env var, single ID)
+//   --also-allow=<id> [--also-allow=<id> ...]  (CLI, repeatable)
+function getExtraExtIds() {
+  const ids = new Set();
+  const envId = process.env.PINAKO_DEV_EXT_ID;
+  if (envId && /^[a-z]{32}$/.test(envId)) ids.add(envId);
+  for (const arg of process.argv) {
+    if (arg.startsWith('--also-allow=')) {
+      const id = arg.split('=')[1];
+      if (/^[a-z]{32}$/.test(id)) ids.add(id);
+    }
+  }
+  return [...ids];
+}
+
+// Read existing allowed_origins from a previously-written manifest, if any.
+// Returns an array of valid chrome-extension URLs (silently drops malformed
+// entries). Returns [] when the file is missing or unreadable.
+function readExistingAllowedOrigins() {
+  try {
+    if (!fs.existsSync(MANIFEST_PATH)) return [];
+    const raw = fs.readFileSync(MANIFEST_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed.allowed_origins)) return [];
+    return parsed.allowed_origins.filter(
+      o => typeof o === 'string' && /^chrome-extension:\/\/[a-z]{32}\/$/.test(o)
+    );
+  } catch {
+    return [];
+  }
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -66,17 +110,31 @@ export function installNativeHost() {
     // 1. Ensure Pinako data directory exists
     fs.mkdirSync(PINAKO_DIR, { recursive: true });
 
-    // 2. Write native host manifest
+    // 2. Compute allowed_origins: primary ID + any extras + previously-allowed
+    //    IDs from an existing manifest. Merging (rather than replacing) means
+    //    a re-install never silently revokes access from an extension that
+    //    was working before — e.g., the developer's dev unpacked install
+    //    when running an installer hardcoded to the prod ID.
+    const allowed = new Set();
+    allowed.add(`chrome-extension://${extId}/`);
+    for (const extra of getExtraExtIds()) {
+      allowed.add(`chrome-extension://${extra}/`);
+    }
+    for (const existing of readExistingAllowedOrigins()) {
+      allowed.add(existing);
+    }
+
+    // 3. Write native host manifest
     const manifest = {
       name: HOST_NAME,
       description: 'Pinako MCP bridge — connects Pinako extension to AI clients',
       path: SERVICE_PATH,
       type: 'stdio',
-      allowed_origins: [`chrome-extension://${extId}/`],
+      allowed_origins: [...allowed],
     };
     fs.writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
 
-    // 3. Platform-specific registration
+    // 4. Platform-specific registration
     if (PLATFORM === 'win32') {
       // Windows: registry key pointing to manifest
       const regKey = `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${HOST_NAME}`;
