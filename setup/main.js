@@ -164,7 +164,7 @@ async function main() {
 
   if (found.length === 0) {
     console.log(yellow('  No supported AI apps found on this machine.'));
-    console.log(dim('  Install Claude Code, Cursor, Windsurf, Cline, Roo Code, or Continue.dev'));
+    console.log(dim('  Install Claude Code, Claude Desktop, Cursor, Windsurf, Cline, Roo Code, or Continue.dev'));
     console.log(dim('  then re-run this installer.'));
     console.log('');
     await showFinalInstructions();
@@ -233,7 +233,7 @@ async function showFinalInstructions() {
   }
   console.log(`  ${bold(cyan('─────────────────────────────────────────────'))}`);
   console.log('');
-  console.log(`  For ${bold('Claude Desktop')} and other apps, see:`);
+  console.log(`  For other MCP-capable apps, see:`);
   console.log(`  ${cyan('https://pinako.pro/docs/ai-connect')}`);
   console.log('');
   console.log(`  ${bold('Open Pinako in Chrome first')} — the MCP server starts`);

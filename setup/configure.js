@@ -50,6 +50,18 @@ const writers = {
     writeJson(configPath, config);
   },
 
+  'claude-desktop'(configPath) {
+    const config = readJson(configPath);
+    config.mcpServers = config.mcpServers || {};
+    // Claude Desktop only supports stdio MCP servers (command + args).
+    // mcp-remote is the official Anthropic-recommended bridge from stdio to HTTP.
+    config.mcpServers.pinako = {
+      command: 'npx',
+      args: ['-y', 'mcp-remote', MCP_URL],
+    };
+    writeJson(configPath, config);
+  },
+
   'cursor'(configPath) {
     const config = readJson(configPath);
     config.mcpServers = config.mcpServers || {};

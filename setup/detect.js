@@ -14,9 +14,17 @@ import { HOME, APPDATA } from './paths.js';
 export const CLIENTS = [
   {
     id: 'claude-code',
-    label: 'Claude Code CLI',
+    label: 'Claude Code',
     configPath: path.join(HOME, '.claude', 'settings.json'),
     detectPath: path.join(HOME, '.claude'),
+    detectType: 'dir',
+    note: null,
+  },
+  {
+    id: 'claude-desktop',
+    label: 'Claude Desktop',
+    configPath: path.join(APPDATA, 'Claude', 'claude_desktop_config.json'),
+    detectPath: path.join(APPDATA, 'Claude'),
     detectType: 'dir',
     note: null,
   },

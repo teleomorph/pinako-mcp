@@ -86,14 +86,73 @@ fn client(id: &str, label: &str, detect: PathBuf, note: Option<&str>) -> ClientI
     }
 }
 
+fn local_appdata() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home().join("AppData").join("Local"))
+    }
+    #[cfg(target_os = "linux")]
+    { home().join(".local").join("share") }
+    #[cfg(target_os = "macos")]
+    { home().join("Library").join("Application Support") }
+}
+
+/// Locate Claude Desktop's data directory when installed via MSIX (Microsoft Store).
+/// MSIX-packaged apps store data under %LOCALAPPDATA%\Packages\<family>\LocalCache\Roaming\Claude.
+/// std::path's exists() can fail for MSIX-virtualized paths even when the data is reachable,
+/// so detection falls back to checking the package directory directly.
+fn find_msix_claude_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let packages = local_appdata().join("Packages");
+        if let Ok(entries) = std::fs::read_dir(&packages) {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if name.starts_with("Claude_") {
+                        return Some(packages.join(&name)
+                            .join("LocalCache").join("Roaming").join("Claude"));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_claude_desktop(appdata: &Path) -> ClientInfo {
+    let traditional = appdata.join("Claude");
+    let msix = find_msix_claude_dir();
+    ClientInfo {
+        id:       "claude-desktop".into(),
+        label:    "Claude Desktop".into(),
+        detected: traditional.exists() || msix.is_some(),
+        note:     None,
+    }
+}
+
+fn write_claude_desktop_config(path: &Path) -> Result<(), String> {
+    let mut cfg = read_json(path);
+    ensure_obj(&mut cfg, "mcpServers");
+    // Claude Desktop only supports stdio MCP servers (command + args).
+    // mcp-remote is the official Anthropic-recommended bridge from stdio to HTTP.
+    cfg["mcpServers"]["pinako"] = serde_json::json!({
+        "command": "npx",
+        "args": ["-y", "mcp-remote", MCP_URL],
+    });
+    write_json(path, &cfg)
+}
+
 /// Detect which AI clients are installed on this machine.
 #[tauri::command]
 fn detect_clients() -> Vec<ClientInfo> {
     let h = home();
     let a = appdata();
     vec![
-        client("claude-code", "Claude Code CLI",
+        client("claude-code", "Claude Code",
             h.join(".claude"), None),
+        detect_claude_desktop(&a),
         client("cursor", "Cursor",
             h.join(".cursor"), None),
         client("windsurf", "Windsurf",
@@ -224,14 +283,46 @@ fn install_native_host(pinako_dir: &Path, service_path: &Path) -> Result<(), Str
         return Err(format!("Invalid extension ID: {ext_id}"));
     }
 
-    // Write host manifest JSON to Pinako data dir
+    // Compute allowed_origins: primary ID + optional dev ID + any IDs already
+    // allowed by a previous install. Merging means re-installs never silently
+    // revoke access from extensions that worked before.
     let manifest_path = pinako_dir.join("pinako-native-host.json");
+    let mut allowed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    allowed.insert(format!("chrome-extension://{ext_id}/"));
+    if let Ok(dev_id) = std::env::var("PINAKO_DEV_EXT_ID") {
+        if dev_id.len() == 32 && dev_id.chars().all(|c| c.is_ascii_lowercase()) {
+            allowed.insert(format!("chrome-extension://{dev_id}/"));
+        }
+    }
+    if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
+        if let Ok(prev) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(arr) = prev.get("allowed_origins").and_then(|v| v.as_array()) {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        // Validate format before keeping: chrome-extension://<32 lowercase>/
+                        let valid = s.starts_with("chrome-extension://")
+                            && s.ends_with('/')
+                            && s.len() == "chrome-extension://".len() + 32 + 1
+                            && s["chrome-extension://".len()..s.len() - 1]
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase());
+                        if valid {
+                            allowed.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let allowed_vec: Vec<String> = allowed.into_iter().collect();
+
+    // Write host manifest JSON to Pinako data dir
     let manifest = serde_json::json!({
         "name":            HOST_NAME,
         "description":     "Pinako MCP bridge — connects Pinako extension to AI clients",
         "path":            service_path.to_string_lossy(),
         "type":            "stdio",
-        "allowed_origins": [format!("chrome-extension://{ext_id}/")]
+        "allowed_origins": allowed_vec
     });
     std::fs::write(
         &manifest_path,
@@ -293,13 +384,14 @@ fn install_native_host(pinako_dir: &Path, service_path: &Path) -> Result<(), Str
 
 fn client_label(id: &str) -> &str {
     match id {
-        "claude-code" => "Claude Code",
-        "cursor"      => "Cursor",
-        "windsurf"    => "Windsurf",
-        "cline"       => "Cline",
-        "roo-code"    => "Roo Code",
-        "continue"    => "Continue.dev",
-        other         => other,
+        "claude-code"    => "Claude Code",
+        "claude-desktop" => "Claude Desktop",
+        "cursor"         => "Cursor",
+        "windsurf"       => "Windsurf",
+        "cline"          => "Cline",
+        "roo-code"       => "Roo Code",
+        "continue"       => "Continue.dev",
+        other            => other,
     }
 }
 
@@ -332,6 +424,28 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             ensure_obj(&mut cfg, "mcpServers");
             cfg["mcpServers"]["pinako"] = serde_json::json!({ "type": "http", "url": MCP_URL });
             write_json(&path, &cfg)
+        }
+        "claude-desktop" => {
+            let mut errs: Vec<String> = Vec::new();
+            let mut wrote = false;
+
+            // Traditional installer location (used by Anthropic's standalone .exe install)
+            let trad = appdata.join("Claude").join("claude_desktop_config.json");
+            match write_claude_desktop_config(&trad) {
+                Ok(()) => wrote = true,
+                Err(e) => errs.push(format!("traditional: {e}")),
+            }
+
+            // MSIX (Microsoft Store) install also gets configured if present
+            if let Some(msix_dir) = find_msix_claude_dir() {
+                let msix = msix_dir.join("claude_desktop_config.json");
+                match write_claude_desktop_config(&msix) {
+                    Ok(()) => wrote = true,
+                    Err(e) => errs.push(format!("msix: {e}")),
+                }
+            }
+
+            if wrote { Ok(()) } else { Err(errs.join("; ")) }
         }
         "cursor" => {
             let path = home.join(".cursor").join("mcp.json");
