@@ -87,8 +87,13 @@ const BRIDGE_URL = (() => {
   return url;
 })();
 
-// ─── In-memory cache ─────────────────────────────────────────────────────────
-let cachedData = null; // { tree, libraries, globalNotes, updatedAt }
+// ─── In-memory cache (per browser) ────────────────────────────────────────────
+// Map<browserId, { tree, libraries, globalNotes, updatedAt, browserId, browserBrand }>.
+// Each Pinako install (Chrome, Brave, Edge, etc.) writes to its own entry,
+// keyed by the browser-side device id. Tools that take a `browser` arg pick
+// one entry; tools called without `browser` while >1 entries exist return an
+// "ambiguous, please specify" error so the AI prompts the user.
+const cachedData = new Map();
 let extensionConnected = false;
 let shutdownTimer = null;
 let forwardToExisting = null; // set on EADDRINUSE — forward data to old instance then exit
@@ -110,9 +115,11 @@ let stdinBuf = Buffer.alloc(0);
 
 function handleNmMessage(msg) {
   if (msg.type === 'treeUpdate' || msg.type === 'treeResponse') {
+    const browserId    = msg.browserId    || 'unknown';
+    const browserBrand = msg.browserBrand || 'Unknown';
     if (forwardToExisting) {
-      // EADDRINUSE path: forward data to old instance and exit
-      forwardToExisting(msg.data);
+      // EADDRINUSE path: forward this browser's data to the port-bound instance
+      forwardToExisting({ data: msg.data, browserId, browserBrand });
       return;
     }
     if (shutdownTimer) {
@@ -120,13 +127,15 @@ function handleNmMessage(msg) {
       shutdownTimer = null;
     }
     extensionConnected = true;
-    cachedData = {
-      tree:        msg.data.tree        || [],
-      libraries:   msg.data.libraries   || [],
-      globalNotes: msg.data.globalNotes || [],
-      updatedAt:   Date.now(),
-    };
-    process.stderr.write(`[pinako-mcp] Tree updated: ${cachedData.tree.length} windows.\n`);
+    cachedData.set(browserId, {
+      tree:         msg.data.tree         || [],
+      libraries:    msg.data.libraries    || [],
+      globalNotes:  msg.data.globalNotes  || [],
+      updatedAt:    Date.now(),
+      browserId,
+      browserBrand,
+    });
+    process.stderr.write(`[pinako-mcp] Tree updated from ${browserBrand} (${browserId.slice(0,16)}…): ${msg.data.tree?.length || 0} windows.\n`);
   }
 }
 
@@ -175,9 +184,9 @@ function sanitizeNode(node) {
   return out;
 }
 
-function getTree(includeGhost = true) {
-  if (!cachedData) return null;
-  const tree = cachedData.tree.map(sanitizeNode);
+function getTree(data, includeGhost = true) {
+  if (!data) return null;
+  const tree = data.tree.map(sanitizeNode);
   // Always strip incognito nodes — incognito data must never leave the local device
   function filterNodes(nodes) {
     return nodes
@@ -186,6 +195,62 @@ function getTree(includeGhost = true) {
       .map(n => ({ ...n, children: n.children ? filterNodes(n.children) : [] }));
   }
   return filterNodes(tree);
+}
+
+// ─── Browser routing helpers ─────────────────────────────────────────────────
+// `selectBrowser(arg)` resolves a `browser` tool argument (browserId or
+// case-insensitive brand name like "Brave") to a single cached entry.
+// `resolveBrowserData()` is the single decision point each tool uses to pick
+// data: returns either { data } (proceed) or { error } (return to caller).
+// Multi-browser ambiguity surfaces as a user-friendly error so the AI asks
+// the user which browser to use, instead of silently merging or guessing.
+function selectBrowser(arg) {
+  if (!arg) return null;
+  if (cachedData.has(arg)) return cachedData.get(arg);
+  const lower = String(arg).toLowerCase();
+  for (const data of cachedData.values()) {
+    if (data.browserBrand.toLowerCase() === lower) return data;
+  }
+  return null;
+}
+
+function noDataError() {
+  return {
+    content: [{ type: 'text', text: 'No data yet — open the Pinako extension first.' }],
+    isError: true,
+  };
+}
+
+function multiBrowserError() {
+  const brands = [...cachedData.values()].map(d => d.browserBrand);
+  const list = brands.join(', ');
+  const example = brands[0] ? `'${brands[0]}'` : "'Brave'";
+  return {
+    content: [{
+      type: 'text',
+      text: `Multiple Pinako installs detected: ${list}. Please specify which one with the 'browser' parameter (e.g., browser=${example}). Use list_browsers to see all connected browsers.`,
+    }],
+    isError: true,
+  };
+}
+
+function resolveBrowserData(browserArg) {
+  if (cachedData.size === 0) return { error: noDataError() };
+  if (browserArg) {
+    const data = selectBrowser(browserArg);
+    if (!data) {
+      const available = [...cachedData.values()].map(d => d.browserBrand).join(', ');
+      return {
+        error: {
+          content: [{ type: 'text', text: `Browser '${browserArg}' not found. Connected browsers: ${available}.` }],
+          isError: true,
+        },
+      };
+    }
+    return { data };
+  }
+  if (cachedData.size === 1) return { data: cachedData.values().next().value };
+  return { error: multiBrowserError() };
 }
 
 function searchInTree(nodes, query, includeGhost, results = []) {
@@ -238,13 +303,21 @@ TERMINOLOGY
 - Tags: categorization labels (string array) attached per node.
 - Ghost tab: a closed tab preserved in the tree (chromeId = null). Not currently open in Chrome.
 
+MULTI-BROWSER
+The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the same time. Each install is a separate data source. Tools accept an optional 'browser' parameter (e.g., browser="Brave") to pick a specific install. When multiple browsers are connected and the user does NOT specify which to use, tools return an ambiguity error — ask the user which browser they want, then retry with the chosen 'browser' value. Use list_browsers to discover what's connected. Libraries and global notes are cloud-synced so their content is identical across the user's browsers, but live tab/window state and per-tab metadata differ per browser.
+
+CONNECTION RECOVERY
+If a tool returns "No data yet — open the Pinako extension first", or list_browsers returns an empty list when the user expects browsers to be connected, the Pinako extension's connection to this MCP server has lapsed. Tell the user to open the Pinako extension popup (click the Pinako icon in their browser toolbar). That re-establishes the native-messaging connection and brings the data back. This rarely happens after initial install, but can occur after PC sleep/wake, browser restart, or extended idle periods. The user does not need to restart your client (Claude Desktop, Cursor, etc.) — just opening the popup is enough.
+
 For complete documentation, see: https://pinako.pro/docs/ai-connect`;
 
 function createMcpServer() {
   const srv = new McpServer(
-    { name: 'pinako', version: '1.1.0' },
+    { name: 'pinako', version: '1.2.0' },
     { instructions: SERVER_INSTRUCTIONS }
   );
+
+  const BROWSER_ARG_DESC = 'Which Pinako install to query (browser brand like "Brave" or "Chrome", or browserId from list_browsers). Required when multiple browsers are connected; omit when only one is connected.';
 
   srv.registerTool(
     'get_tree',
@@ -255,11 +328,18 @@ function createMcpServer() {
         'openedDate, memoText, tags, notes, collapsed, and children.',
       inputSchema: {
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs (chromeId=null). Default true.'),
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ include_ghost_tabs = true }) => {
-      if (!cachedData) return { content: [{ type: 'text', text: 'No data yet — open the Pinako extension first.' }], isError: true };
-      return { content: [{ type: 'text', text: JSON.stringify({ tree: getTree(include_ghost_tabs), updatedAt: cachedData.updatedAt }) }] };
+    async ({ include_ghost_tabs = true, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser: r.data.browserBrand,
+        browserId: r.data.browserId,
+        tree: getTree(r.data, include_ghost_tabs),
+        updatedAt: r.data.updatedAt,
+      }) }] };
     }
   );
 
@@ -270,27 +350,40 @@ function createMcpServer() {
       inputSchema: {
         query: z.string().describe('Search query (case-insensitive)'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs. Default true.'),
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ query, include_ghost_tabs = true }) => {
-      if (!cachedData) return { content: [{ type: 'text', text: 'No data yet — open the Pinako extension first.' }], isError: true };
-      const results = searchInTree(cachedData.tree, query, include_ghost_tabs);
-      return { content: [{ type: 'text', text: JSON.stringify({ results, count: results.length }) }] };
+    async ({ query, include_ghost_tabs = true, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const results = searchInTree(r.data.tree, query, include_ghost_tabs);
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser: r.data.browserBrand,
+        results,
+        count: results.length,
+      }) }] };
     }
   );
 
   srv.registerTool(
     'list_libraries',
     {
-      description: 'Lists all Pinako libraries (saved tab collections). Returns id, title, description, tab count, and library-level notes.',
+      description: 'Lists all Pinako libraries (saved tab collections). Returns id, title, description, tab count, and library-level notes. Libraries are cloud-synced, so their list is identical across a user\'s browsers; the browser argument still applies for routing consistency.',
+      inputSchema: {
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
     },
-    async () => {
-      if (!cachedData) return { content: [{ type: 'text', text: 'No data yet — open the Pinako extension first.' }], isError: true };
-      const libs = (cachedData.libraries || []).map(lib => ({
+    async ({ browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const libs = (r.data.libraries || []).map(lib => ({
         id: lib.id, title: lib.title, description: lib.description || '',
         tabCount: countTabsInLibrary(lib.children || []), notes: lib.notes || [],
       }));
-      return { content: [{ type: 'text', text: JSON.stringify({ libraries: libs }) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser: r.data.browserBrand,
+        libraries: libs,
+      }) }] };
     }
   );
 
@@ -298,22 +391,55 @@ function createMcpServer() {
     'get_library',
     {
       description: 'Returns the full contents of a Pinako library: folders, tabs, memos, tags, notes.',
-      inputSchema: { library_id: z.string().describe('Library id from list_libraries') },
+      inputSchema: {
+        library_id: z.string().describe('Library id from list_libraries'),
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
     },
-    async ({ library_id }) => {
-      if (!cachedData) return { content: [{ type: 'text', text: 'No data yet — open the Pinako extension first.' }], isError: true };
-      const lib = (cachedData.libraries || []).find(l => l.id === library_id);
-      if (!lib) return { content: [{ type: 'text', text: `Library not found: ${library_id}` }], isError: true };
-      return { content: [{ type: 'text', text: JSON.stringify(sanitizeNode(lib)) }] };
+    async ({ library_id, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const lib = (r.data.libraries || []).find(l => l.id === library_id);
+      if (!lib) return { content: [{ type: 'text', text: `Library not found: ${library_id} (in ${r.data.browserBrand})` }], isError: true };
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser: r.data.browserBrand,
+        library: sanitizeNode(lib),
+      }) }] };
     }
   );
 
   srv.registerTool(
     'get_global_notes',
-    { description: 'Returns global notes — rich text documents not attached to any specific tab or library.' },
+    {
+      description: 'Returns global notes — rich text documents not attached to any specific tab or library. Cloud-synced, identical across browsers.',
+      inputSchema: {
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser: r.data.browserBrand,
+        globalNotes: r.data.globalNotes || [],
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'list_browsers',
+    {
+      description: 'Lists all Pinako installs currently connected to this MCP server. Each entry: browserBrand (human-readable name like "Chrome" or "Brave"), browserId (stable per-install id), updatedAt (timestamp of last data update), windowCount (live windows), libraryCount. Use the browserBrand or browserId as the "browser" argument to other tools when multiple browsers are connected.',
+    },
     async () => {
-      if (!cachedData) return { content: [{ type: 'text', text: 'No data yet — open the Pinako extension first.' }], isError: true };
-      return { content: [{ type: 'text', text: JSON.stringify({ globalNotes: cachedData.globalNotes || [] }) }] };
+      const browsers = [...cachedData.values()].map(d => ({
+        browserBrand: d.browserBrand,
+        browserId:    d.browserId,
+        updatedAt:    d.updatedAt,
+        windowCount:  (d.tree || []).filter(n => !n.incognito).length,
+        libraryCount: (d.libraries || []).length,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify({ browsers, count: browsers.length }) }] };
     }
   );
 
@@ -329,7 +455,15 @@ const httpServer = http.createServer(async (req, res) => {
   // Health check
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, extensionConnected, dataAge: cachedData ? Date.now() - cachedData.updatedAt : null }));
+    res.end(JSON.stringify({
+      ok: true,
+      extensionConnected,
+      browsers: [...cachedData.values()].map(d => ({
+        browserBrand: d.browserBrand,
+        browserId:    d.browserId,
+        dataAge:      Date.now() - d.updatedAt,
+      })),
+    }));
     return;
   }
 
@@ -346,12 +480,22 @@ const httpServer = http.createServer(async (req, res) => {
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
       try {
-        const { data } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const { data, browserId, browserBrand } = body;
         if (data) {
-          cachedData = { tree: data.tree || [], libraries: data.libraries || [], globalNotes: data.globalNotes || [], updatedAt: Date.now() };
+          const id    = browserId    || 'unknown';
+          const brand = browserBrand || 'Unknown';
+          cachedData.set(id, {
+            tree:         data.tree         || [],
+            libraries:    data.libraries    || [],
+            globalNotes:  data.globalNotes  || [],
+            updatedAt:    Date.now(),
+            browserId:    id,
+            browserBrand: brand,
+          });
           extensionConnected = true;
           if (shutdownTimer) { clearTimeout(shutdownTimer); shutdownTimer = null; }
-          process.stderr.write(`[pinako-mcp] Cache refreshed via /update.\n`);
+          process.stderr.write(`[pinako-mcp] Cache refreshed via /update from ${brand}.\n`);
         }
         res.writeHead(200); res.end();
       } catch { res.writeHead(400); res.end(); }
@@ -432,12 +576,13 @@ if (!BRIDGE_URL) {
   httpServer.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
       process.stderr.write(`[pinako-mcp] Port ${MCP_PORT} in use — relaying to existing instance.\n`);
-      forwardToExisting = (data) => {
-        const body = JSON.stringify({ data });
+      forwardToExisting = (payload) => {
+        // payload: { data, browserId, browserBrand }
+        const body = JSON.stringify(payload);
         const r = http.request(
           { hostname: '127.0.0.1', port: MCP_PORT, path: '/update', method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
-          () => { process.stderr.write('[pinako-mcp] Relayed tree update.\n'); }
+          () => { process.stderr.write(`[pinako-mcp] Relayed tree update from ${payload.browserBrand || 'unknown'}.\n`); }
         );
         r.on('error', (err) => { process.stderr.write(`[pinako-mcp] Relay error: ${err.message}\n`); });
         r.write(body); r.end();
