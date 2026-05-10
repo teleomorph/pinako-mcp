@@ -580,6 +580,39 @@ function _postEditResultToLeader(msg) {
   req.end();
 }
 
+// ─── Phase 3 Slice D: destructive-op confirmation gate ───────────────────────
+// MCP-boundary check that destructive ops carry confirmedByUser:true. The
+// engine schemas enforce the same thing (z.literal(true)); the bridge layer
+// is the canonical bypass-proof guard mirroring the per-content-cap pattern.
+// Returns CONFIRMATION_REQUIRED early if missing — clear, distinct error code
+// for AI clients to render a confirmation prompt before retrying.
+//
+// Two destructive surfaces:
+//   - Always-destructive ops: ghost_node, delete_live_node. Listed in the set.
+//   - Conditionally-destructive: delete_library_group with cascadeMembers:true.
+//     Plain dissolve is non-destructive (Slice 1.5 back-compat).
+const _ALWAYS_DESTRUCTIVE_OP_TYPES = new Set(['ghost_node', 'delete_live_node']);
+
+function _isDestructiveOp(op) {
+  if (!op || typeof op !== 'object') return false;
+  if (_ALWAYS_DESTRUCTIVE_OP_TYPES.has(op.type)) return true;
+  if (op.type === 'delete_library_group' && op.cascadeMembers === true) return true;
+  return false;
+}
+
+function _checkConfirmedByUser(op, opIndex) {
+  if (!_isDestructiveOp(op)) return null;
+  if (op.confirmedByUser === true) return null;
+  const opLabel = (op.type === 'delete_library_group') ? 'delete_library_group {cascadeMembers:true}' : op.type;
+  const err = {
+    code: 'CONFIRMATION_REQUIRED',
+    message: `Destructive op ${opLabel} requires confirmedByUser:true. Ask the user to explicitly confirm this specific action, then retry with confirmedByUser:true. Do NOT set this flag without explicit user approval.`,
+    context: { opType: op.type, ...(op.cascadeMembers !== undefined ? { cascadeMembers: op.cascadeMembers } : {}) },
+  };
+  if (typeof opIndex === 'number') err.context.subOpIndex = opIndex;
+  return err;
+}
+
 // ─── Phase 3 Slice B: per-content-cap enforcement ─────────────────────────────
 // MCP-boundary tier check for note content writes. Mirrors wrapper-side
 // _checkNoteContentTier in pinako.js (~line 3015), kept in lockstep:
@@ -646,6 +679,30 @@ async function executeEdit(op, browserArg) {
     return { ok: false, error: { code: 'BROWSER_NOT_FOUND', message: r.error.content[0].text } };
   }
   log(`executeEdit: op.type=${op.type} browserId=${r.data.browserId.slice(0,16)}… brand=${r.data.browserBrand}`);
+
+  // Phase 3 Slice D: destructive-op confirmation gate. Bypass-proof at the
+  // MCP boundary; engine schemas re-enforce the same thing as defense-in-
+  // depth. Bulk-aware: walks bulk_apply.ops and rejects with subOpIndex.
+  {
+    const topErr = _checkConfirmedByUser(op);
+    if (topErr) {
+      log(`executeEdit: confirmation reject (${topErr.code}) for ${op.type} on ${r.data.browserBrand}`);
+      return { ok: false, error: topErr };
+    }
+    if (op.type === 'bulk_apply' && Array.isArray(op.ops)) {
+      for (let i = 0; i < op.ops.length; i++) {
+        const subErr = _checkConfirmedByUser(op.ops[i], i);
+        if (subErr) {
+          log(`executeEdit: confirmation reject (${subErr.code}) for bulk_apply sub-op ${i} on ${r.data.browserBrand}`);
+          return { ok: false, error: {
+            code: subErr.code,
+            message: `Sub-op ${i}: ${subErr.message}`,
+            context: subErr.context,
+          } };
+        }
+      }
+    }
+  }
 
   // Phase 3 Slice B: per-content-cap enforcement at the MCP boundary. Runs
   // before dispatch so oversize content never reaches the extension. Bulk-
@@ -1139,7 +1196,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('create_group', args));
 
   srv.registerTool('delete_node', {
-    description: 'Deletes a GHOST node (chromeId=null — closed/saved tabs that the user preserved in the tree). REJECTS subtrees that contain any live node (chromeId set) — those need a separate flow that closes the browser tab/window first, gated behind user confirmation (deferred to a later phase). Use this for "clean up these saved tabs I don\'t need anymore".',
+    description: 'Deletes a GHOST node (chromeId=null — closed/saved tabs that the user preserved in the tree). REJECTS subtrees that contain any live node (chromeId set) with LIVE_NODE_REFUSED — for live tabs/windows, use ghost_node (close browser tabs but keep saved nodes) or delete_live_node (close browser tabs AND remove saved nodes). Use delete_node for "clean up these saved tabs I don\'t need anymore".',
     inputSchema: {
       nodeId:    z.string().describe('Target ghost node id.'),
       scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
@@ -1147,6 +1204,28 @@ function createMcpServer() {
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
   }, async (args) => writeToolHandler('delete_node', args));
+
+  srv.registerTool('ghost_node', {
+    description: 'DESTRUCTIVE — closes the live browser tab(s) for this node and all live descendants. The tree node and its structure are preserved with chromeId=null on every ghosted node, so the user can re-open them later. Mirrors the manual "X" button. REQUIRES EXPLICIT USER APPROVAL: set confirmedByUser:true ONLY after the user has confirmed THIS specific ghost action — do not set it as a default or retry it after a previous failure. The engine and bridge both enforce this; missing the flag returns CONFIRMATION_REQUIRED. Returns NODE_NOT_LIVE if nothing in the subtree is live.',
+    inputSchema: {
+      nodeId:          z.string().describe('Target node id (tab, window, group, or folder). The node and all live descendants will be ghosted.'),
+      confirmedByUser: z.literal(true).describe('Must be exactly TRUE. Set ONLY after explicit user approval of this specific destructive action.'),
+      scope:           z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId:       z.string().optional().describe('Required when scope=library.'),
+      browser:         z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('ghost_node', args));
+
+  srv.registerTool('delete_live_node', {
+    description: 'DESTRUCTIVE — closes the live browser tab(s) AND removes the tree node entirely (compound of ghost_node + delete_node, but bypasses delete_node\'s LIVE_NODE_REFUSED). Use when the user wants both the browser tabs gone AND the saved tree node gone. Mirrors the manual trash button on live nodes. REQUIRES EXPLICIT USER APPROVAL: set confirmedByUser:true ONLY after the user has confirmed THIS specific deletion — do not set it as a default. The engine and bridge both enforce this; missing the flag returns CONFIRMATION_REQUIRED.',
+    inputSchema: {
+      nodeId:          z.string().describe('Target node id. The node, all descendants, and any live browser tabs in the subtree will be removed.'),
+      confirmedByUser: z.literal(true).describe('Must be exactly TRUE. Set ONLY after explicit user approval of this specific destructive action.'),
+      scope:           z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId:       z.string().optional().describe('Required when scope=library.'),
+      browser:         z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('delete_live_node', args));
 
   srv.registerTool('indent_node', {
     description: 'Nests a node under its previous sibling (one level deeper). Rejects when the node has no prior sibling (INDENT_NO_PREV_SIBLING). Auto-expands the new parent. Tree-only (not for libraries or bookmarks).',
@@ -1221,10 +1300,12 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('create_library_group', args));
 
   srv.registerTool('delete_library_group', {
-    description: 'Removes a library group (DISSOLVE semantics). Member libraries are KEPT and re-appear in the standalone library card list at the position the group occupied. Cascade-delete-members (also delete the libraries themselves) is a separate destructive op deferred behind user confirmation.',
+    description: 'Removes a library group. TWO MODES via cascadeMembers: (1) DEFAULT (cascadeMembers omitted/false) — DISSOLVE: member libraries are KEPT and re-appear in the standalone library card list at the position the group occupied. Safe; non-destructive. (2) cascadeMembers:true — DESTRUCTIVE: also deletes each member library (owned libraries are deleted from cloud; linked libraries are unlinked from this account). REQUIRES EXPLICIT USER APPROVAL when cascadeMembers:true: set confirmedByUser:true ONLY after the user has confirmed they want to lose the libraries\' content. Cascade is one-way — undo restores group structure but NOT the cascaded libraries\' content. Engine + bridge both enforce confirmedByUser when cascading.',
     inputSchema: {
-      groupId: z.string().describe('Group id to dissolve.'),
-      browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      groupId:         z.string().describe('Group id to remove.'),
+      cascadeMembers:  z.boolean().optional().describe('FALSE (default) = dissolve, libraries kept. TRUE = also delete member libraries. Destructive when true.'),
+      confirmedByUser: z.literal(true).optional().describe('Required to be TRUE when cascadeMembers:true. Set ONLY after explicit user approval of cascade deletion.'),
+      browser:         z.string().optional().describe(BROWSER_ARG_DESC),
     },
   }, async (args) => writeToolHandler('delete_library_group', args));
 
