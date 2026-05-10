@@ -562,6 +562,72 @@ function _postEditResultToLeader(msg) {
   req.end();
 }
 
+// ─── Phase 3 Slice A: unified edit dispatch ───────────────────────────────────
+// Single entry point for agent ops, used by both the curl-testable /edit
+// endpoint and every MCP write tool registered in createMcpServer(). Validates
+// the op shape minimally, resolves the target browser via resolveBrowserData,
+// then routes to local NM (Slice A) or SSE forwarder (Slice B). Returns a
+// uniform result shape: { ok: true, ...wrapperResult } or { ok: false, error }.
+// The 22 MCP write tools call this directly; /edit also calls it and translates
+// the result into an HTTP response via httpStatusForEditResult.
+async function executeEdit(op, browserArg) {
+  if (!op || typeof op !== 'object' || typeof op.type !== 'string') {
+    return { ok: false, error: { code: 'BAD_REQUEST', message: 'op must be an object with a string `type` field' } };
+  }
+  const r = resolveBrowserData(browserArg);
+  if (r.error) {
+    return { ok: false, error: { code: 'BROWSER_NOT_FOUND', message: r.error.content[0].text } };
+  }
+  log(`executeEdit: op.type=${op.type} browserId=${r.data.browserId.slice(0,16)}… brand=${r.data.browserBrand}`);
+  if (localBrowserId && r.data.browserId === localBrowserId) {
+    return await dispatchEdit(op, r.data.browserId);
+  }
+  if (forwarders.has(r.data.browserId)) {
+    return await dispatchEditViaSse(op, r.data.browserId);
+  }
+  if (!localBrowserId) {
+    return { ok: false, error: {
+      code: 'BRIDGE_NOT_READY',
+      message: 'Pinako AI Bridge has not yet received the initial connection from the Pinako popup. Open the popup and try again in a moment.',
+    } };
+  }
+  return { ok: false, error: {
+    code: 'FORWARDER_NOT_CONNECTED',
+    message: `Pinako AI Bridge has the cache entry for ${r.data.browserBrand} but no active forwarder bridge to deliver writes. The Pinako popup in ${r.data.browserBrand} may not be open. Open it and try again.`,
+    context: { requestedBrowser: r.data.browserBrand },
+  } };
+}
+
+// Maps an executeEdit result to the HTTP status code /edit should respond
+// with. Distinct status codes for distinct failure modes so curl callers can
+// branch on status; MCP tool callers use error.code instead.
+function httpStatusForEditResult(result) {
+  if (result.ok) return 200;
+  const code = result.error && result.error.code;
+  if (code === 'BAD_REQUEST' || code === 'BROWSER_NOT_FOUND') return 400;
+  if (code === 'BRIDGE_NOT_READY' || code === 'FORWARDER_NOT_CONNECTED') return 503;
+  return 502; // engine validation errors, EDIT_TIMEOUT, LEADER_CHANGED, NM_WRITE_FAILED, etc.
+}
+
+// Shared handler for every MCP write tool. Pulls `browser` out of the args,
+// drops undefined fields (so engine defaults apply for omitted scope/library/
+// position/etc.), builds the op shape with `type`, and dispatches via
+// executeEdit. The MCP content envelope wraps the executeEdit result; isError
+// is set when ok=false so AI clients render the response as an error and can
+// retry with corrected input.
+async function writeToolHandler(opType, args) {
+  const { browser, ...opFields } = args || {};
+  const op = { type: opType };
+  for (const [k, v] of Object.entries(opFields)) {
+    if (v !== undefined) op[k] = v;
+  }
+  const result = await executeEdit(op, browser);
+  return {
+    content: [{ type: 'text', text: JSON.stringify(result) }],
+    ...(result.ok ? {} : { isError: true }),
+  };
+}
+
 // ─── Data helpers ─────────────────────────────────────────────────────────────
 const STRIP_KEYS = new Set([
   '_depth', '_parentId', '_isLastChild', '_ancestorIds', 'isEditing', 'rowColorIsCustom',
@@ -836,6 +902,251 @@ function createMcpServer() {
     }
   );
 
+  // ═══ Write tools (Phase 3 Slice A) ═════════════════════════════════════════
+  // 22 agent ops registered as MCP tools so AI clients (Claude Desktop, Cursor,
+  // Cline, Continue.dev, etc.) can drive the same engine surface that's already
+  // curl-testable via /edit. Schemas are intentionally LOOSE at this boundary
+  // (field types only) — the engine's zod schemas in mutation-engine.js are
+  // the canonical validators. Constraints are baked into description text;
+  // the reference doc carries the full inventory.
+  // ═════════════════════════════════════════════════════════════════════════
+
+  const SCOPE_TREE_OR_LIBRARY = "Scope: 'tree' (default), 'library' (libraryId required), or 'bookmarks'. Most node-targeted ops only need scope when working outside the main tree.";
+  const SCOPE_NOTES = "Required: 'library-notes' (notes attached to a specific library; libraryId required) or 'global-notes' (notes attached to the main tree). NOTE: when wrapped in bulk_apply, you must set scope on EACH sub-op individually — bulk's outer scope is NOT inherited by create_note / set_note_content sub-ops because their schemas accept two scopes.";
+  const POSITION_DESC = "Optional 0-indexed insertion position; omit to append. Negative or out-of-range values clamp to ends.";
+
+  // ─── Tag ops ────────────────────────────────────────────────────────────────
+  srv.registerTool('set_tags', {
+    description: 'REPLACES the entire tag array on a node. Pass an empty array to clear all tags. Use add_tags / remove_tags for delta updates that preserve existing tags. Constraints: each tag max 50 chars; max 50 tags per node.',
+    inputSchema: {
+      nodeId:    z.string().describe('Target node id.'),
+      tags:      z.array(z.string()).describe('New tag array (replaces existing). Use [] to clear.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('set_tags', args));
+
+  srv.registerTool('add_tags', {
+    description: 'APPENDS tags to a node, deduping and preserving order of existing tags. Use this when the user says "tag X with Y" or "also add Z" — it preserves prior tags. Use set_tags for full replacement, remove_tags for deletion.',
+    inputSchema: {
+      nodeId:    z.string().describe('Target node id.'),
+      tags:      z.array(z.string()).min(1).describe('Tags to append (deduped against existing).'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('add_tags', args));
+
+  srv.registerTool('remove_tags', {
+    description: 'Filters specific tags off a node, preserving the rest. No-op for tags not present. Use this for "untag X from Y" requests.',
+    inputSchema: {
+      nodeId:    z.string().describe('Target node id.'),
+      tags:      z.array(z.string()).min(1).describe('Tags to remove (no-op if missing).'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('remove_tags', args));
+
+  // ─── Metadata ops ───────────────────────────────────────────────────────────
+  srv.registerTool('set_memo', {
+    description: 'Sets the memo (short plain-text annotation, max 2500 chars) on a node. Pass empty string to clear. Memos are per-node and concise; for richer rich-text documents use create_note / set_note_content (which target a library or the global notes, not individual nodes).',
+    inputSchema: {
+      nodeId:    z.string().describe('Target node id.'),
+      text:      z.string().describe('Memo text (max 2500 chars). Empty string clears the memo.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('set_memo', args));
+
+  srv.registerTool('set_star_color', {
+    description: 'Sets the row star color on a node. Accepts a named color (e.g. "yellow", "red", "purple") or an explicit hex (e.g. "#ffaa00"). Pass null to clear.',
+    inputSchema: {
+      nodeId:    z.string().describe('Target node id.'),
+      color:     z.union([z.string(), z.null()]).describe('Color name, hex string, or null to clear.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('set_star_color', args));
+
+  srv.registerTool('set_title', {
+    description: 'Sets a custom title on a tab, window, group, or folder node. Trimmed; max 200 chars. Sets customTitle=true so the title persists across browser restarts.',
+    inputSchema: {
+      nodeId:    z.string().describe('Target node id.'),
+      title:     z.string().describe('New title (trimmed, non-empty, max 200 chars).'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('set_title', args));
+
+  // ─── Tree-structure ops ─────────────────────────────────────────────────────
+  srv.registerTool('move_node', {
+    description: 'Moves a node (and its full subtree) under newParentId at an optional position. SUBTREE SEMANTICS: all descendants come along. To move ONLY the node WITHOUT its children (e.g., "move tab X but leave the nested tabs"), use the outdent-first-child pattern: outdent the node\'s first child first (sibling-adoption pulls the rest under it), then move the now-empty target. Or wrap both ops in a single bulk_apply for atomicity. Pass newParentId=null to move to root (auto-wraps tabs into a new window).',
+    inputSchema: {
+      nodeId:      z.string().describe('Node to move (with its subtree).'),
+      newParentId: z.union([z.string(), z.null()]).optional().describe('Destination parent id, or null for root.'),
+      position:    z.number().optional().describe(POSITION_DESC),
+      scope:       z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId:   z.string().optional().describe('Required when scope=library.'),
+      browser:     z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('move_node', args));
+
+  srv.registerTool('create_group', {
+    description: 'Creates a new Pinako group node. Groups can contain other groups and windows but NOT tabs directly (tabs always live under a window or another tab). Position defaults to TOP of the destination siblings (matches the manual UI). For Chrome tab groups (the colored-strip groups in the browser tab bar), Pinako mirrors what Chrome shows; create those by moving tabs together in a window via move_node, not via this op.',
+    inputSchema: {
+      title:     z.string().describe('Group title (trimmed, non-empty, max 200 chars).'),
+      rowColor:  z.string().optional().describe('Optional row background color: a named color, hex string, or "accent2" (default, theme-tracking).'),
+      parentId:  z.union([z.string(), z.null()]).optional().describe('Parent node id (must be another group or null for root).'),
+      position:  z.number().optional().describe(POSITION_DESC + ' Default TOP if omitted.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('create_group', args));
+
+  srv.registerTool('delete_node', {
+    description: 'Deletes a GHOST node (chromeId=null — closed/saved tabs that the user preserved in the tree). REJECTS subtrees that contain any live node (chromeId set) — those need a separate flow that closes the browser tab/window first, gated behind user confirmation (deferred to a later phase). Use this for "clean up these saved tabs I don\'t need anymore".',
+    inputSchema: {
+      nodeId:    z.string().describe('Target ghost node id.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('delete_node', args));
+
+  srv.registerTool('indent_node', {
+    description: 'Nests a node under its previous sibling (one level deeper). Rejects when the node has no prior sibling (INDENT_NO_PREV_SIBLING). Auto-expands the new parent. Tree-only (not for libraries or bookmarks).',
+    inputSchema: {
+      nodeId:    z.string().describe('Node to indent.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('indent_node', args));
+
+  srv.registerTool('outdent_node', {
+    description: 'Promotes a node to its grandparent\'s level (one level shallower). Sibling-adoption preserves layout: the outdented node\'s younger siblings become its children, so visual row order is preserved. CHILD-EXTRACTION PATTERN: outdent the FIRST child of a target to free the target solo (target becomes empty, all children become adopted under the outdented first child). Tree-only.',
+    inputSchema: {
+      nodeId:    z.string().describe('Node to outdent.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('outdent_node', args));
+
+  // ─── Library system ops ─────────────────────────────────────────────────────
+  srv.registerTool('create_library', {
+    description: 'Creates a new empty library with an auto-seeded "Notes" note. Returns createdLibraryId and createdNoteId in the result. Use add_to_library afterwards to populate. For just creating an organizational umbrella over EXISTING libraries, use create_library_group instead.',
+    inputSchema: {
+      title:       z.string().describe('Library title (trimmed, non-empty, max 200 chars).'),
+      description: z.string().optional().describe('Optional description shown beneath title (max 1000 chars).'),
+      browser:     z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('create_library', args));
+
+  srv.registerTool('add_to_library', {
+    description: 'Clones nodes from a source surface into a library. INCLUDECHILDREN GUIDANCE: default true (subtree comes along, matching manual DND). Set FALSE when adding individual tabs ("add tab X to library") to avoid bundling unrelated nested children; keep TRUE for windows/groups/explicit "add subtree" requests. SOURCESCOPE: "tree" (default — main tab tree), "library" (cross-library copy; sourceLibraryId required), or "bookmarks" (clone from bookmark tree). Engine auto-wraps tab clones into ONE new window in the destination (libraries require tabs to have a window/tab/folder parent). Max 100 source ids per call.',
+    inputSchema: {
+      nodeIds:         z.array(z.string()).min(1).describe('Source node ids (max 100). Order of clones matches order here.'),
+      libraryId:       z.string().describe('Destination library id.'),
+      includeChildren: z.boolean().optional().describe('Default TRUE: include each source node\'s subtree. Set FALSE to clone only the leaf node.'),
+      sourceScope:     z.string().optional().describe('"tree" (default), "library", or "bookmarks". Use "library" with sourceLibraryId to copy from another library.'),
+      sourceLibraryId: z.string().optional().describe('Required when sourceScope="library".'),
+      position:        z.number().optional().describe(POSITION_DESC),
+      browser:         z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('add_to_library', args));
+
+  srv.registerTool('set_note_content', {
+    description: 'Updates an existing note\'s content. MODE GUIDANCE: "replace" (default) overwrites — use for "update note X with Y", "replace note X". "append" concatenates after existing content — use for "add Y to note X", "note down that ...". For prepend, read existing content first then call replace with the combined string. Note char limit is tier-gated (50K Pro / 150K Pro+ / 250K Premium / 500K Enterprise); for append mode the FINAL length is what\'s gated.',
+    inputSchema: {
+      noteId:    z.string().describe('Note id within the target notes array.'),
+      content:   z.string().describe('Note content (max varies by tier; see description).'),
+      mode:      z.string().optional().describe('"replace" (default) or "append".'),
+      scope:     z.string().describe(SCOPE_NOTES),
+      libraryId: z.string().optional().describe('Required when scope=library-notes.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('set_note_content', args));
+
+  srv.registerTool('create_note', {
+    description: 'Creates a new note in a library or in global notes. Use this when the user says "create a note about X", "save these findings as a new note", etc. For UPDATING an existing note, use set_note_content. Returns createdNoteId. Char limit is tier-gated.',
+    inputSchema: {
+      title:     z.string().describe('Note title (trimmed, non-empty, max 200 chars).'),
+      content:   z.string().optional().describe('Initial content (default empty). Char limit varies by tier.'),
+      scope:     z.string().describe(SCOPE_NOTES),
+      libraryId: z.string().optional().describe('Required when scope=library-notes.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('create_note', args));
+
+  // ─── Library Group ops ──────────────────────────────────────────────────────
+  srv.registerTool('create_library_group', {
+    description: 'Creates a new library group (an organizational umbrella over multiple libraries). Returns createdGroupId. After creating, use add_library_to_group to add member libraries.',
+    inputSchema: {
+      title:       z.string().describe('Group title (trimmed, non-empty, max 200 chars).'),
+      description: z.string().optional().describe('Optional group description (max 1000 chars).'),
+      browser:     z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('create_library_group', args));
+
+  srv.registerTool('delete_library_group', {
+    description: 'Removes a library group (DISSOLVE semantics). Member libraries are KEPT and re-appear in the standalone library card list at the position the group occupied. Cascade-delete-members (also delete the libraries themselves) is a separate destructive op deferred behind user confirmation.',
+    inputSchema: {
+      groupId: z.string().describe('Group id to dissolve.'),
+      browser: z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('delete_library_group', args));
+
+  srv.registerTool('add_library_to_group', {
+    description: 'Adds an existing library to an existing group. A library can belong to at most one group; rejects with LIBRARY_ALREADY_IN_GROUP / LIBRARY_IN_OTHER_GROUP if it\'s already assigned somewhere.',
+    inputSchema: {
+      groupId:   z.string().describe('Target group id.'),
+      libraryId: z.string().describe('Library id to add.'),
+      position:  z.number().optional().describe(POSITION_DESC + ' Default appends.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('add_library_to_group', args));
+
+  srv.registerTool('remove_library_from_group', {
+    description: 'Removes a library from a group, returning it to the standalone library card list right after the group. The library itself is preserved. No-op if the library wasn\'t in the group (removing a stale ref is valid cleanup).',
+    inputSchema: {
+      groupId:   z.string().describe('Source group id.'),
+      libraryId: z.string().describe('Library id to remove from the group.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('remove_library_from_group', args));
+
+  srv.registerTool('set_library_group_title', {
+    description: 'Renames a library group. Trimmed, non-empty, max 200 chars.',
+    inputSchema: {
+      groupId: z.string().describe('Target group id.'),
+      title:   z.string().describe('New title.'),
+      browser: z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('set_library_group_title', args));
+
+  srv.registerTool('set_library_group_description', {
+    description: 'Updates a library group\'s description. Empty string clears it. Max 1000 chars.',
+    inputSchema: {
+      groupId:     z.string().describe('Target group id.'),
+      description: z.string().describe('New description (empty string clears).'),
+      browser:     z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('set_library_group_description', args));
+
+  // ─── Composite ─────────────────────────────────────────────────────────────
+  srv.registerTool('bulk_apply', {
+    description: 'Atomically applies up to 100 sub-ops as a SINGLE undoable unit. Use for multi-step reorganizations ("move these 12 tabs into a new library called Research") so the user can undo the whole thing in one click. SUB-OP SCOPE INHERITANCE: sub-ops without explicit scope/libraryId inherit the bulk\'s; explicitly setting a different value is rejected (BULK_SCOPE_MISMATCH / BULK_LIBRARY_MISMATCH). EXCEPTION for create_note and set_note_content: their schemas accept two valid scopes (library-notes, global-notes), so EVERY sub-op of those types must include its own explicit scope field — bulk\'s outer scope is NOT auto-filled in. NESTING: bulk_apply cannot contain another bulk_apply.',
+    inputSchema: {
+      ops:       z.array(z.object({}).passthrough()).min(1).describe('Array of agent ops (each with type + fields). Max 100.'),
+      scope:     z.string().optional().describe('Default scope for sub-ops that omit it. NOT applied to create_note / set_note_content sub-ops (must specify per sub-op).'),
+      libraryId: z.string().optional().describe('Default libraryId for sub-ops that omit it.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('bulk_apply', args));
+
   return srv;
 }
 
@@ -992,70 +1303,22 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // ─── Phase 2 Slice A: applyEdit endpoint (curl-testable) ──────────────────
+  // ─── /edit endpoint (curl-testable; Slice A introduced, Slice A→B evolved) ──
   // Body: { op: <agent op shape>, browser?: <browserId|brand> }
-  // Response: { ok, requestId, error?, ...wrapper-result-fields }
-  // Status: 200 on ok=true, 502 on ok=false (Bad Gateway = upstream issue).
-  // Slice B routes: localBrowserId match → existing local NM dispatch; else
-  // → SSE to the forwarder bridge that owns the target browser.
+  // Response: { ok, requestId?, error?, ...wrapper-result-fields }
+  // Status: 200 ok, 400 BAD_REQUEST/BROWSER_NOT_FOUND, 503 BRIDGE_NOT_READY/
+  //         FORWARDER_NOT_CONNECTED, 502 wrapper/engine/timeout failures.
+  // After Phase 3 Slice A: routing + dispatch live in executeEdit; this
+  // handler is just the HTTP wrapper. The 22 MCP write tools registered in
+  // createMcpServer() share executeEdit so their responses are identical.
   if (req.url === '/edit' && req.method === 'POST') {
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', async () => {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        const { op, browser } = body;
-        if (!op || typeof op !== 'object' || typeof op.type !== 'string') {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            ok: false,
-            error: { code: 'BAD_REQUEST', message: 'Body must be { op: { type: ..., ... }, browser?: ... }' },
-          }));
-          return;
-        }
-        const r = resolveBrowserData(browser);
-        if (r.error) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            ok: false,
-            error: { code: 'BROWSER_NOT_FOUND', message: r.error.content[0].text },
-          }));
-          return;
-        }
-        // Slice B routing: localBrowserId match → local NM (Slice A path);
-        // else → SSE to the forwarder that owns the target browser. If
-        // neither path is available, return a diagnostic 503 so the AI
-        // client knows whether to nudge the user toward this browser's
-        // popup or the target browser's popup.
-        log(`POST /edit: op.type=${op.type} browserId=${r.data.browserId.slice(0,16)}… brand=${r.data.browserBrand}`);
-        let result;
-        if (localBrowserId && r.data.browserId === localBrowserId) {
-          result = await dispatchEdit(op, r.data.browserId);
-        } else if (forwarders.has(r.data.browserId)) {
-          result = await dispatchEditViaSse(op, r.data.browserId);
-        } else if (!localBrowserId) {
-          res.writeHead(503, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            ok: false,
-            error: {
-              code: 'BRIDGE_NOT_READY',
-              message: 'Pinako AI Bridge has not yet received the initial connection from the Pinako popup. Open the popup and try again in a moment.',
-            },
-          }));
-          return;
-        } else {
-          res.writeHead(503, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            ok: false,
-            error: {
-              code: 'FORWARDER_NOT_CONNECTED',
-              message: `Pinako AI Bridge has the cache entry for ${r.data.browserBrand} but no active forwarder bridge to deliver writes. The Pinako popup in ${r.data.browserBrand} may not be open. Open it and try again.`,
-              context: { requestedBrowser: r.data.browserBrand },
-            },
-          }));
-          return;
-        }
-        res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' });
+        const result = await executeEdit(body.op, body.browser);
+        res.writeHead(httpStatusForEditResult(result), { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (e) {
         log(`POST /edit error: ${e.message}`);
