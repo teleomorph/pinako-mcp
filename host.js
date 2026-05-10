@@ -71,6 +71,13 @@ function logRequest(label, req, body) {
 const MCP_PORT = 37421;
 const STDIN_GRACE_MS = 30_000;
 
+// Per-tier note content character limits. Mirrors NOTE_CHAR_LIMITS in
+// Pinako/pinako.js (~line 3673). Phase 3 Slice B: enforced at the MCP write
+// tool boundary (this file) for set_note_content and create_note (top-level
+// AND inside bulk_apply). Wrapper-side _checkNoteContentTier in pinako.js
+// stays as defense-in-depth for in-process callers (chat panel in Phase 4).
+const NOTE_CHAR_LIMITS = { 0: 50000, 1: 50000, 2: 150000, 3: 250000, 4: 500000 };
+
 // Last-resort handlers so an uncaught error in any async path is at least
 // logged to disk before the process dies. Without these, an async throw in
 // the /edit handler or NM listener would crash the host silently from the
@@ -225,6 +232,14 @@ function handleNmMessage(msg) {
   if (msg.type === 'treeUpdate' || msg.type === 'treeResponse') {
     const browserId    = msg.browserId    || 'unknown';
     const browserBrand = msg.browserBrand || 'Unknown';
+    // Phase 3 Slice B: per-browser tier (and userId for Phase 3C audit log)
+    // travels alongside browser identity. Tier defaults to 0 when missing
+    // (fail-closed for the per-content-cap check). userId may be empty for
+    // browsers signed out of Pinako Pro — read tools work locally; write
+    // tools wouldn't reach the bridge since the SW gate refuses to connect
+    // for tier-0 users, but defaulting is still correct.
+    const userTier = Number.isFinite(msg.userTier) ? msg.userTier : 0;
+    const userId   = typeof msg.userId === 'string' ? msg.userId : '';
     // Identify local browser regardless of leader/forwarder role: NM stdio
     // ALWAYS reaches our local extension. Slice B uses localBrowserId on
     // both leader (route local-vs-SSE in /edit) and forwarder (open SSE
@@ -236,7 +251,7 @@ function handleNmMessage(msg) {
     if (forwardToExisting) {
       // Forwarder path: relay data to leader, ensure SSE channel is open
       // so the leader can dispatch applyEdit events back to us.
-      forwardToExisting({ data: msg.data, browserId, browserBrand });
+      forwardToExisting({ data: msg.data, browserId, browserBrand, userTier, userId });
       _ensureSseConnection();
       return;
     }
@@ -253,6 +268,8 @@ function handleNmMessage(msg) {
       updatedAt:    Date.now(),
       browserId,
       browserBrand,
+      userTier,
+      userId,
     });
     process.stderr.write(`[pinako-mcp] Tree updated from ${browserBrand} (${browserId.slice(0,16)}…): ${msg.data.tree?.length || 0} windows.\n`);
   } else if (msg.type === 'editApplied' || msg.type === 'editFailed') {
@@ -563,6 +580,55 @@ function _postEditResultToLeader(msg) {
   req.end();
 }
 
+// ─── Phase 3 Slice B: per-content-cap enforcement ─────────────────────────────
+// MCP-boundary tier check for note content writes. Mirrors wrapper-side
+// _checkNoteContentTier in pinako.js (~line 3015), kept in lockstep:
+//  - applies to set_note_content and create_note (and those types as sub-ops
+//    of bulk_apply)
+//  - mode=append uses the cached existing note content for final-length math
+//    (cache may be ~150ms stale per Slice B's pushTreeUpdate cadence; the
+//    wrapper-side check catches the rare edge where this pass-through races)
+//  - error envelope matches wrapper's NOTE_CONTENT_OVER_TIER_LIMIT shape so
+//    AI clients see the same error code from either layer
+function _resolveExistingNoteContent(browserData, scope, libraryId, noteId) {
+  if (!browserData || !noteId) return '';
+  if (scope === 'global-notes') {
+    const list = Array.isArray(browserData.globalNotes) ? browserData.globalNotes : [];
+    const note = list.find(n => n && n.id === noteId);
+    return (note && note.content) || '';
+  }
+  if (scope === 'library-notes' && libraryId) {
+    const libs = Array.isArray(browserData.libraries) ? browserData.libraries : [];
+    const lib = libs.find(l => l && l.id === libraryId);
+    const notes = (lib && Array.isArray(lib.notes)) ? lib.notes : [];
+    const note = notes.find(n => n && n.id === noteId);
+    return (note && note.content) || '';
+  }
+  return '';
+}
+
+function _checkNoteContentTierAtBridge(op, browserData, fallbackScope, fallbackLibraryId) {
+  const tier = Number.isFinite(browserData?.userTier) ? browserData.userTier : 0;
+  const tierLimit = NOTE_CHAR_LIMITS[tier] || NOTE_CHAR_LIMITS[0];
+  const effectiveScope     = op.scope     || fallbackScope;
+  const effectiveLibraryId = op.libraryId || fallbackLibraryId;
+  const mode = op.mode || 'replace';
+  const inputLength = ((op.content == null) ? '' : String(op.content)).length;
+  let finalLength = inputLength;
+  if (mode === 'append') {
+    const existing = _resolveExistingNoteContent(browserData, effectiveScope, effectiveLibraryId, op.noteId);
+    finalLength = existing.length + inputLength;
+  }
+  if (finalLength > tierLimit) {
+    return {
+      code: 'NOTE_CONTENT_OVER_TIER_LIMIT',
+      message: `Note content (final length ${finalLength} chars after mode=${mode}) exceeds tier ${tier} limit of ${tierLimit} chars.`,
+      context: { finalLength, mode, inputLength, tier, tierLimit },
+    };
+  }
+  return null;
+}
+
 // ─── Phase 3 Slice A: unified edit dispatch ───────────────────────────────────
 // Single entry point for agent ops, used by both the curl-testable /edit
 // endpoint and every MCP write tool registered in createMcpServer(). Validates
@@ -580,6 +646,35 @@ async function executeEdit(op, browserArg) {
     return { ok: false, error: { code: 'BROWSER_NOT_FOUND', message: r.error.content[0].text } };
   }
   log(`executeEdit: op.type=${op.type} browserId=${r.data.browserId.slice(0,16)}… brand=${r.data.browserBrand}`);
+
+  // Phase 3 Slice B: per-content-cap enforcement at the MCP boundary. Runs
+  // before dispatch so oversize content never reaches the extension. Bulk-
+  // aware: walks sub-ops for set_note_content/create_note inside bulk_apply,
+  // returning the failing sub-op's index so AI clients can correct precisely.
+  if (op.type === 'set_note_content' || op.type === 'create_note') {
+    const err = _checkNoteContentTierAtBridge(op, r.data, op.scope, op.libraryId);
+    if (err) {
+      log(`executeEdit: tier-cap reject (${err.code}) for ${op.type} on ${r.data.browserBrand}`);
+      return { ok: false, error: err };
+    }
+  } else if (op.type === 'bulk_apply' && Array.isArray(op.ops)) {
+    const bulkScope     = op.scope     || 'tree';
+    const bulkLibraryId = op.libraryId || null;
+    for (let i = 0; i < op.ops.length; i++) {
+      const sub = op.ops[i];
+      if (!sub || (sub.type !== 'set_note_content' && sub.type !== 'create_note')) continue;
+      const err = _checkNoteContentTierAtBridge(sub, r.data, bulkScope, bulkLibraryId);
+      if (err) {
+        log(`executeEdit: tier-cap reject (${err.code}) for bulk_apply sub-op ${i} (${sub.type}) on ${r.data.browserBrand}`);
+        return { ok: false, error: {
+          code: err.code,
+          message: `Sub-op ${i} (${sub.type}): ${err.message}`,
+          context: { ...err.context, subOpIndex: i },
+        } };
+      }
+    }
+  }
+
   if (localBrowserId && r.data.browserId === localBrowserId) {
     return await dispatchEdit(op, r.data.browserId);
   }
@@ -1219,10 +1314,14 @@ const httpServer = http.createServer(async (req, res) => {
     req.on('end', () => {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        const { data, browserId, browserBrand } = body;
+        const { data, browserId, browserBrand, userTier, userId } = body;
         if (data) {
           const id    = browserId    || 'unknown';
           const brand = browserBrand || 'Unknown';
+          // Phase 3 Slice B: per-browser tier flows through the forwarder
+          // relay too. Same fail-closed default as the leader's NM path.
+          const tier  = Number.isFinite(userTier) ? userTier : 0;
+          const uid   = typeof userId === 'string' ? userId : '';
           cachedData.set(id, {
             tree:         data.tree         || [],
             libraries:    data.libraries    || [],
@@ -1231,6 +1330,8 @@ const httpServer = http.createServer(async (req, res) => {
             updatedAt:    Date.now(),
             browserId:    id,
             browserBrand: brand,
+            userTier:     tier,
+            userId:       uid,
           });
           extensionConnected = true;
           if (shutdownTimer) { clearTimeout(shutdownTimer); shutdownTimer = null; }
