@@ -1265,13 +1265,14 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('create_library', args));
 
   srv.registerTool('add_to_library', {
-    description: 'Clones nodes from a source surface into a library. INCLUDECHILDREN GUIDANCE: default true (subtree comes along, matching manual DND). Set FALSE when adding individual tabs ("add tab X to library") to avoid bundling unrelated nested children; keep TRUE for windows/groups/explicit "add subtree" requests. SOURCESCOPE: "tree" (default — main tab tree), "library" (cross-library copy; sourceLibraryId required), or "bookmarks" (clone from bookmark tree). Engine auto-wraps tab clones into ONE new window in the destination (libraries require tabs to have a window/tab/folder parent). Max 100 source ids per call.',
+    description: 'Clones nodes from a source surface into a library. INCLUDECHILDREN GUIDANCE: default true (subtree comes along, matching manual DND). Set FALSE when adding individual tabs ("add tab X to library") to avoid bundling unrelated nested children; keep TRUE for windows/groups/explicit "add subtree" requests. SOURCESCOPE: "tree" (default — main tab tree), "library" (cross-library copy; sourceLibraryId required), "bookmarks" (clone from bookmark tree), or "sync" (clone from a connected device — another Pinako install on the same account, or a Chrome-synced mobile device; sourceDeviceId required). For "sync" sources, mobile devices resolve instantly (eager-loaded); PC/browser devices may add ~50-300ms latency on first use as the device tree fetches from Pinako cloud (cached for the rest of the session). Engine auto-wraps tab clones into ONE new window in the destination (libraries require tabs to have a window/tab/folder parent). Max 100 source ids per call.',
     inputSchema: {
       nodeIds:         z.array(z.string()).min(1).describe('Source node ids (max 100). Order of clones matches order here.'),
       libraryId:       z.string().describe('Destination library id.'),
       includeChildren: z.boolean().optional().describe('Default TRUE: include each source node\'s subtree. Set FALSE to clone only the leaf node.'),
-      sourceScope:     z.string().optional().describe('"tree" (default), "library", or "bookmarks". Use "library" with sourceLibraryId to copy from another library.'),
+      sourceScope:     z.string().optional().describe('"tree" (default), "library", "bookmarks", or "sync".'),
       sourceLibraryId: z.string().optional().describe('Required when sourceScope="library".'),
+      sourceDeviceId:  z.string().optional().describe('Required when sourceScope="sync". Use the syncDevices.id of the device card (e.g. "device-pc", "device-phone").'),
       position:        z.number().optional().describe(POSITION_DESC),
       browser:         z.string().optional().describe(BROWSER_ARG_DESC),
     },
