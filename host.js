@@ -120,10 +120,24 @@ const EDIT_TIMEOUT_MS = 30_000;
 // localBrowserId — the browserId of the extension connected to THIS bridge
 // process via direct NM stdio (as opposed to forwarded entries that arrived
 // via /update from other bridge processes). Set on the first NM treeResponse
-// or treeUpdate. Used by /edit to refuse writes targeted at a forwarded
-// browser, since Slice A's nmWrite reaches only this process's local
-// extension. Slice B will lift this via SSE routing.
+// or treeUpdate. Used by /edit to route locally vs via SSE: matching
+// browserId → local nmWrite (fast path); non-matching → SSE to the
+// forwarder that owns the target browser.
 let localBrowserId = null;
+
+// ─── Phase 2 Slice B: SSE forwarder infrastructure (leader-side) ──────────────
+// `forwarders` tracks open SSE channels keyed by browserId. Forwarder bridges
+// open `GET /edits?browserId=X` after their first /update succeeds; the leader
+// writes applyEdit events down the stream when /edit resolves to a non-local
+// browserId. `browserQueues` is the per-browserId Promise chain that
+// serializes SSE dispatch — two clients (Claude Desktop + Cursor) racing
+// /edit for the same browser get FIFO ordering at the leader. Per-browserId
+// scope means Brave's writes don't block Chrome's. The popup-side
+// _queueAgentCall queue gives a second layer of ordering at the extension;
+// leader-side ordering matters when multiple AI clients race the same browser.
+const forwarders = new Map();    // browserId -> { sseRes, heartbeatTimer }
+const browserQueues = new Map(); // browserId -> Promise (serialization chain)
+const SSE_HEARTBEAT_MS = 25_000;
 
 // ─── Native Messaging write ───────────────────────────────────────────────────
 // Chrome NM protocol: 4-byte LE length prefix + UTF-8 JSON body.
@@ -148,6 +162,31 @@ function _markNmStdoutBroken(reason) {
   if (_nmStdoutBroken) return;
   _nmStdoutBroken = true;
   try { log(`Native messaging stdout broken (${reason}); exiting so a healthy bridge can take port ${MCP_PORT}.`); } catch (_) {}
+  // Phase 2 Slice B: best-effort LEADER_CHANGED notification. The 200ms
+  // grace window is enough to flush HTTP responses to in-flight /edit
+  // callers. Without this, pending entries would just hit their 30s timeout
+  // and the AI client would wait the full window before retrying. Walk both
+  // local-NM and SSE-routed entries (the latter would also hit
+  // FORWARDER_DISCONNECTED via SSE close, but LEADER_CHANGED is the more
+  // accurate diagnosis when the leader is the one going down).
+  try {
+    for (const [requestId, entry] of pendingEdits) {
+      try { clearTimeout(entry.timer); } catch (_) {}
+      try {
+        entry.resolve({
+          ok: false,
+          requestId,
+          error: {
+            code: 'LEADER_CHANGED',
+            message: 'Pinako AI Bridge leader process is exiting (zombie-leader recovery). The forwarder will promote within ~5 seconds; retry then.',
+          },
+        });
+      } catch (_) {}
+    }
+    pendingEdits.clear();
+  } catch (e) {
+    try { log(`LEADER_CHANGED cleanup error: ${e.message}`); } catch (_) {}
+  }
   // Settle in 200ms so any in-flight log/HTTP responses get flushed.
   setTimeout(() => process.exit(0), 200);
 }
@@ -186,9 +225,19 @@ function handleNmMessage(msg) {
   if (msg.type === 'treeUpdate' || msg.type === 'treeResponse') {
     const browserId    = msg.browserId    || 'unknown';
     const browserBrand = msg.browserBrand || 'Unknown';
+    // Identify local browser regardless of leader/forwarder role: NM stdio
+    // ALWAYS reaches our local extension. Slice B uses localBrowserId on
+    // both leader (route local-vs-SSE in /edit) and forwarder (open SSE
+    // channel keyed by our browserId).
+    if (browserId !== 'unknown' && localBrowserId !== browserId) {
+      localBrowserId = browserId;
+      log(`Local browser identified: ${browserBrand} (${browserId.slice(0,16)}…)`);
+    }
     if (forwardToExisting) {
-      // EADDRINUSE path: forward this browser's data to the port-bound instance
+      // Forwarder path: relay data to leader, ensure SSE channel is open
+      // so the leader can dispatch applyEdit events back to us.
       forwardToExisting({ data: msg.data, browserId, browserBrand });
+      _ensureSseConnection();
       return;
     }
     if (shutdownTimer) {
@@ -196,13 +245,6 @@ function handleNmMessage(msg) {
       shutdownTimer = null;
     }
     extensionConnected = true;
-    // This message arrived via direct NM (not via /update), so it identifies
-    // OUR local extension. Forwarded browsers go through the forwardToExisting
-    // branch above and never reach this code path on the leader.
-    if (localBrowserId !== browserId) {
-      localBrowserId = browserId;
-      log(`Local browser identified: ${browserBrand} (${browserId.slice(0,16)}…)`);
-    }
     cachedData.set(browserId, {
       tree:         msg.data.tree         || [],
       libraries:    msg.data.libraries    || [],
@@ -213,9 +255,15 @@ function handleNmMessage(msg) {
     });
     process.stderr.write(`[pinako-mcp] Tree updated from ${browserBrand} (${browserId.slice(0,16)}…): ${msg.data.tree?.length || 0} windows.\n`);
   } else if (msg.type === 'editApplied' || msg.type === 'editFailed') {
-    // Phase 2 Slice A: applyEdit RPC reply from extension. Resolve the
-    // pending Promise registered by dispatchEdit. Late replies (after
-    // timeout fired and removed the entry) are silently dropped.
+    // applyEdit RPC reply from local extension. In forwarder mode, this is
+    // an SSE-routed edit from the leader — POST result back to /edit-result
+    // so the leader resolves its pendingEdits entry. In leader mode, resolve
+    // our local pendingEdits directly (Slice A path). Late replies (after
+    // timeout fired and removed the entry) are silently dropped either way.
+    if (forwardToExisting) {
+      _postEditResultToLeader(msg);
+      return;
+    }
     const pending = pendingEdits.get(msg.requestId);
     if (!pending) return;
     clearTimeout(pending.timer);
@@ -291,7 +339,7 @@ function dispatchEdit(op, browserId) {
         error: { code: 'EDIT_TIMEOUT', message: `applyEdit ${requestId} timed out after ${EDIT_TIMEOUT_MS}ms` },
       });
     }, EDIT_TIMEOUT_MS);
-    pendingEdits.set(requestId, { resolve, timer, browserId });
+    pendingEdits.set(requestId, { resolve, timer, browserId, path: 'local' });
     // The extension's SW NM listener picks this up, forwards to the popup
     // via chrome.runtime.sendMessage, popup runs mutateTreeForAgent, replies
     // editApplied / editFailed back over NM. nmWrite returns false (instead
@@ -308,6 +356,210 @@ function dispatchEdit(op, browserId) {
       });
     }
   });
+}
+
+// ─── Phase 2 Slice B: applyEdit dispatch via SSE ──────────────────────────────
+// Sends an applyEdit event to a forwarder bridge over its SSE channel. The
+// forwarder relays it to its local extension via NM, then POSTs back to
+// /edit-result with the editApplied/editFailed result. We register the
+// pending Promise the same shape as dispatchEdit so /edit awaits identically
+// regardless of routing.
+//
+// Per-browserId serialization: chained through browserQueues so concurrent
+// /edit calls for the same browserId fire SSE events in arrival order at the
+// leader. A failure in one job doesn't break the chain.
+function dispatchEditViaSse(op, browserId) {
+  const prev = browserQueues.get(browserId) || Promise.resolve();
+  const next = prev.then(
+    () => _doSseDispatch(op, browserId),
+    () => _doSseDispatch(op, browserId),
+  );
+  browserQueues.set(browserId, next.catch(() => {}));
+  return next;
+}
+
+function _doSseDispatch(op, browserId) {
+  const requestId = randomUUID();
+  log(`dispatchEditViaSse ${requestId.slice(0,8)} starting op=${op.type} browserId=${(browserId||'').slice(0,16)}…`);
+  return new Promise((resolve) => {
+    const forwarder = forwarders.get(browserId);
+    if (!forwarder) {
+      resolve({
+        ok: false,
+        requestId,
+        error: {
+          code: 'FORWARDER_NOT_CONNECTED',
+          message: `No active forwarder bridge for browserId ${(browserId||'').slice(0,16)}…. The target browser's Pinako popup may not be open.`,
+        },
+      });
+      return;
+    }
+    const timer = setTimeout(() => {
+      pendingEdits.delete(requestId);
+      resolve({
+        ok: false,
+        requestId,
+        error: { code: 'EDIT_TIMEOUT', message: `applyEdit ${requestId} timed out after ${EDIT_TIMEOUT_MS}ms` },
+      });
+    }, EDIT_TIMEOUT_MS);
+    pendingEdits.set(requestId, { resolve, timer, browserId, path: 'sse' });
+    try {
+      forwarder.sseRes.write(`event: applyEdit\ndata: ${JSON.stringify({ requestId, op, browserId })}\n\n`);
+    } catch (err) {
+      clearTimeout(timer);
+      pendingEdits.delete(requestId);
+      log(`dispatchEditViaSse ${requestId.slice(0,8)} SSE write failed: ${err.message}`);
+      resolve({
+        ok: false,
+        requestId,
+        error: { code: 'SSE_WRITE_FAILED', message: `SSE write to forwarder failed: ${err.message}` },
+      });
+    }
+  });
+}
+
+// Drop a forwarder when its SSE connection closes (forwarder process died,
+// browser closed, leader restarting). Cleans the entry, stops the heartbeat,
+// and rejects any in-flight pending edits routed to this browserId so the
+// AI client gets a fast failure instead of waiting the full 30s timeout.
+function _dropForwarder(browserId, reason) {
+  const f = forwarders.get(browserId);
+  if (!f) return;
+  if (f.heartbeatTimer) clearInterval(f.heartbeatTimer);
+  forwarders.delete(browserId);
+  log(`Forwarder dropped: browserId=${(browserId||'').slice(0,16)}… reason=${reason}`);
+  for (const [requestId, entry] of pendingEdits) {
+    if (entry.path === 'sse' && entry.browserId === browserId) {
+      clearTimeout(entry.timer);
+      pendingEdits.delete(requestId);
+      entry.resolve({
+        ok: false,
+        requestId,
+        error: {
+          code: 'FORWARDER_DISCONNECTED',
+          message: `Forwarder bridge for browserId ${(browserId||'').slice(0,16)}… disconnected before the edit completed (${reason}).`,
+        },
+      });
+    }
+  }
+}
+
+// ─── Phase 2 Slice B: SSE client (forwarder-side) ─────────────────────────────
+// When this process is in forwarder mode (EADDRINUSE → forwardToExisting set),
+// it opens a long-running GET /edits?browserId=X to the leader. The leader
+// streams applyEdit events down this channel; we relay each to our local
+// extension via NM (same code path the leader uses). Reply travels back the
+// other direction: extension → NM → handleNmMessage forwarder branch →
+// _postEditResultToLeader → leader's pendingEdits resolves.
+//
+// Reconnect: 5s flat (matches PROMOTE_RETRY_MS). On disconnect we may
+// promote to leader (port-bind succeeds) OR a peer forwarder may have
+// promoted and is the new leader; either way the next _ensureSseConnection
+// call probes the right state.
+let sseClientReq       = null;
+let sseClientReconnect = null;
+
+function _ensureSseConnection() {
+  if (!forwardToExisting) return; // leader doesn't connect to itself
+  if (!localBrowserId) return;    // need our browserId first
+  if (sseClientReq) return;       // already connecting/connected
+  log(`Opening SSE channel to leader for browserId=${localBrowserId.slice(0,16)}…`);
+  let sseBuf = '';
+  const req = http.request({
+    hostname: '127.0.0.1',
+    port: MCP_PORT,
+    path: `/edits?browserId=${encodeURIComponent(localBrowserId)}`,
+    method: 'GET',
+    headers: { 'Accept': 'text/event-stream' },
+  });
+  sseClientReq = req;
+  req.on('response', (res) => {
+    if (res.statusCode !== 200) {
+      log(`SSE channel rejected: HTTP ${res.statusCode}`);
+      sseClientReq = null;
+      _scheduleSseReconnect();
+      res.resume();
+      return;
+    }
+    log('SSE channel open.');
+    res.setEncoding('utf8');
+    res.on('data', (chunk) => {
+      sseBuf += chunk;
+      let i;
+      while ((i = sseBuf.indexOf('\n\n')) !== -1) {
+        const event = sseBuf.slice(0, i);
+        sseBuf = sseBuf.slice(i + 2);
+        _handleSseEvent(event);
+      }
+    });
+    res.on('end',   () => { log('SSE channel ended by leader.');   sseClientReq = null; _scheduleSseReconnect(); });
+    res.on('error', (err) => { log(`SSE channel res error: ${err.message}`); sseClientReq = null; _scheduleSseReconnect(); });
+    res.on('close', () => { sseClientReq = null; _scheduleSseReconnect(); });
+  });
+  req.on('error', (err) => {
+    log(`SSE channel req error: ${err.message}`);
+    sseClientReq = null;
+    _scheduleSseReconnect();
+  });
+  req.end();
+}
+
+function _scheduleSseReconnect() {
+  if (sseClientReconnect) return;
+  if (!forwardToExisting) return; // we may have promoted to leader; no need to reconnect
+  sseClientReconnect = setTimeout(() => {
+    sseClientReconnect = null;
+    _ensureSseConnection();
+  }, PROMOTE_RETRY_MS);
+}
+
+function _handleSseEvent(eventText) {
+  // SSE event format: "event: name\ndata: payload" terminated by "\n\n".
+  // Lines starting with ":" are comments (heartbeats); skip them.
+  const lines = eventText.split('\n');
+  let eventName = null;
+  const dataParts = [];
+  for (const line of lines) {
+    if (line.startsWith(':')) continue;
+    if (line.startsWith('event: ')) eventName = line.slice(7).trim();
+    else if (line.startsWith('data: ')) dataParts.push(line.slice(6));
+  }
+  if (eventName === 'ready') return;
+  if (eventName !== 'applyEdit') {
+    if (eventName) log(`SSE: ignoring unknown event ${eventName}`);
+    return;
+  }
+  let data;
+  try { data = JSON.parse(dataParts.join('\n')); }
+  catch (e) { log(`SSE: bad applyEdit data: ${e.message}`); return; }
+  const { requestId, op, browserId } = data || {};
+  if (!requestId || !op) { log('SSE: applyEdit missing requestId or op'); return; }
+  log(`SSE applyEdit ${requestId.slice(0,8)} for browserId=${(browserId||'').slice(0,16)}… op=${op.type}`);
+  const ok = nmWrite({ type: 'applyEdit', op, requestId, browserId });
+  if (!ok) {
+    _postEditResultToLeader({
+      type: 'editFailed',
+      requestId,
+      error: { code: 'NM_WRITE_FAILED', message: 'Forwarder native messaging write failed (stdout broken).' },
+    });
+  }
+}
+
+function _postEditResultToLeader(msg) {
+  const body = JSON.stringify({
+    requestId: msg.requestId,
+    ok:        msg.type === 'editApplied',
+    result:    msg.result,
+    error:     msg.error,
+  });
+  const req = http.request(
+    { hostname: '127.0.0.1', port: MCP_PORT, path: '/edit-result', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+    (res) => { res.resume(); }
+  );
+  req.on('error', (err) => { log(`/edit-result post error: ${err.message}`); });
+  req.write(body);
+  req.end();
 }
 
 // ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -644,15 +896,108 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  // ─── Phase 2 Slice B: leader-only endpoint guard ──────────────────────────
+  // /edit, /edit-result, and /edits are leader-only — only the bridge
+  // process holding port 37421 should serve these. Forwarders don't bind
+  // their own HTTP server today, so this guard is mostly defensive against
+  // the millisecond-scale race window during forwarder→leader promotion
+  // (forwardToExisting clears synchronously after listen() succeeds, but
+  // a request could in principle land mid-promotion).
+  if (forwardToExisting && (
+        req.url === '/edit' ||
+        req.url === '/edit-result' ||
+        (req.url && req.url.startsWith('/edits'))
+      )) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: false,
+      error: { code: 'LEADER_ONLY', message: 'This endpoint is served by the leader bridge only. Forwarders are read-only.' },
+    }));
+    return;
+  }
+
+  // ─── Phase 2 Slice B: SSE channel for forwarders ──────────────────────────
+  // GET /edits?browserId=X opens a long-running text/event-stream. The leader
+  // keeps the connection open and writes `event: applyEdit\ndata: {...}\n\n`
+  // events when /edit dispatches to that browserId. Forwarder bridges relay
+  // each event to their local extension via NM. Heartbeats every 25s keep the
+  // connection alive across any localhost OS-idle timers. On req close, the
+  // leader drops the forwarder entry and rejects in-flight pending edits for
+  // that browserId so the AI client gets a fast failure.
+  if (req.url && req.url.startsWith('/edits') && req.method === 'GET') {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const browserId = url.searchParams.get('browserId');
+    if (!browserId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: { code: 'BAD_REQUEST', message: 'GET /edits requires ?browserId=X' } }));
+      return;
+    }
+    if (forwarders.has(browserId)) {
+      _dropForwarder(browserId, 'replaced by new SSE connection');
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+    });
+    res.write(`event: ready\ndata: {"browserId":"${browserId}"}\n\n`);
+    const heartbeatTimer = setInterval(() => {
+      try { res.write(`: hb\n\n`); }
+      catch (_) { /* will fire 'close' below */ }
+    }, SSE_HEARTBEAT_MS);
+    forwarders.set(browserId, { sseRes: res, heartbeatTimer });
+    log(`Forwarder SSE connected: browserId=${browserId.slice(0,16)}…`);
+    req.on('close', () => { _dropForwarder(browserId, 'SSE req close'); });
+    return;
+  }
+
+  // POST /edit-result — forwarders relay editApplied/editFailed back to us.
+  // Body: { requestId, ok, result?, error? }. We resolve the matching
+  // pendingEdits entry. Late replies (after timeout removed the entry) are
+  // silently dropped, matching the NM-direct path's behavior in handleNmMessage.
+  if (req.url === '/edit-result' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const { requestId } = body;
+        if (!requestId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: { code: 'BAD_REQUEST', message: 'POST /edit-result requires { requestId }' } }));
+          return;
+        }
+        const pending = pendingEdits.get(requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingEdits.delete(requestId);
+          if (body.ok) {
+            pending.resolve(body.result || { ok: true, requestId });
+          } else {
+            pending.resolve({
+              ok: false,
+              requestId,
+              error: body.error || { code: 'UNKNOWN_EDIT_FAILURE', message: '/edit-result without error details' },
+            });
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        log(`POST /edit-result error: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: { code: 'INTERNAL', message: e.message } }));
+      }
+    });
+    return;
+  }
+
   // ─── Phase 2 Slice A: applyEdit endpoint (curl-testable) ──────────────────
   // Body: { op: <agent op shape>, browser?: <browserId|brand> }
   // Response: { ok, requestId, error?, ...wrapper-result-fields }
   // Status: 200 on ok=true, 502 on ok=false (Bad Gateway = upstream issue).
-  // Slice A is single-browser: only the locally-connected extension can be
-  // written to. If `browser` resolves to a non-local cache entry, the dispatch
-  // still goes over our local NM (which targets only our local extension), so
-  // the wrong-browser case effectively no-ops on the wrong extension. Slice B
-  // adds proper SSE forwarder routing for multi-browser writes.
+  // Slice B routes: localBrowserId match → existing local NM dispatch; else
+  // → SSE to the forwarder bridge that owns the target browser.
   if (req.url === '/edit' && req.method === 'POST') {
     const chunks = [];
     req.on('data', c => chunks.push(c));
@@ -677,14 +1022,18 @@ const httpServer = http.createServer(async (req, res) => {
           }));
           return;
         }
-        // Single-browser write guard. Slice A's dispatchEdit writes via
-        // local NM stdio, which only reaches THIS bridge process's connected
-        // extension. If the AI client targets a browser that's cached here
-        // (e.g., via /update from another bridge process) but isn't our
-        // local one, silently writing to local would mutate the WRONG tree.
-        // Slice B's SSE routing lifts this by streaming applyEdit to the
-        // forwarder bridge that owns the target browser.
-        if (!localBrowserId) {
+        // Slice B routing: localBrowserId match → local NM (Slice A path);
+        // else → SSE to the forwarder that owns the target browser. If
+        // neither path is available, return a diagnostic 503 so the AI
+        // client knows whether to nudge the user toward this browser's
+        // popup or the target browser's popup.
+        log(`POST /edit: op.type=${op.type} browserId=${r.data.browserId.slice(0,16)}… brand=${r.data.browserBrand}`);
+        let result;
+        if (localBrowserId && r.data.browserId === localBrowserId) {
+          result = await dispatchEdit(op, r.data.browserId);
+        } else if (forwarders.has(r.data.browserId)) {
+          result = await dispatchEditViaSse(op, r.data.browserId);
+        } else if (!localBrowserId) {
           res.writeHead(503, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             ok: false,
@@ -694,30 +1043,18 @@ const httpServer = http.createServer(async (req, res) => {
             },
           }));
           return;
-        }
-        if (r.data.browserId !== localBrowserId) {
-          const localCached = cachedData.get(localBrowserId);
-          const writeAvailableFor = (localCached && localCached.browserBrand) || 'this browser';
-          res.writeHead(409, { 'Content-Type': 'application/json' });
+        } else {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             ok: false,
             error: {
-              code: 'SINGLE_BROWSER_WRITE_LIMIT',
-              message:
-                `Pinako AI Bridge can currently make changes in only one browser at a time. ` +
-                `You asked to make changes in ${r.data.browserBrand}, but this connection is set up to make changes in ${writeAvailableFor}. ` +
-                `To edit ${r.data.browserBrand}'s tree instead, open the Pinako popup in ${r.data.browserBrand} and try again. ` +
-                `(Multi-browser editing is planned for a later update.)`,
-              context: {
-                requestedBrowser: r.data.browserBrand,
-                writeAvailableFor,
-              },
+              code: 'FORWARDER_NOT_CONNECTED',
+              message: `Pinako AI Bridge has the cache entry for ${r.data.browserBrand} but no active forwarder bridge to deliver writes. The Pinako popup in ${r.data.browserBrand} may not be open. Open it and try again.`,
+              context: { requestedBrowser: r.data.browserBrand },
             },
           }));
           return;
         }
-        log(`POST /edit: op.type=${op.type} browserId=${r.data.browserId.slice(0,16)}…`);
-        const result = await dispatchEdit(op, r.data.browserId);
         res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (e) {
@@ -838,6 +1175,11 @@ async function tryBindOrForward(initialAttempt) {
     }
     forwardToExisting = null;
     if (promoteTimer) { clearInterval(promoteTimer); promoteTimer = null; }
+    // Tear down forwarder-side SSE state — we ARE the leader now and don't
+    // need a /edits stream against ourselves. Pending applyEdit events on the
+    // old leader's queue were already failed when its SSE channel closed.
+    if (sseClientReconnect) { clearTimeout(sseClientReconnect); sseClientReconnect = null; }
+    if (sseClientReq) { try { sseClientReq.destroy(); } catch (_) {} sseClientReq = null; }
     extensionConnected = true;
     process.stderr.write(`[pinako-mcp] Listening on http://127.0.0.1:${MCP_PORT}/mcp\n`);
     nmWrite({ type: 'getTree' });
