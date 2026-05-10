@@ -117,6 +117,14 @@ let forwardToExisting = null; // set on EADDRINUSE — forward data to old insta
 const pendingEdits = new Map();   // requestId -> { resolve, timer, browserId }
 const EDIT_TIMEOUT_MS = 30_000;
 
+// localBrowserId — the browserId of the extension connected to THIS bridge
+// process via direct NM stdio (as opposed to forwarded entries that arrived
+// via /update from other bridge processes). Set on the first NM treeResponse
+// or treeUpdate. Used by /edit to refuse writes targeted at a forwarded
+// browser, since Slice A's nmWrite reaches only this process's local
+// extension. Slice B will lift this via SSE routing.
+let localBrowserId = null;
+
 // ─── Native Messaging write ───────────────────────────────────────────────────
 // Chrome NM protocol: 4-byte LE length prefix + UTF-8 JSON body.
 // Write to stdout only. Never use console.log() — it corrupts stdout.
@@ -188,6 +196,13 @@ function handleNmMessage(msg) {
       shutdownTimer = null;
     }
     extensionConnected = true;
+    // This message arrived via direct NM (not via /update), so it identifies
+    // OUR local extension. Forwarded browsers go through the forwardToExisting
+    // branch above and never reach this code path on the leader.
+    if (localBrowserId !== browserId) {
+      localBrowserId = browserId;
+      log(`Local browser identified: ${browserBrand} (${browserId.slice(0,16)}…)`);
+    }
     cachedData.set(browserId, {
       tree:         msg.data.tree         || [],
       libraries:    msg.data.libraries    || [],
@@ -659,6 +674,45 @@ const httpServer = http.createServer(async (req, res) => {
           res.end(JSON.stringify({
             ok: false,
             error: { code: 'BROWSER_NOT_FOUND', message: r.error.content[0].text },
+          }));
+          return;
+        }
+        // Single-browser write guard. Slice A's dispatchEdit writes via
+        // local NM stdio, which only reaches THIS bridge process's connected
+        // extension. If the AI client targets a browser that's cached here
+        // (e.g., via /update from another bridge process) but isn't our
+        // local one, silently writing to local would mutate the WRONG tree.
+        // Slice B's SSE routing lifts this by streaming applyEdit to the
+        // forwarder bridge that owns the target browser.
+        if (!localBrowserId) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: {
+              code: 'BRIDGE_NOT_READY',
+              message: 'Pinako AI Bridge has not yet received the initial connection from the Pinako popup. Open the popup and try again in a moment.',
+            },
+          }));
+          return;
+        }
+        if (r.data.browserId !== localBrowserId) {
+          const localCached = cachedData.get(localBrowserId);
+          const writeAvailableFor = (localCached && localCached.browserBrand) || 'this browser';
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: {
+              code: 'SINGLE_BROWSER_WRITE_LIMIT',
+              message:
+                `Pinako AI Bridge can currently make changes in only one browser at a time. ` +
+                `You asked to make changes in ${r.data.browserBrand}, but this connection is set up to make changes in ${writeAvailableFor}. ` +
+                `To edit ${r.data.browserBrand}'s tree instead, open the Pinako popup in ${r.data.browserBrand} and try again. ` +
+                `(Multi-browser editing is planned for a later update.)`,
+              context: {
+                requestedBrowser: r.data.browserBrand,
+                writeAvailableFor,
+              },
+            },
           }));
           return;
         }
