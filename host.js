@@ -249,6 +249,7 @@ function handleNmMessage(msg) {
       tree:         msg.data.tree         || [],
       libraries:    msg.data.libraries    || [],
       globalNotes:  msg.data.globalNotes  || [],
+      bookmarks:    msg.data.bookmarks    || [],
       updatedAt:    Date.now(),
       browserId,
       browserBrand,
@@ -740,6 +741,18 @@ function countTabsInLibrary(nodes) {
   return n;
 }
 
+// chrome.bookmarks tree shape: each node has .url for actual bookmarks,
+// .children for folders. Counts only leaf bookmarks (with .url), skipping
+// folders. Walks recursively starting from a root node.
+function countBookmarksRecursive(node) {
+  if (!node) return 0;
+  let n = node.url ? 1 : 0;
+  if (Array.isArray(node.children)) {
+    for (const child of node.children) n += countBookmarksRecursive(child);
+  }
+  return n;
+}
+
 // ─── MCP Server factory ────────────────────────────────────────────────────────
 // Each HTTP session gets its own McpServer + transport instance.
 // Tool handlers read from the global cachedData (no per-session state needed).
@@ -886,17 +899,38 @@ function createMcpServer() {
   );
 
   srv.registerTool(
+    'get_bookmarks',
+    {
+      description: 'Returns the user\'s Chrome bookmark tree (raw chrome.bookmarks.getTree() result). Use this to discover bookmark node ids before calling add_to_library with sourceScope="bookmarks". Each node has: id (stable Chrome bookmark id; persists across the bookmark\'s lifetime), title, url (set for bookmarks, missing for folders), children (array, present for folders), dateAdded (Unix ms timestamp), parentId, index (0-based position within parent). Top-level roots are typically "Bookmarks Bar" (id "1") and "Other Bookmarks" (id "2").',
+      inputSchema: {
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:   r.data.browserBrand,
+        browserId: r.data.browserId,
+        bookmarks: r.data.bookmarks || [],
+        updatedAt: r.data.updatedAt,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
     'list_browsers',
     {
       description: 'Lists all Pinako installs currently connected to this MCP server. Each entry: browserBrand (human-readable name like "Chrome" or "Brave"), browserId (stable per-install id), updatedAt (timestamp of last data update), windowCount (live windows), libraryCount. Use the browserBrand or browserId as the "browser" argument to other tools when multiple browsers are connected.',
     },
     async () => {
       const browsers = [...cachedData.values()].map(d => ({
-        browserBrand: d.browserBrand,
-        browserId:    d.browserId,
-        updatedAt:    d.updatedAt,
-        windowCount:  (d.tree || []).filter(n => !n.incognito).length,
-        libraryCount: (d.libraries || []).length,
+        browserBrand:  d.browserBrand,
+        browserId:     d.browserId,
+        updatedAt:     d.updatedAt,
+        windowCount:   (d.tree || []).filter(n => !n.incognito).length,
+        libraryCount:  (d.libraries || []).length,
+        bookmarkCount: (d.bookmarks || []).reduce((acc, root) => acc + countBookmarksRecursive(root), 0),
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ browsers, count: browsers.length }) }] };
     }
@@ -1193,6 +1227,7 @@ const httpServer = http.createServer(async (req, res) => {
             tree:         data.tree         || [],
             libraries:    data.libraries    || [],
             globalNotes:  data.globalNotes  || [],
+            bookmarks:    data.bookmarks    || [],
             updatedAt:    Date.now(),
             browserId:    id,
             browserBrand: brand,
