@@ -1158,6 +1158,17 @@ function createMcpServer() {
     },
   }, async (args) => writeToolHandler('set_star_color', args));
 
+  srv.registerTool('set_row_color', {
+    description: 'Sets the rowColor of a Pinako Group node or Folder node. NOT related to Chrome Tab Group color (Chrome owns those — agent has no direct control over them; tabs join/leave Chrome Tab Groups implicitly via move_node positioning). Accepts: "accent2" (theme-tracking default), a named color ("blue", "red", "green", "purple", "yellow", "orange", "pink", "cyan", "grey"), an explicit 6-digit hex ("#1890ff"), or null (reset to "accent2"). Rejects on non-group/non-folder node types with INVALID_NODE_TYPE.',
+    inputSchema: {
+      nodeId:    z.string().describe('Target group or folder node id.'),
+      rowColor:  z.union([z.string(), z.null()]).describe('"accent2", named color, 6-digit hex, or null to reset.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('set_row_color', args));
+
   srv.registerTool('set_title', {
     description: 'Sets a custom title on a tab, window, group, or folder node. Trimmed; max 200 chars. Sets customTitle=true so the title persists across browser restarts.',
     inputSchema: {
@@ -1171,7 +1182,7 @@ function createMcpServer() {
 
   // ─── Tree-structure ops ─────────────────────────────────────────────────────
   srv.registerTool('move_node', {
-    description: 'Moves a node (and its full subtree) under newParentId at an optional position. SUBTREE SEMANTICS: all descendants come along. To move ONLY the node WITHOUT its children (e.g., "move tab X but leave the nested tabs"), use the outdent-first-child pattern: outdent the node\'s first child first (sibling-adoption pulls the rest under it), then move the now-empty target. Or wrap both ops in a single bulk_apply for atomicity. Pass newParentId=null to move to root (auto-wraps tabs into a new window).',
+    description: 'Moves a node (and its full subtree) under newParentId at an optional position. SUBTREE SEMANTICS: all descendants come along. To move ONLY the node WITHOUT its children (e.g., "move tab X but leave the nested tabs"), use the outdent-first-child pattern: outdent the node\'s first child first (sibling-adoption pulls the rest under it), then move the now-empty target. Or wrap both ops in a single bulk_apply for atomicity. Pass newParentId=null to move to root (auto-wraps tabs into a new window). CHROME TAB GROUP behavior (Pinako has no direct ops for Chrome Tab Group membership — it\'s controlled implicitly by tree position): a tab JOINS a Chrome Tab Group only when moved INTO a position BETWEEN two existing group members. Moving a tab to the position immediately BEFORE the first group member or immediately AFTER the last member does NOT auto-join — it stays adjacent but outside the group. A grouped tab moved AWAY from its siblings forcibly leaves the group. So to add tabs to a Chrome Tab Group: move them between any two members. To position a tab next to a group without joining: move it before the first member or after the last.',
     inputSchema: {
       nodeId:      z.string().describe('Node to move (with its subtree).'),
       newParentId: z.union([z.string(), z.null()]).optional().describe('Destination parent id, or null for root.'),
@@ -1345,6 +1356,44 @@ function createMcpServer() {
       browser:     z.string().optional().describe(BROWSER_ARG_DESC),
     },
   }, async (args) => writeToolHandler('set_library_group_description', args));
+
+  srv.registerTool('reorder_library_panel', {
+    description: 'Reorders the cards in the library panel (standalone library cards + library group cards). Pass the COMPLETE current list of entries in the desired order. Each entry is {type:"library"|"group", id:<id>}. ORDER ONLY — every existing entry must be present (rejects with PANEL_ORDER_MISMATCH if count differs, PANEL_ORDER_UNKNOWN_ENTRY if an unknown id is introduced). Use create_library / delete_library_group / etc. to change membership; this op cannot add or remove cards. Use list_libraries first to see current ordering, then submit the rearranged list. Max 200 entries.',
+    inputSchema: {
+      entries: z.array(z.object({
+        type: z.string().describe('"library" or "group"'),
+        id:   z.string().describe('Library or group id'),
+      })).describe('Full ordered list of panel cards. Must match current set exactly.'),
+      browser: z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('reorder_library_panel', args));
+
+  // ─── Bookmark-scope ops (Phase 3 Slice G) ──────────────────────────────────
+  // Standard agent ops (move_node, set_title, delete_node) accept scope='bookmarks'
+  // to operate on the browser's native bookmark tree. Plus a dedicated
+  // create_folder tool for new bookmark folders.
+
+  srv.registerTool('create_folder', {
+    description: 'Creates a new folder node in a library or in the browser bookmarks. NOT for the main tab tree (the main tree uses windows + groups, not folders). Required scope: "library" (with libraryId) or "bookmarks". Default position is TOP of the parent (matches manual UI). For bookmarks, the folder is also created in the browser\'s native bookmark tree via chrome.bookmarks.create — synced automatically. parentId omitted/null places the new folder at the scope root.',
+    inputSchema: {
+      title:     z.string().describe('Folder title (trimmed, non-empty, max 200 chars).'),
+      rowColor:  z.string().optional().describe('Optional row background color: a named color, hex string, or "accent2" (default).'),
+      parentId:  z.union([z.string(), z.null()]).optional().describe('Parent folder id, or null for scope root.'),
+      position:  z.number().optional().describe(POSITION_DESC + ' Default TOP if omitted.'),
+      scope:     z.string().describe('"library" or "bookmarks".'),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('create_folder', args));
+
+  srv.registerTool('reorder_libraries_in_group', {
+    description: 'Reorders the libraries within a single library group. Pass the COMPLETE current list of member library ids in the desired order. ORDER ONLY — every current member must be present (rejects with LIBRARY_ORDER_MISMATCH if count differs, LIBRARY_ORDER_UNKNOWN_MEMBER if an unknown id is introduced, LIBRARY_ORDER_DUPLICATE if duplicates). Use add_library_to_group / remove_library_from_group to change membership. Max 200.',
+    inputSchema: {
+      groupId:    z.string().describe('Target group id.'),
+      libraryIds: z.array(z.string()).describe('Full ordered list of member library ids. Must match current membership exactly.'),
+      browser:    z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('reorder_libraries_in_group', args));
 
   // ─── Composite ─────────────────────────────────────────────────────────────
   srv.registerTool('bulk_apply', {
