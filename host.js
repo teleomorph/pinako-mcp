@@ -71,6 +71,17 @@ function logRequest(label, req, body) {
 const MCP_PORT = 37421;
 const STDIN_GRACE_MS = 30_000;
 
+// Last-resort handlers so an uncaught error in any async path is at least
+// logged to disk before the process dies. Without these, an async throw in
+// the /edit handler or NM listener would crash the host silently from the
+// AI Bridge user's perspective.
+process.on('uncaughtException', (err) => {
+  try { log(`UNCAUGHT EXCEPTION: ${err && err.stack ? err.stack : String(err)}`); } catch (_) {}
+});
+process.on('unhandledRejection', (reason) => {
+  try { log(`UNHANDLED REJECTION: ${reason && reason.stack ? reason.stack : String(reason)}`); } catch (_) {}
+});
+
 // ─── Mode detection ───────────────────────────────────────────────────────────
 // --stdio-mcp <URL>: act as a stdio MCP server that proxies to a local HTTP MCP
 // server. Used by Claude Desktop, whose mcpServers schema only accepts
@@ -98,14 +109,64 @@ let extensionConnected = false;
 let shutdownTimer = null;
 let forwardToExisting = null; // set on EADDRINUSE — forward data to old instance then exit
 
+// ─── Phase 2 Slice A: applyEdit pending registry ──────────────────────────────
+// Tracks in-flight applyEdit RPCs from the HTTP /edit endpoint (and future MCP
+// write tools in Phase 3). Each entry resolves when the matching editApplied /
+// editFailed message arrives back over NM, or rejects on timeout. Single-browser
+// only in Slice A; Slice B adds SSE forwarder routing for non-leader browsers.
+const pendingEdits = new Map();   // requestId -> { resolve, timer, browserId }
+const EDIT_TIMEOUT_MS = 30_000;
+
 // ─── Native Messaging write ───────────────────────────────────────────────────
 // Chrome NM protocol: 4-byte LE length prefix + UTF-8 JSON body.
 // Write to stdout only. Never use console.log() — it corrupts stdout.
+//
+// EPIPE handling. On Windows, Chrome doesn't reliably close the bridge's
+// stdin pipe when the SW reconnects to a fresh bridge process; the OLD
+// bridge keeps its HTTP server alive and continues to receive data via
+// `/update` from the forwarder, but its outbound NM pipe (stdout) is
+// severed. The next nmWrite throws EPIPE asynchronously, which (without
+// this guard) crashes the request that triggered it without releasing
+// port 37421. Phase 1 / v1.2.0 only sent ONE nmWrite (initial `getTree`)
+// so this latent bug never bit; Phase 2 makes outbound NM the hot path.
+//
+// Fix: catch EPIPE both synchronously (rare) AND on the stream's 'error'
+// event (the actual delivery path on Windows). Either way: log, mark the
+// bridge as fatally degraded, exit so the forwarder can re-bind 37421
+// and become a healthy leader.
+let _nmStdoutBroken = false;
+
+function _markNmStdoutBroken(reason) {
+  if (_nmStdoutBroken) return;
+  _nmStdoutBroken = true;
+  try { log(`Native messaging stdout broken (${reason}); exiting so a healthy bridge can take port ${MCP_PORT}.`); } catch (_) {}
+  // Settle in 200ms so any in-flight log/HTTP responses get flushed.
+  setTimeout(() => process.exit(0), 200);
+}
+
+process.stdout.on('error', (err) => {
+  if (err && (err.code === 'EPIPE' || /EPIPE|broken pipe/i.test(err.message || ''))) {
+    _markNmStdoutBroken('stdout error EPIPE');
+  } else {
+    try { log(`stdout error: ${err && err.message ? err.message : String(err)}`); } catch (_) {}
+  }
+});
+
 function nmWrite(obj) {
+  if (_nmStdoutBroken) return false;
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
   const header = Buffer.alloc(4);
   header.writeUInt32LE(body.length, 0);
-  process.stdout.write(Buffer.concat([header, body]));
+  try {
+    process.stdout.write(Buffer.concat([header, body]));
+    return true;
+  } catch (err) {
+    if (err && (err.code === 'EPIPE' || /EPIPE|broken pipe/i.test(err.message || ''))) {
+      _markNmStdoutBroken('nmWrite sync EPIPE');
+      return false;
+    }
+    throw err;
+  }
 }
 
 // ─── Native Messaging async read ─────────────────────────────────────────────
@@ -136,6 +197,23 @@ function handleNmMessage(msg) {
       browserBrand,
     });
     process.stderr.write(`[pinako-mcp] Tree updated from ${browserBrand} (${browserId.slice(0,16)}…): ${msg.data.tree?.length || 0} windows.\n`);
+  } else if (msg.type === 'editApplied' || msg.type === 'editFailed') {
+    // Phase 2 Slice A: applyEdit RPC reply from extension. Resolve the
+    // pending Promise registered by dispatchEdit. Late replies (after
+    // timeout fired and removed the entry) are silently dropped.
+    const pending = pendingEdits.get(msg.requestId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingEdits.delete(msg.requestId);
+    if (msg.type === 'editApplied') {
+      pending.resolve(msg.result || { ok: true, requestId: msg.requestId });
+    } else {
+      pending.resolve({
+        ok: false,
+        requestId: msg.requestId,
+        error: msg.error || { code: 'UNKNOWN_EDIT_FAILURE', message: 'editFailed without error details' },
+      });
+    }
   }
 }
 
@@ -166,6 +244,54 @@ if (!BRIDGE_URL) {
       process.stderr.write('[pinako-mcp] Grace period expired. Exiting.\n');
       process.exit(0);
     }, STDIN_GRACE_MS);
+  });
+}
+
+// ─── Phase 2 Slice A: applyEdit dispatcher ────────────────────────────────────
+// Sends an applyEdit message to the locally-connected extension over NM and
+// returns a Promise that resolves with the editApplied / editFailed reply.
+// Single-browser only in Slice A — `browserId` is informational so the result
+// payload can echo it back. Slice B will route to non-leader browsers via SSE.
+function dispatchEdit(op, browserId) {
+  // Keep all logging OUTSIDE the Promise executor: process.stderr/stdout writes
+  // can emit async error events that try/catch can't catch and that crash the
+  // Promise. We log on entry/exit using the resolved value and the requestId
+  // we generate up front.
+  const requestId = randomUUID();
+  log(`dispatchEdit ${requestId.slice(0,8)} starting op=${op.type} browserId=${(browserId||'').slice(0,16)}…`);
+  return new Promise((resolve) => {
+    if (_nmStdoutBroken) {
+      resolve({
+        ok: false,
+        requestId,
+        error: { code: 'NM_STDOUT_BROKEN', message: 'Native messaging stdout is broken (zombie leader). The bridge is exiting; reload the Pinako extension and retry in a few seconds.' },
+      });
+      return;
+    }
+    const timer = setTimeout(() => {
+      pendingEdits.delete(requestId);
+      resolve({
+        ok: false,
+        requestId,
+        error: { code: 'EDIT_TIMEOUT', message: `applyEdit ${requestId} timed out after ${EDIT_TIMEOUT_MS}ms` },
+      });
+    }, EDIT_TIMEOUT_MS);
+    pendingEdits.set(requestId, { resolve, timer, browserId });
+    // The extension's SW NM listener picks this up, forwards to the popup
+    // via chrome.runtime.sendMessage, popup runs mutateTreeForAgent, replies
+    // editApplied / editFailed back over NM. nmWrite returns false (instead
+    // of throwing) when stdout is broken; we resolve immediately in that
+    // case so the request doesn't hang for the full 30s timeout.
+    const ok = nmWrite({ type: 'applyEdit', op, requestId, browserId });
+    if (!ok) {
+      clearTimeout(timer);
+      pendingEdits.delete(requestId);
+      resolve({
+        ok: false,
+        requestId,
+        error: { code: 'NM_WRITE_FAILED', message: 'Native messaging write failed (stdout broken). The bridge is exiting; reload the Pinako extension and retry.' },
+      });
+    }
   });
 }
 
@@ -503,6 +629,52 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  // ─── Phase 2 Slice A: applyEdit endpoint (curl-testable) ──────────────────
+  // Body: { op: <agent op shape>, browser?: <browserId|brand> }
+  // Response: { ok, requestId, error?, ...wrapper-result-fields }
+  // Status: 200 on ok=true, 502 on ok=false (Bad Gateway = upstream issue).
+  // Slice A is single-browser: only the locally-connected extension can be
+  // written to. If `browser` resolves to a non-local cache entry, the dispatch
+  // still goes over our local NM (which targets only our local extension), so
+  // the wrong-browser case effectively no-ops on the wrong extension. Slice B
+  // adds proper SSE forwarder routing for multi-browser writes.
+  if (req.url === '/edit' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', async () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const { op, browser } = body;
+        if (!op || typeof op !== 'object' || typeof op.type !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: { code: 'BAD_REQUEST', message: 'Body must be { op: { type: ..., ... }, browser?: ... }' },
+          }));
+          return;
+        }
+        const r = resolveBrowserData(browser);
+        if (r.error) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: { code: 'BROWSER_NOT_FOUND', message: r.error.content[0].text },
+          }));
+          return;
+        }
+        log(`POST /edit: op.type=${op.type} browserId=${r.data.browserId.slice(0,16)}…`);
+        const result = await dispatchEdit(op, r.data.browserId);
+        res.writeHead(result.ok ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        log(`POST /edit error: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: { code: 'INTERNAL', message: e.message } }));
+      }
+    });
+    return;
+  }
+
   if (req.url !== '/mcp') { res.writeHead(404); res.end(); return; }
 
   if (req.method === 'POST') {
@@ -572,33 +744,79 @@ const httpServer = http.createServer(async (req, res) => {
 
 // HTTP server only listens in default mode. The bridge mode is purely a
 // stdio↔HTTP proxy and never opens a port itself.
-if (!BRIDGE_URL) {
-  httpServer.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
+//
+// Forwarder takeover. When a forwarder is running and the leader exits
+// (zombie-leader EPIPE detection above, or any other reason), port 37421
+// becomes free. Without active retry, the forwarder stays in forwarder
+// mode forever and only the next SW reconnect (which spawns a fresh
+// bridge) ever restores HTTP service. Periodic re-bind closes that gap:
+// every PROMOTE_RETRY_MS, the forwarder tries to bind. On success it
+// becomes the new leader and clears `forwardToExisting`.
+const PROMOTE_RETRY_MS = 5_000;
+let promoteTimer = null;
+
+function attemptListen() {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const onceErr = (e) => {
+      if (resolved) return;
+      resolved = true;
+      httpServer.removeListener('listening', onceOk);
+      resolve({ ok: false, error: e });
+    };
+    const onceOk = () => {
+      if (resolved) return;
+      resolved = true;
+      httpServer.removeListener('error', onceErr);
+      resolve({ ok: true });
+    };
+    httpServer.once('error', onceErr);
+    httpServer.once('listening', onceOk);
+    httpServer.listen(MCP_PORT, '127.0.0.1');
+  });
+}
+
+async function tryBindOrForward(initialAttempt) {
+  const r = await attemptListen();
+  if (r.ok) {
+    if (!initialAttempt) {
+      log(`Forwarder promoted to leader; bound port ${MCP_PORT}.`);
+    }
+    forwardToExisting = null;
+    if (promoteTimer) { clearInterval(promoteTimer); promoteTimer = null; }
+    extensionConnected = true;
+    process.stderr.write(`[pinako-mcp] Listening on http://127.0.0.1:${MCP_PORT}/mcp\n`);
+    nmWrite({ type: 'getTree' });
+    return;
+  }
+  if (r.error && r.error.code === 'EADDRINUSE') {
+    if (initialAttempt) {
       process.stderr.write(`[pinako-mcp] Port ${MCP_PORT} in use — relaying to existing instance.\n`);
       forwardToExisting = (payload) => {
-        // payload: { data, browserId, browserBrand }
         const body = JSON.stringify(payload);
-        const r = http.request(
+        const req = http.request(
           { hostname: '127.0.0.1', port: MCP_PORT, path: '/update', method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
           () => { process.stderr.write(`[pinako-mcp] Relayed tree update from ${payload.browserBrand || 'unknown'}.\n`); }
         );
-        r.on('error', (err) => { process.stderr.write(`[pinako-mcp] Relay error: ${err.message}\n`); });
-        r.write(body); r.end();
+        req.on('error', (err) => { process.stderr.write(`[pinako-mcp] Relay error: ${err.message}\n`); });
+        req.write(body); req.end();
       };
       nmWrite({ type: 'getTree' });
-    } else {
-      process.stderr.write(`[pinako-mcp] HTTP error: ${e.message}\n`);
-      process.exit(1);
+      // Start promotion polling so we can take over when the leader dies.
+      if (!promoteTimer) {
+        promoteTimer = setInterval(() => { tryBindOrForward(false).catch(() => {}); }, PROMOTE_RETRY_MS);
+      }
     }
-  });
+    // else: still busy on retry, leave forwarder running and try again next tick.
+    return;
+  }
+  process.stderr.write(`[pinako-mcp] HTTP error: ${r.error?.message || 'unknown'}\n`);
+  if (initialAttempt) process.exit(1);
+}
 
-  httpServer.listen(MCP_PORT, '127.0.0.1', () => {
-    extensionConnected = true;
-    process.stderr.write(`[pinako-mcp] Listening on http://127.0.0.1:${MCP_PORT}/mcp\n`);
-    nmWrite({ type: 'getTree' });
-  });
+if (!BRIDGE_URL) {
+  tryBindOrForward(true);
 }
 
 // ─── Stdio MCP bridge mode ────────────────────────────────────────────────────
