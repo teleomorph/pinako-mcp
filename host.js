@@ -21,7 +21,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
 
 // ─── Debug log file ───────────────────────────────────────────────────────────
 // Cross-platform log path (host.js is bundled independently — no import from setup/paths.js)
@@ -133,7 +133,7 @@ let forwardToExisting = null; // set on EADDRINUSE — forward data to old insta
 // /update POST and on the /edits subscribe + /edit-result POST.
 // Leader side: stores the most recent token per browserId; validates on
 // every /edits and /edit-result.
-const _myForwarderToken = require('crypto').randomBytes(16).toString('hex');
+const _myForwarderToken = randomBytes(16).toString('hex');
 
 // ─── Phase 2 Slice A: applyEdit pending registry ──────────────────────────────
 // Tracks in-flight applyEdit RPCs from the HTTP /edit endpoint (and future MCP
