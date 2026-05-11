@@ -316,6 +316,18 @@ function handleNmMessage(msg) {
       forwarderToken: prior?.forwarderToken || null,
     });
     process.stderr.write(`[pinako-mcp] Tree updated from ${browserBrand} (${browserId.slice(0,16)}…): ${msg.data.tree?.length || 0} windows.\n`);
+    // Diagnostic: surface docs/bookmarks counts on every NM update so we can
+    // tell at a glance whether the extension is pushing them. Logged to the
+    // disk log (not just stderr) so it survives across leader processes.
+    try {
+      const docsLen = Array.isArray(msg.data?.docs) ? msg.data.docs.length : '<absent>';
+      const bmLen = Array.isArray(msg.data?.bookmarks)
+        ? msg.data.bookmarks.reduce((acc, r) => acc + countBookmarksRecursive(r), 0)
+        : '<absent>';
+      log(`NM update from ${browserBrand}: docs=${docsLen} bookmarks=${bmLen} windows=${msg.data?.tree?.length || 0}`);
+    } catch (e) {
+      try { log(`NM update log failed: ${e.message}`); } catch (_) {}
+    }
   } else if (msg.type === 'editApplied' || msg.type === 'editFailed') {
     // applyEdit RPC reply from local extension. In forwarder mode, this is
     // an SSE-routed edit from the leader — POST result back to /edit-result
@@ -1646,11 +1658,25 @@ const httpServer = http.createServer(async (req, res) => {
           // /update. Stored alongside other browser identity so leader-side
           // /edits and /edit-result validators can match.
           const fwToken = (typeof forwarderToken === 'string' && forwarderToken.length > 0) ? forwarderToken : null;
+          // 2026-05-11: docs uses the same preserve-when-omitted pattern as
+          // handleNmMessage. The /update relay can fire twice within a few
+          // seconds when an extension's SW calls connectNative more than once
+          // (popup-open + reconnect, dev-mode toggle, etc.) — one path
+          // populates docs via NM, then a forwarder relays a docsless update
+          // that would wipe them. Preserve cached docs when the incoming
+          // payload omits the field. Same shape for bookmarks would have
+          // helped earlier; leaving the literal bookmarks fallback in place
+          // for now since it matches what extension always sends today.
+          const priorCache = cachedData.get(id);
+          const docsField = (data && 'docs' in data)
+            ? (data.docs || [])
+            : (priorCache?.docs || []);
           cachedData.set(id, {
             tree:           data.tree         || [],
             libraries:      data.libraries    || [],
             globalNotes:    data.globalNotes  || [],
             bookmarks:      data.bookmarks    || [],
+            docs:           docsField,
             updatedAt:      Date.now(),
             browserId:      id,
             browserBrand:   brand,
@@ -1658,6 +1684,12 @@ const httpServer = http.createServer(async (req, res) => {
             userId:         uid,
             forwarderToken: fwToken,
           });
+          // Same diagnostic line as the NM path so we can tell at a glance
+          // whether docs were preserved or overwritten.
+          try {
+            const incomingDocs = Array.isArray(data?.docs) ? data.docs.length : '<absent>';
+            log(`/update from ${brand}: incoming docs=${incomingDocs} → stored docs=${docsField.length} windows=${data?.tree?.length || 0}`);
+          } catch (_) {}
           extensionConnected = true;
           if (shutdownTimer) { clearTimeout(shutdownTimer); shutdownTimer = null; }
           process.stderr.write(`[pinako-mcp] Cache refreshed via /update from ${brand}.\n`);
