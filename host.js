@@ -116,6 +116,25 @@ let extensionConnected = false;
 let shutdownTimer = null;
 let forwardToExisting = null; // set on EADDRINUSE — forward data to old instance then exit
 
+// 2026-05-11: forwarderToken binds an SSE /edits subscription to the
+// forwarder process that registered the underlying browser via /update.
+// Without it, ANY local process could GET /edits?browserId=X to intercept
+// agent writes (full set_note_content payload visible on the wire), evict
+// the legitimate forwarder, and POST /edit-result with fake outcomes that
+// the leader resolves as the AI client's response.
+//
+// Threat model: 127.0.0.1 is "local trust" but other processes on the
+// machine should NOT see write payloads or be able to spoof outcomes.
+// Token-binding closes that gap: only the bridge process that posted
+// /update with token T can subscribe to /edits and post /edit-result
+// for that browserId.
+//
+// Forwarder side: generates one random token at startup; sends it on every
+// /update POST and on the /edits subscribe + /edit-result POST.
+// Leader side: stores the most recent token per browserId; validates on
+// every /edits and /edit-result.
+const _myForwarderToken = require('crypto').randomBytes(16).toString('hex');
+
 // ─── Phase 2 Slice A: applyEdit pending registry ──────────────────────────────
 // Tracks in-flight applyEdit RPCs from the HTTP /edit endpoint (and future MCP
 // write tools in Phase 3). Each entry resolves when the matching editApplied /
@@ -260,16 +279,32 @@ function handleNmMessage(msg) {
       shutdownTimer = null;
     }
     extensionConnected = true;
+    // 2026-05-11: when the data payload OMITS `bookmarks` (e.g., a
+    // pushTreeUpdate from the popup after a non-bookmark agent op),
+    // PRESERVE the previously cached bookmarks for this browserId
+    // instead of wiping to []. Bookmarks aren't cloud-synced and can
+    // only change via chrome.bookmarks-driven events; a non-bookmark
+    // agent write can't have invalidated them. The initial getTree at
+    // bridge start populates them; later pushes only override when the
+    // op actually touched bookmarks.
+    const prior = cachedData.get(browserId);
+    const bookmarks = (msg.data && 'bookmarks' in msg.data)
+      ? (msg.data.bookmarks || [])
+      : (prior?.bookmarks || []);
     cachedData.set(browserId, {
-      tree:         msg.data.tree         || [],
-      libraries:    msg.data.libraries    || [],
-      globalNotes:  msg.data.globalNotes  || [],
-      bookmarks:    msg.data.bookmarks    || [],
-      updatedAt:    Date.now(),
+      tree:           msg.data.tree         || [],
+      libraries:      msg.data.libraries    || [],
+      globalNotes:    msg.data.globalNotes  || [],
+      bookmarks,
+      updatedAt:      Date.now(),
       browserId,
       browserBrand,
       userTier,
       userId,
+      // Preserve forwarderToken across non-bookmark pushes — it was set
+      // by the most recent /update; treeUpdate via direct NM doesn't carry
+      // a token (NM-direct is implicitly trusted via Chrome's allowed_origins).
+      forwarderToken: prior?.forwarderToken || null,
     });
     process.stderr.write(`[pinako-mcp] Tree updated from ${browserBrand} (${browserId.slice(0,16)}…): ${msg.data.tree?.length || 0} windows.\n`);
   } else if (msg.type === 'editApplied' || msg.type === 'editFailed') {
@@ -486,7 +521,10 @@ function _ensureSseConnection() {
   const req = http.request({
     hostname: '127.0.0.1',
     port: MCP_PORT,
-    path: `/edits?browserId=${encodeURIComponent(localBrowserId)}`,
+    // 2026-05-11: include forwarderToken so the leader token-binds this
+    // SSE channel to THIS forwarder process (rejects other local
+    // processes trying to subscribe to the same browserId).
+    path: `/edits?browserId=${encodeURIComponent(localBrowserId)}&token=${encodeURIComponent(_myForwarderToken)}`,
     method: 'GET',
     headers: { 'Accept': 'text/event-stream' },
   });
@@ -565,10 +603,14 @@ function _handleSseEvent(eventText) {
 
 function _postEditResultToLeader(msg) {
   const body = JSON.stringify({
-    requestId: msg.requestId,
-    ok:        msg.type === 'editApplied',
-    result:    msg.result,
-    error:     msg.error,
+    requestId:      msg.requestId,
+    ok:             msg.type === 'editApplied',
+    result:         msg.result,
+    error:          msg.error,
+    // 2026-05-11: token-bound /edit-result. Without this, any local
+    // process that observed a requestId could spoof a successful
+    // editApplied for the AI client.
+    forwarderToken: _myForwarderToken,
   });
   const req = http.request(
     { hostname: '127.0.0.1', port: MCP_PORT, path: '/edit-result', method: 'POST',
@@ -591,7 +633,14 @@ function _postEditResultToLeader(msg) {
 //   - Always-destructive ops: ghost_node, delete_live_node. Listed in the set.
 //   - Conditionally-destructive: delete_library_group with cascadeMembers:true.
 //     Plain dissolve is non-destructive (Slice 1.5 back-compat).
-const _ALWAYS_DESTRUCTIVE_OP_TYPES = new Set(['ghost_node', 'delete_live_node']);
+// 2026-05-11 reshuffle: ghost_node moved OUT of the destructive list — the
+// tree record is preserved so an erroneous ghost is reversible by re-opening
+// from the tree. delete_node moved INTO the list — deleting tree records
+// loses metadata (tags, memos, star color, custom title) permanently;
+// only Chrome history retains the URL. delete_live_node remains (closes
+// browser tabs AND removes tree records). delete_library_group with
+// cascadeMembers:true stays conditionally destructive (handled below).
+const _ALWAYS_DESTRUCTIVE_OP_TYPES = new Set(['delete_node', 'delete_live_node']);
 
 function _isDestructiveOp(op) {
   if (!op || typeof op !== 'object') return false;
@@ -668,7 +717,7 @@ function _checkNoteContentTierAtBridge(op, browserData, fallbackScope, fallbackL
 // the op shape minimally, resolves the target browser via resolveBrowserData,
 // then routes to local NM (Slice A) or SSE forwarder (Slice B). Returns a
 // uniform result shape: { ok: true, ...wrapperResult } or { ok: false, error }.
-// The 22 MCP write tools call this directly; /edit also calls it and translates
+// The MCP write tools registered in createMcpServer() call this directly; /edit also calls it and translates
 // the result into an HTTP response via httpStatusForEditResult.
 async function executeEdit(op, browserArg) {
   if (!op || typeof op !== 'object' || typeof op.type !== 'string') {
@@ -908,7 +957,28 @@ function countBookmarksRecursive(node) {
 // ─── MCP Server factory ────────────────────────────────────────────────────────
 // Each HTTP session gets its own McpServer + transport instance.
 // Tool handlers read from the global cachedData (no per-session state needed).
-const SERVER_INSTRUCTIONS = `Pinako is a browser tab manager Chrome extension. This MCP server gives you read access to the user's live tab data.
+const SERVER_INSTRUCTIONS = `Pinako is a browser tab manager Chrome extension. This MCP server gives you READ and WRITE access to the user's live tab data, libraries, library groups, notes, and browser bookmarks.
+
+WRITE TOOLS (Pro tier 1+)
+Read tools (get_tree, search_tabs, list_libraries, get_library, get_global_notes, get_bookmarks, list_browsers) require no special handling.
+
+Write tools fall into four categories:
+- METADATA: set_tags, add_tags, remove_tags, set_memo, set_star_color, set_row_color, set_title.
+- TREE STRUCTURE: move_node, indent_node, outdent_node, create_group, delete_node, ghost_node, delete_live_node, create_folder.
+- LIBRARY SYSTEM: create_library, add_to_library, set_note_content, create_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group.
+- COMPOSITE: bulk_apply (up to 100 sub-ops, atomic, undoable as a single unit).
+
+DESTRUCTIVE OPS need explicit user approval. Set confirmedByUser:true on these tools ONLY after the user has confirmed THIS specific action (not as a default, not on retry after a failure):
+- delete_node (removes a ghost tree record permanently; only Chrome history retains the URL)
+- delete_live_node (closes live tabs AND removes the tree record)
+- delete_library_group with cascadeMembers:true (also deletes member libraries' content)
+Note: ghost_node (closes live tabs, preserves tree record) is NOT destructive — the user can re-open from the tree.
+
+CREATE-* OPS ARE NOT IDEMPOTENT. On transient failures (EDIT_TIMEOUT, NM_WRITE_FAILED, LEADER_CHANGED, FORWARDER_DISCONNECTED), DO NOT auto-retry — query state (list_libraries / get_global_notes / get_library) first to check whether the previous attempt succeeded. Otherwise you may silently create duplicates.
+
+DELETE/GHOST OPS ARE IDEMPOTENT-ON-RETRY. NODE_NOT_FOUND (delete_node) or NODE_NOT_LIVE (ghost_node) on a retry typically means the previous call succeeded but the response was lost — treat as success rather than re-asking the user.
+
+ERROR HANDLING. Every write tool returns either {ok:true, ...result} or {ok:false, error:{code, message, context}}. Branch on error.code to react programmatically (e.g., CONFIRMATION_REQUIRED → ask the user to confirm; NOTE_CONTENT_OVER_TIER_LIMIT → trim content or warn the user; LIBRARY_NOT_FOUND → re-fetch list_libraries; subOpIndex in bulk_apply errors identifies the failing sub-op so you can correct and resubmit).
 
 DATA MODEL
 The tab tree is hierarchical: Windows → Groups → Tabs.
@@ -1089,7 +1159,7 @@ function createMcpServer() {
   );
 
   // ═══ Write tools (Phase 3 Slice A) ═════════════════════════════════════════
-  // 22 agent ops registered as MCP tools so AI clients (Claude Desktop, Cursor,
+  // Agent ops registered as MCP tools so AI clients (Claude Desktop, Cursor,
   // Cline, Continue.dev, etc.) can drive the same engine surface that's already
   // curl-testable via /edit. Schemas are intentionally LOOSE at this boundary
   // (field types only) — the engine's zod schemas in mutation-engine.js are
@@ -1114,7 +1184,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_tags', args));
 
   srv.registerTool('add_tags', {
-    description: 'APPENDS tags to a node, deduping and preserving order of existing tags. Use this when the user says "tag X with Y" or "also add Z" — it preserves prior tags. Use set_tags for full replacement, remove_tags for deletion.',
+    description: 'APPENDS tags to a node, deduping and preserving order of existing tags. Use this when the user says "tag X with Y" or "also add Z" — it preserves prior tags. Use set_tags for full replacement, remove_tags for deletion. Constraints: each tag max 50 chars; max 50 tags per node total (existing + appended).',
     inputSchema: {
       nodeId:    z.string().describe('Target node id.'),
       tags:      z.array(z.string()).min(1).describe('Tags to append (deduped against existing).'),
@@ -1125,7 +1195,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('add_tags', args));
 
   srv.registerTool('remove_tags', {
-    description: 'Filters specific tags off a node, preserving the rest. No-op for tags not present. Use this for "untag X from Y" requests.',
+    description: 'Filters specific tags off a node, preserving the rest. No-op for tags not present. Use this for "untag X from Y" requests. Constraints: each tag max 50 chars.',
     inputSchema: {
       nodeId:    z.string().describe('Target node id.'),
       tags:      z.array(z.string()).min(1).describe('Tags to remove (no-op if missing).'),
@@ -1148,7 +1218,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_memo', args));
 
   srv.registerTool('set_star_color', {
-    description: 'Sets the row star color on a node. Accepts a named color (e.g. "yellow", "red", "purple") or an explicit hex (e.g. "#ffaa00"). Pass null to clear.',
+    description: 'Sets the row star color on a node. Accepts a named color (red, orange, yellow, green, blue, purple) OR its exact hex equivalent (#ff4d4f red, #fa8c16 orange, #fadb14 yellow, #52c41a green, #1890ff blue, #722ed1 purple). Arbitrary hex codes are NOT accepted — only the six pre-defined hex values. Pass null to clear.',
     inputSchema: {
       nodeId:    z.string().describe('Target node id.'),
       color:     z.union([z.string(), z.null()]).describe('Color name, hex string, or null to clear.'),
@@ -1207,23 +1277,23 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('create_group', args));
 
   srv.registerTool('delete_node', {
-    description: 'Deletes a GHOST node (chromeId=null — closed/saved tabs that the user preserved in the tree). REJECTS subtrees that contain any live node (chromeId set) with LIVE_NODE_REFUSED — for live tabs/windows, use ghost_node (close browser tabs but keep saved nodes) or delete_live_node (close browser tabs AND remove saved nodes). Use delete_node for "clean up these saved tabs I don\'t need anymore".',
+    description: 'DESTRUCTIVE — permanently removes a GHOST node (chromeId=null) and its metadata (tags, memos, star color, custom title). For scope="bookmarks", removes the bookmark from the browser via chrome.bookmarks.remove. REJECTS subtrees that contain any live tab (chromeId set) with LIVE_NODE_REFUSED — for live tabs, use ghost_node first (closes the browser tab, preserves the tree record) then delete_node, OR use delete_live_node which does both in one shot. REQUIRES EXPLICIT USER APPROVAL: set confirmedByUser:true ONLY after the user has confirmed THIS specific deletion. Once deleted, only Chrome history retains the URL — Pinako-specific metadata is gone permanently. Idempotent-on-retry: NODE_NOT_FOUND on a retry typically means the previous call succeeded but the response was lost; treat as success rather than re-asking the user.',
     inputSchema: {
-      nodeId:    z.string().describe('Target ghost node id.'),
-      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
-      libraryId: z.string().optional().describe('Required when scope=library.'),
-      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
-    },
-  }, async (args) => writeToolHandler('delete_node', args));
-
-  srv.registerTool('ghost_node', {
-    description: 'DESTRUCTIVE — closes the live browser tab(s) for this node and all live descendants. The tree node and its structure are preserved with chromeId=null on every ghosted node, so the user can re-open them later. Mirrors the manual "X" button. REQUIRES EXPLICIT USER APPROVAL: set confirmedByUser:true ONLY after the user has confirmed THIS specific ghost action — do not set it as a default or retry it after a previous failure. The engine and bridge both enforce this; missing the flag returns CONFIRMATION_REQUIRED. Returns NODE_NOT_LIVE if nothing in the subtree is live.',
-    inputSchema: {
-      nodeId:          z.string().describe('Target node id (tab, window, group, or folder). The node and all live descendants will be ghosted.'),
+      nodeId:          z.string().describe('Target ghost node id (or bookmark id when scope="bookmarks").'),
       confirmedByUser: z.literal(true).describe('Must be exactly TRUE. Set ONLY after explicit user approval of this specific destructive action.'),
       scope:           z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
       libraryId:       z.string().optional().describe('Required when scope=library.'),
       browser:         z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+  }, async (args) => writeToolHandler('delete_node', args));
+
+  srv.registerTool('ghost_node', {
+    description: 'Closes the live browser tab(s) for this node and all live descendants, while preserving the tree node with chromeId=null on every ghosted node. Mirrors the manual "X" button. REVERSIBLE: the user can re-open from the tree later (URLs and metadata stay in the tree). Use this for "close these tabs but keep them saved" intents — end-of-day cleanup, freeing memory, archiving research. No confirmedByUser required (2026-05-11): the tree record is preserved so an erroneous ghost is undoable by re-opening. The browser-tab close is still visible, so narrate the intent before invoking ("I\'ll close these but they\'ll stay saved in your tree"). Returns NODE_NOT_LIVE if nothing in the subtree is live. Idempotent-on-retry: NODE_NOT_LIVE on retry typically means the previous call already ghosted everything; treat as success.',
+    inputSchema: {
+      nodeId:    z.string().describe('Target node id (tab, window, group, or folder). The node and all live descendants will be ghosted.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
   }, async (args) => writeToolHandler('ghost_node', args));
 
@@ -1239,24 +1309,28 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('delete_live_node', args));
 
   srv.registerTool('indent_node', {
-    description: 'Nests a node under its previous sibling (one level deeper). Rejects when the node has no prior sibling (INDENT_NO_PREV_SIBLING). Auto-expands the new parent. Tree-only (not for libraries or bookmarks).',
+    description: 'Nests a node under its previous sibling (one level deeper). Rejects when the node has no prior sibling (INDENT_NO_PREV_SIBLING). Auto-expands the new parent. Works across tree, library, and bookmark scopes — a common pattern for quickly de-nesting then re-organizing tabs. For scope="bookmarks", the parent change syncs to chrome.bookmarks.move (when the new parent is a folder) or to Pinako\'s tab-under-tab override (when the new parent is a tab/bookmark — chrome.bookmarks can\'t represent that natively).',
     inputSchema: {
       nodeId:    z.string().describe('Node to indent.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
   }, async (args) => writeToolHandler('indent_node', args));
 
   srv.registerTool('outdent_node', {
-    description: 'Promotes a node to its grandparent\'s level (one level shallower). Sibling-adoption preserves layout: the outdented node\'s younger siblings become its children, so visual row order is preserved. CHILD-EXTRACTION PATTERN: outdent the FIRST child of a target to free the target solo (target becomes empty, all children become adopted under the outdented first child). Tree-only.',
+    description: 'Promotes a node to its grandparent\'s level (one level shallower). Sibling-adoption preserves layout: the outdented node\'s younger siblings become its children, so visual row order is preserved. CHILD-EXTRACTION PATTERN: outdent the FIRST child of a target to free the target solo (target becomes empty, all children become adopted under the outdented first child). Works across tree, library, and bookmark scopes. For scope="bookmarks", the parent change (and each adopted sibling\'s new parent) syncs to chrome.bookmarks.move or to Pinako\'s tab-under-tab override depending on the new parent\'s type.',
     inputSchema: {
       nodeId:    z.string().describe('Node to outdent.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
   }, async (args) => writeToolHandler('outdent_node', args));
 
   // ─── Library system ops ─────────────────────────────────────────────────────
   srv.registerTool('create_library', {
-    description: 'Creates a new empty library with an auto-seeded "Notes" note. Returns createdLibraryId and createdNoteId in the result. Use add_to_library afterwards to populate. For just creating an organizational umbrella over EXISTING libraries, use create_library_group instead.',
+    description: 'Creates a new empty library with an auto-seeded "Notes" note. Returns createdLibraryId and createdNoteId in the result. Use add_to_library afterwards to populate. For just creating an organizational umbrella over EXISTING libraries, use create_library_group instead. NOT IDEMPOTENT: each call creates a new library. On transient failures (EDIT_TIMEOUT, FORWARDER_DISCONNECTED, LEADER_CHANGED, NM_WRITE_FAILED), DO NOT auto-retry — call list_libraries to check whether the previous attempt succeeded before retrying, otherwise you may create duplicates.',
     inputSchema: {
       title:       z.string().describe('Library title (trimmed, non-empty, max 200 chars).'),
       description: z.string().optional().describe('Optional description shown beneath title (max 1000 chars).'),
@@ -1279,7 +1353,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('add_to_library', args));
 
   srv.registerTool('set_note_content', {
-    description: 'Updates an existing note\'s content. MODE GUIDANCE: "replace" (default) overwrites — use for "update note X with Y", "replace note X". "append" concatenates after existing content — use for "add Y to note X", "note down that ...". For prepend, read existing content first then call replace with the combined string. Note char limit is tier-gated (50K Pro / 150K Pro+ / 250K Premium / 500K Enterprise); for append mode the FINAL length is what\'s gated.',
+    description: 'Updates an existing note\'s content. MODE GUIDANCE: "replace" (default) overwrites — use for "update note X with Y", "replace note X". "append" concatenates after existing content — use for "add Y to note X", "note down that ...". For prepend, read existing content first then call replace with the combined string. Note char limit is tier-gated (50K Pro / 150K Pro+ / 250K Premium / 500K Enterprise); for append mode the FINAL length is what\'s gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. Idempotent on retry for replace mode; append mode on retry would double-append, so DO NOT auto-retry append on transient failures — re-read first.',
     inputSchema: {
       noteId:    z.string().describe('Note id within the target notes array.'),
       content:   z.string().describe('Note content (max varies by tier; see description).'),
@@ -1291,7 +1365,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_note_content', args));
 
   srv.registerTool('create_note', {
-    description: 'Creates a new note in a library or in global notes. Use this when the user says "create a note about X", "save these findings as a new note", etc. For UPDATING an existing note, use set_note_content. Returns createdNoteId. Char limit is tier-gated.',
+    description: 'Creates a new note in a library or in global notes. Use this when the user says "create a note about X", "save these findings as a new note", etc. For UPDATING an existing note, use set_note_content. Returns createdNoteId. Char limit is tier-gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. NOT IDEMPOTENT: each call creates a new note. On transient failures, DO NOT auto-retry — call get_library or get_global_notes to check whether the previous attempt succeeded before retrying.',
     inputSchema: {
       title:     z.string().describe('Note title (trimmed, non-empty, max 200 chars).'),
       content:   z.string().optional().describe('Initial content (default empty). Char limit varies by tier.'),
@@ -1303,7 +1377,7 @@ function createMcpServer() {
 
   // ─── Library Group ops ──────────────────────────────────────────────────────
   srv.registerTool('create_library_group', {
-    description: 'Creates a new library group (an organizational umbrella over multiple libraries). Returns createdGroupId. After creating, use add_library_to_group to add member libraries.',
+    description: 'Creates a new library group (an organizational umbrella over multiple libraries). Returns createdGroupId. After creating, use add_library_to_group to add member libraries. NOT IDEMPOTENT: each call creates a new group. On transient failures, DO NOT auto-retry — call list_libraries to inspect existing groups before retrying.',
     inputSchema: {
       title:       z.string().describe('Group title (trimmed, non-empty, max 200 chars).'),
       description: z.string().optional().describe('Optional group description (max 1000 chars).'),
@@ -1398,7 +1472,7 @@ function createMcpServer() {
 
   // ─── Composite ─────────────────────────────────────────────────────────────
   srv.registerTool('bulk_apply', {
-    description: 'Atomically applies up to 100 sub-ops as a SINGLE undoable unit. Use for multi-step reorganizations ("move these 12 tabs into a new library called Research") so the user can undo the whole thing in one click. SUB-OP SCOPE INHERITANCE: sub-ops without explicit scope/libraryId inherit the bulk\'s; explicitly setting a different value is rejected (BULK_SCOPE_MISMATCH / BULK_LIBRARY_MISMATCH). EXCEPTION for create_note and set_note_content: their schemas accept two valid scopes (library-notes, global-notes), so EVERY sub-op of those types must include its own explicit scope field — bulk\'s outer scope is NOT auto-filled in. NESTING: bulk_apply cannot contain another bulk_apply.',
+    description: 'Atomically applies up to 100 sub-ops as a SINGLE undoable unit. Use for multi-step reorganizations ("move these 12 tabs into a new library called Research") so the user can undo the whole thing in one click. SUB-OP SCOPE INHERITANCE: sub-ops without explicit scope/libraryId inherit the bulk\'s; explicitly setting a different value is rejected (BULK_SCOPE_MISMATCH / BULK_LIBRARY_MISMATCH). EXCEPTION for create_note and set_note_content: their schemas accept two valid scopes (library-notes, global-notes), so EVERY sub-op of those types must include its own explicit scope field — bulk\'s outer scope is NOT auto-filled in. NESTING: bulk_apply cannot contain another bulk_apply. PER-SUB-OP CONFIRMATION: each destructive sub-op (delete_node, delete_live_node, delete_library_group with cascadeMembers:true) requires its OWN confirmedByUser:true field — the bulk_apply wrapper does NOT confer confirmation to sub-ops; obtain user approval for each destructive action individually. ERROR LOCATION: on failure, error.context.subOpIndex (and a "Sub-op N:" prefix in the message) identifies the failing sub-op — correct and resubmit just that one in a new bulk_apply, or fix and resubmit the whole batch.',
     inputSchema: {
       ops:       z.array(z.object({}).passthrough()).min(1).describe('Array of agent ops (each with type + fields). Max 100.'),
       scope:     z.string().optional().describe('Default scope for sub-ops that omit it. NOT applied to create_note / set_note_content sub-ops (must specify per sub-op).'),
@@ -1445,7 +1519,7 @@ const httpServer = http.createServer(async (req, res) => {
     req.on('end', () => {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        const { data, browserId, browserBrand, userTier, userId } = body;
+        const { data, browserId, browserBrand, userTier, userId, forwarderToken } = body;
         if (data) {
           const id    = browserId    || 'unknown';
           const brand = browserBrand || 'Unknown';
@@ -1453,16 +1527,22 @@ const httpServer = http.createServer(async (req, res) => {
           // relay too. Same fail-closed default as the leader's NM path.
           const tier  = Number.isFinite(userTier) ? userTier : 0;
           const uid   = typeof userId === 'string' ? userId : '';
+          // 2026-05-11: forwarderToken binds the SSE channel + /edit-result
+          // posts for this browserId to the forwarder that just POSTed
+          // /update. Stored alongside other browser identity so leader-side
+          // /edits and /edit-result validators can match.
+          const fwToken = (typeof forwarderToken === 'string' && forwarderToken.length > 0) ? forwarderToken : null;
           cachedData.set(id, {
-            tree:         data.tree         || [],
-            libraries:    data.libraries    || [],
-            globalNotes:  data.globalNotes  || [],
-            bookmarks:    data.bookmarks    || [],
-            updatedAt:    Date.now(),
-            browserId:    id,
-            browserBrand: brand,
-            userTier:     tier,
-            userId:       uid,
+            tree:           data.tree         || [],
+            libraries:      data.libraries    || [],
+            globalNotes:    data.globalNotes  || [],
+            bookmarks:      data.bookmarks    || [],
+            updatedAt:      Date.now(),
+            browserId:      id,
+            browserBrand:   brand,
+            userTier:       tier,
+            userId:         uid,
+            forwarderToken: fwToken,
           });
           extensionConnected = true;
           if (shutdownTimer) { clearTimeout(shutdownTimer); shutdownTimer = null; }
@@ -1505,13 +1585,43 @@ const httpServer = http.createServer(async (req, res) => {
   if (req.url && req.url.startsWith('/edits') && req.method === 'GET') {
     const url = new URL(req.url, 'http://127.0.0.1');
     const browserId = url.searchParams.get('browserId');
+    const token     = url.searchParams.get('token');
     if (!browserId) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: { code: 'BAD_REQUEST', message: 'GET /edits requires ?browserId=X' } }));
       return;
     }
+    // 2026-05-11: token-bind the SSE subscription to the forwarder that
+    // registered the underlying /update for this browserId. Without this,
+    // any local process could subscribe to a victim browserId's edit
+    // stream, observe full set_note_content payloads, and spoof results
+    // via /edit-result. The expected token was stored when /update arrived.
+    const expectedToken = cachedData.get(browserId)?.forwarderToken || null;
+    if (!expectedToken) {
+      // No /update has registered for this browserId yet (or registered
+      // without a token — pre-2026-05-11 forwarders). Reject so the
+      // attacker can't subscribe before the legitimate forwarder
+      // establishes the binding.
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: { code: 'TOKEN_REQUIRED', message: 'No forwarder is registered for this browserId yet. Re-POST /update with forwarderToken first.' } }));
+      return;
+    }
+    if (!token || token !== expectedToken) {
+      log(`SSE /edits rejected for browserId=${browserId.slice(0,16)}… — token mismatch`);
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: { code: 'TOKEN_MISMATCH', message: 'forwarderToken does not match the token recorded on the most recent /update for this browserId.' } }));
+      return;
+    }
+    // Reject a SECOND active SSE for the same browserId (rather than
+    // evicting the first). Pre-2026-05-11 we evicted; combined with no
+    // token check this let an attacker repeatedly steal the channel
+    // from the legitimate forwarder. Now: the legitimate forwarder
+    // keeps its channel; if its process actually died, req.on('close')
+    // already dropped the entry, so this guard only fires on contention.
     if (forwarders.has(browserId)) {
-      _dropForwarder(browserId, 'replaced by new SSE connection');
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: { code: 'SSE_ALREADY_CONNECTED', message: 'A forwarder is already subscribed to this browserId. Wait for the existing channel to close, or POST /update with a different forwarderToken to invalidate it.' } }));
+      return;
     }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -1539,7 +1649,7 @@ const httpServer = http.createServer(async (req, res) => {
     req.on('end', () => {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        const { requestId } = body;
+        const { requestId, forwarderToken } = body;
         if (!requestId) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: { code: 'BAD_REQUEST', message: 'POST /edit-result requires { requestId }' } }));
@@ -1547,6 +1657,23 @@ const httpServer = http.createServer(async (req, res) => {
         }
         const pending = pendingEdits.get(requestId);
         if (pending) {
+          // 2026-05-11: token-bind /edit-result to the forwarder that owns
+          // the target browserId. Without this, any local process that
+          // observed a requestId (via /debug, or by guessing) could spoof
+          // a successful editApplied for the AI client. SSE-routed pending
+          // entries have entry.browserId; the leader's expected token for
+          // that browserId is in cachedData. Local-NM pending entries
+          // (entry.path === 'local') bypass the token — no /edit-result
+          // post comes from a separate process for those.
+          if (pending.path === 'sse') {
+            const expectedToken = cachedData.get(pending.browserId)?.forwarderToken || null;
+            if (!expectedToken || forwarderToken !== expectedToken) {
+              log(`/edit-result rejected for requestId=${requestId.slice(0,8)} — token mismatch (browserId=${(pending.browserId||'').slice(0,16)}…)`);
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: { code: 'TOKEN_MISMATCH', message: 'forwarderToken does not match the token recorded for this browserId.' } }));
+              return;
+            }
+          }
           clearTimeout(pending.timer);
           pendingEdits.delete(requestId);
           if (body.ok) {
@@ -1576,7 +1703,7 @@ const httpServer = http.createServer(async (req, res) => {
   // Status: 200 ok, 400 BAD_REQUEST/BROWSER_NOT_FOUND, 503 BRIDGE_NOT_READY/
   //         FORWARDER_NOT_CONNECTED, 502 wrapper/engine/timeout failures.
   // After Phase 3 Slice A: routing + dispatch live in executeEdit; this
-  // handler is just the HTTP wrapper. The 22 MCP write tools registered in
+  // handler is just the HTTP wrapper. The MCP write tools registered in
   // createMcpServer() share executeEdit so their responses are identical.
   if (req.url === '/edit' && req.method === 'POST') {
     const chunks = [];
@@ -1719,7 +1846,10 @@ async function tryBindOrForward(initialAttempt) {
     if (initialAttempt) {
       process.stderr.write(`[pinako-mcp] Port ${MCP_PORT} in use — relaying to existing instance.\n`);
       forwardToExisting = (payload) => {
-        const body = JSON.stringify(payload);
+        // 2026-05-11: include forwarderToken on every /update so the leader
+        // can token-bind this browserId's SSE subscription + /edit-result
+        // posts to THIS process. Without it, any local process could spoof.
+        const body = JSON.stringify({ ...payload, forwarderToken: _myForwarderToken });
         const req = http.request(
           { hostname: '127.0.0.1', port: MCP_PORT, path: '/update', method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
