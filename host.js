@@ -866,6 +866,145 @@ function sanitizeNode(node) {
   return out;
 }
 
+// ─── Agent response modes ────────────────────────────────────────────────────
+// Three tiers for read tools, tuned for different agent workloads:
+//
+//   'minimal' — flat list, compact URLs, no children/collapsed/ghost.
+//               Optimized for "find/search/filter X" scans. Smallest payload;
+//               fits ~2000+ tabs comfortably in tool-result caps.
+//
+//   'lite'    — tree shape with children/collapsed/ghost preserved.
+//               For hierarchical reads ("what's in this window?") and any
+//               op where the structure matters.
+//
+//   'full'    — everything in the source data EXCEPT favicons.
+//               For the rare case where the agent wants visual fields, full
+//               URL fidelity, or rich-text note content (on get_library).
+//
+// Favicons (base64 data URIs, 1-3KB per tab) are NEVER returned unless the
+// caller passes include_favicons:true. They have negligible value for agents
+// and dominate payload size when present.
+
+const MODES = new Set(['minimal', 'lite', 'full']);
+
+// URL compaction for minimal mode. Drops fragments, queries, and trailing
+// hash-like path segments. Title carries the primary semantic signal; URL
+// in minimal mode is just a coarse hint at what the tab is. Full URL is
+// always available via mode:'full'.
+function compactUrl(url) {
+  if (!url) return url;
+  let u = String(url);
+  const hashIdx = u.indexOf('#'); if (hashIdx >= 0) u = u.slice(0, hashIdx);
+  const qIdx    = u.indexOf('?'); if (qIdx    >= 0) u = u.slice(0, qIdx);
+  // Strip path segments that look like opaque IDs (long, mixed alphanumeric,
+  // not broken up by enough word-separators to look like a slug).
+  const isHashLike = (seg) => {
+    if (seg.length <= 25) return false;
+    const noBreaks = seg.replace(/[-_]/g, '');
+    if (noBreaks.length < 20) return false;
+    return /[a-z]/i.test(noBreaks) && /\d/.test(noBreaks);
+  };
+  const parts = u.split('/');
+  const kept  = parts.filter(p => !isHashLike(p));
+  let result  = kept.join('/');
+  // Final length cap: 80 chars, truncate at last path boundary if needed.
+  if (result.length > 80) {
+    const cut = result.lastIndexOf('/', 80);
+    if (cut > 'https://x'.length) result = result.slice(0, cut);
+    else result = result.slice(0, 80);
+  }
+  return result;
+}
+
+// Strip favIconUrl recursively. Used in 'full' mode when include_favicons
+// is not set (the default). favicons dominate payload size; agents almost
+// never use them.
+function stripFavicons(node) {
+  if (!node || typeof node !== 'object') return node;
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (k === 'favIconUrl') continue;
+    out[k] = (k === 'children' && Array.isArray(v)) ? v.map(stripFavicons) : v;
+  }
+  return out;
+}
+
+// Lite-mode node (tree shape). Keeps hierarchy, drops favicons, timestamps,
+// visual fields, the empty per-node `notes` array. Includes openedDate so
+// agents can answer time-based queries ("tabs older than 6 months").
+function liteNode(node, scope, libraryId) {
+  if (!node || typeof node !== 'object') return node;
+  const out = {
+    id:    node.id,
+    type:  node.type,
+    title: node.title || '',
+  };
+  if (scope)     out.scope     = scope;
+  if (libraryId) out.libraryId = libraryId;
+  if (node.url) out.url = node.url;
+  if (node.type === 'tab' && node.chromeId === null) out.ghost = true;
+  if (node.type === 'tab' && node.openedDate) out.openedDate = node.openedDate;
+  if (Array.isArray(node.tags) && node.tags.length > 0) out.tags = node.tags;
+  if (node.memoText) out.memoText = node.memoText;
+  if (node.collapsed) out.collapsed = true;
+  if (Array.isArray(node.children) && node.children.length > 0) {
+    out.children = node.children.map(c => liteNode(c, scope, libraryId));
+  }
+  return out;
+}
+
+// Minimal-mode node. Single flat record per node; lineage preserved via
+// parentId. Drops children, collapsed, ghost. URL compacted. openedDate
+// kept for time-based queries. tags/memoText kept when non-empty (already
+// conditional so they're free).
+function minimalNode(node, scope, libraryId, parentId) {
+  const out = {
+    id:    node.id,
+    type:  node.type,
+    title: node.title || '',
+  };
+  if (scope)     out.scope     = scope;
+  if (libraryId) out.libraryId = libraryId;
+  if (parentId)  out.parentId  = parentId;
+  if (node.url)  out.url       = compactUrl(node.url);
+  if (node.type === 'tab' && node.openedDate) out.openedDate = node.openedDate;
+  if (Array.isArray(node.tags) && node.tags.length > 0) out.tags = node.tags;
+  if (node.memoText) out.memoText = node.memoText;
+  return out;
+}
+
+// Flatten a tree into a minimal-mode array. parentId on each non-root node
+// preserves enough lineage info for the agent to reconstruct hierarchy when
+// it actually needs to (e.g. "tabs in window X" → filter where parentId===X).
+function flattenForMinimal(nodes, scope, libraryId, parentId = null, out = []) {
+  if (!Array.isArray(nodes)) return out;
+  for (const node of nodes) {
+    if (!node) continue;
+    out.push(minimalNode(node, scope, libraryId, parentId));
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      flattenForMinimal(node.children, scope, libraryId, node.id, out);
+    }
+  }
+  return out;
+}
+
+// Dispatch helper: shape a tree (array of root nodes) according to mode.
+function shapeTree(rootNodes, scope, libraryId, mode, includeFavicons) {
+  if (mode === 'minimal') return flattenForMinimal(rootNodes, scope, libraryId);
+  if (mode === 'lite')    return rootNodes.map(n => liteNode(n, scope, libraryId));
+  // full
+  return includeFavicons ? rootNodes : rootNodes.map(stripFavicons);
+}
+
+// Strip rich-text note content to id+title only. Note `content` is HTML/
+// rich-text and dominates payload size for libraries with substantive notes
+// (Demo Note alone can be 30KB+ of formatting markup). Used in minimal+lite
+// modes. Full mode includes the content.
+function liteNotes(notes) {
+  if (!Array.isArray(notes)) return [];
+  return notes.map(n => ({ id: n.id, title: n.title || '' }));
+}
+
 function getTree(data, includeGhost = true) {
   if (!data) return null;
   const tree = data.tree.map(sanitizeNode);
@@ -1040,17 +1179,42 @@ Cost of search_docs is negligible (local read, no LLM call). When in doubt, call
 Skip search_docs when the request is direct and the tool is obvious ("tag this 'history'" → set_tags), or you've already established the vocabulary earlier in this conversation.
 
 SEARCH SCOPE
-When the user asks a lookup question over their saved data — "how many tabs about X do I have", "find Y", "where are my Z", "list everything tagged W" — search BOTH the main tree AND every library by default:
-- Main tree: search_tabs (covers live + ghost tabs; matches title, URL, tags, memo text).
-- Libraries: list_libraries → get_library on each → filter children for matches against title, URL, tags, memos.
-Do NOT search bookmarks by default. Bookmark trees are often huge (10K+ entries common) and would dominate result counts without adding signal. Include bookmarks ONLY when the user explicitly references them: "bookmark(s)", "in my bookmarks", "across everything", "including bookmarks".
-Report results BY SOURCE rather than as a bare total. Example: "24 total — 3 live tabs, 8 ghosts in the main tree, 11 in 'Travel: Yucatán' library, 2 in 'Research Notes' library." The breakdown is often as useful as the count.
+When the user asks "find / list / count / tag / memo X", first distinguish two patterns:
+
+LITERAL match — the user named an exact substring (URL, domain, specific tag value, exact title fragment):
+  Examples: "tabs from stackoverflow.com", "tabs tagged 'urgent'", "the tab titled 'Inbox'".
+  Approach: search_tabs for main tree; list_libraries + get_library for libraries if needed.
+
+SEMANTIC / categorical intent — the user named a topic, theme, or concept:
+  Examples: "find my exercise tabs", "anything about gardening", "show me cooking links", "tabs about programming", "tabs older than 6 months".
+  Approach (faster AND more accurate than synonym iteration):
+  1. Call get_tree({mode:"minimal"}) — flat list of every main-tree tab in compact form (~100 bytes/tab; fits 2000+ tab trees comfortably).
+  2. Call list_libraries({include_tabs:true, mode:"minimal"}) — flat list of every library tab in compact form, one call across all libraries.
+  3. Read the title+url+openedDate of every tab in those two responses and identify matches USING YOUR OWN UNDERSTANDING. You know "exercise" extends to squats, pushups, stretches, mobility, ancestral movement, primal patterns, strength training, etc. Match in-head; do not iterate search_tabs with keyword after keyword.
+  4. Apply writes via per-scope bulk_apply (one per scope/libraryId — see WRITES below).
+
+  Mode tiers (read tools):
+  - "minimal" — flat list, compact URLs, no children/collapsed/ghost, keeps openedDate, tags, memoText. Smallest. Use for scan/find/filter.
+  - "lite"    — tree shape, full URLs, includes children/collapsed/ghost/openedDate. Use when hierarchy matters ("what's in this window?", placement-aware ops).
+  - "full"    — everything in source data except favicons. Use only when visual fields or rich-text note content are actually needed.
+  - include_favicons:true — opt-in for the rare workflow that needs favicon images (e.g., organizing tabs by favicon color). Never default.
+
+DO NOT call search_tabs multiple times with synonyms ("exercise", then "workout", then "fitness", then "stretch"...) — you will miss things (titles like "10-min Transform" with no obvious keyword) AND burn round-trips. Two well-chosen reads beat ten literal searches.
+
+Both patterns cover tree + libraries by default. Skip bookmarks unless the user explicitly references them ("in my bookmarks", "across everything", "including bookmarks") — bookmark trees are often 10K+ entries and would dominate without adding signal.
+
+When the query is about TABS / LINKS / WINDOWS / TREE structure, DO NOT include note content in the search. Notes are a separate surface — rich-text docs attached to a tree or library, not to individual tabs. Conflating "I have a tab about gardening" with "I wrote a note mentioning gardening" misleads the user. list_libraries and get_library return note metadata (id+title) but not content by default; that's intentional. Include note content only when the user explicitly says "notes" ("search my notes for X", "find the note about Y") — use get_global_notes or get_library({lite:false}) then.
+
+Report results BY SOURCE rather than as a bare total: "24 total — 3 live tabs, 8 ghosts in the main tree, 11 in 'Travel: Yucatán' library, 2 in 'Research Notes' library." The breakdown is often as useful as the count.
+
 Override phrases that change scope:
 - "in the main tree only" / "in the live tree" → skip libraries.
 - "in my libraries only" → skip main tree.
 - "in library X" → constrain to that one library.
 - "everywhere" / "including bookmarks" → add bookmarks.
-For writes ("tag all my X tabs as 'Y'"), apply the same default scope: issue per-scope ops (scope:'tree' for main-tree nodes, scope:'library' with libraryId for each affected library) bundled into ONE bulk_apply so the user gets one-click undo.
+
+WRITES across multi-source results:
+For "tag/memo all my X tabs as Y": issue ONE bulk_apply per scope (one for scope:'tree' main-tree nodes, one per affected library with scope:'library'+libraryId). Each bulk_apply is one undo step for the user — acceptable for now (cross-scope single-undo is on the roadmap).
 
 MULTI-BROWSER
 The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the same time. Each install is a separate data source. Tools accept an optional 'browser' parameter (e.g., browser="Brave") to pick a specific install. When multiple browsers are connected and the user does NOT specify which to use, tools return an ambiguity error — ask the user which browser they want, then retry with the chosen 'browser' value. Use list_browsers to discover what's connected. Libraries and global notes are cloud-synced so their content is identical across the user's browsers, but live tab/window state and per-tab metadata differ per browser.
@@ -1068,25 +1232,37 @@ function createMcpServer() {
 
   const BROWSER_ARG_DESC = 'Which Pinako install to query (browser brand like "Brave" or "Chrome", or browserId from list_browsers). Required when multiple browsers are connected; omit when only one is connected.';
 
+  // Common helper: normalize a caller's `mode` arg.
+  const _normalizeMode = (m) => MODES.has(m) ? m : 'lite';
+
   srv.registerTool(
     'get_tree',
     {
       description:
-        'Returns the full tab tree (Windows → Groups → Tabs) from the Pinako extension. ' +
-        'Each node includes: id, type, title, url, favIconUrl, chromeId (null = ghost/closed tab), ' +
-        'openedDate, memoText, tags, notes, collapsed, and children.',
+        'Returns the tab tree (Windows → Groups → Tabs) from the Pinako extension. Three modes: ' +
+        '"minimal" (FLAT list, compact URLs, drops children/collapsed/ghost, keeps openedDate — best for semantic search across 500+ tab trees); ' +
+        '"lite" (DEFAULT — tree shape with children/collapsed/ghost, full URLs, keeps openedDate, no favicons); ' +
+        '"full" (everything in source data EXCEPT favicons; useful only for visual-field workflows). ' +
+        'Favicons are NEVER returned unless include_favicons:true (they\'re 1-3KB base64 blobs of zero agent value).',
       inputSchema: {
+        mode: z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "lite". Use "minimal" for semantic-search scans.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs (chromeId=null). Default true.'),
+        include_favicons:   z.boolean().optional().describe('Include favIconUrl base64 data. Default false. Set true only for color-organization workflows.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ include_ghost_tabs = true, browser }) => {
+    async ({ mode, include_ghost_tabs = true, include_favicons = false, browser }) => {
+      mode = _normalizeMode(mode);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
+      const tree = getTree(r.data, include_ghost_tabs);
+      const out  = shapeTree(tree, 'tree', null, mode, include_favicons);
       return { content: [{ type: 'text', text: JSON.stringify({
-        browser: r.data.browserBrand,
+        browser:   r.data.browserBrand,
         browserId: r.data.browserId,
-        tree: getTree(r.data, include_ghost_tabs),
+        scope:     'tree',
+        mode,
+        tree:      out,
         updatedAt: r.data.updatedAt,
       }) }] };
     }
@@ -1095,21 +1271,26 @@ function createMcpServer() {
   srv.registerTool(
     'search_tabs',
     {
-      description: 'Searches all tabs for a query. Matches title, URL, memo text, and tags. Returns matching tab nodes.',
+      description: 'LITERAL substring search across main-tree tabs. Matches title, URL, memo text, and tags against the exact query string. Use ONLY when the user names a literal substring ("tabs from stackoverflow.com", "the tab titled exactly X"). For SEMANTIC / categorical intent ("find my exercise tabs", "anything about gardening") do NOT iterate this tool with synonyms — instead call get_tree({mode:"minimal"}) + list_libraries({include_tabs:true, mode:"minimal"}) and match in your own head. See SEARCH SCOPE in server instructions. Mode param: "minimal" (flat, compact URLs — default for this tool since results are already a focused list), "lite" (tree shape), "full" (everything except favicons).',
       inputSchema: {
-        query: z.string().describe('Search query (case-insensitive)'),
+        query: z.string().describe('LITERAL substring (case-insensitive). For semantic intent, prefer get_tree.'),
+        mode:  z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "minimal" since search results are already a focused list.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs. Default true.'),
+        include_favicons:   z.boolean().optional().describe('Include favIconUrl base64. Default false.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ query, include_ghost_tabs = true, browser }) => {
+    async ({ query, mode, include_ghost_tabs = true, include_favicons = false, browser }) => {
+      mode = _normalizeMode(mode || 'minimal');
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const results = searchInTree(r.data.tree, query, include_ghost_tabs);
+      const out     = shapeTree(results, 'tree', null, mode, include_favicons);
       return { content: [{ type: 'text', text: JSON.stringify({
         browser: r.data.browserBrand,
-        results,
-        count: results.length,
+        mode,
+        results: out,
+        count:   out.length,
       }) }] };
     }
   );
@@ -1117,20 +1298,34 @@ function createMcpServer() {
   srv.registerTool(
     'list_libraries',
     {
-      description: 'Lists all Pinako libraries (saved tab collections). Returns id, title, description, tab count, and library-level notes. Libraries are cloud-synced, so their list is identical across a user\'s browsers; the browser argument still applies for routing consistency.',
+      description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies.',
       inputSchema: {
-        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+        include_tabs: z.boolean().optional().describe('Embed each library\'s tabs in the response. Default false. Use this for cross-library semantic search in one call.'),
+        mode:         z.enum(['minimal', 'lite', 'full']).optional().describe('Mode for embedded tabs (only used when include_tabs:true). Default "minimal".'),
+        include_favicons: z.boolean().optional().describe('Include favIconUrl on embedded tabs. Default false.'),
+        browser:      z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ browser }) => {
+    async ({ include_tabs = false, mode, include_favicons = false, browser }) => {
+      mode = _normalizeMode(mode || 'minimal');
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
-      const libs = (r.data.libraries || []).map(lib => ({
-        id: lib.id, title: lib.title, description: lib.description || '',
-        tabCount: countTabsInLibrary(lib.children || []), notes: lib.notes || [],
-      }));
+      const libs = (r.data.libraries || []).map(lib => {
+        const entry = {
+          id:          lib.id,
+          title:       lib.title,
+          description: lib.description || '',
+          tabCount:    countTabsInLibrary(lib.children || []),
+          notes:       liteNotes(lib.notes),
+        };
+        if (include_tabs) {
+          entry.children = shapeTree(lib.children || [], 'library', lib.id, mode, include_favicons);
+        }
+        return entry;
+      });
       return { content: [{ type: 'text', text: JSON.stringify({
-        browser: r.data.browserBrand,
+        browser:   r.data.browserBrand,
+        mode:      include_tabs ? mode : undefined,
         libraries: libs,
       }) }] };
     }
@@ -1139,20 +1334,48 @@ function createMcpServer() {
   srv.registerTool(
     'get_library',
     {
-      description: 'Returns the full contents of a Pinako library: folders, tabs, memos, tags, notes.',
+      description: 'Returns one library\'s contents. Three modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties.',
       inputSchema: {
         library_id: z.string().describe('Library id from list_libraries'),
-        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+        mode:       z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "lite".'),
+        include_favicons: z.boolean().optional().describe('Include favIconUrl base64. Default false.'),
+        browser:    z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ library_id, browser }) => {
+    async ({ library_id, mode, include_favicons = false, browser }) => {
+      mode = _normalizeMode(mode);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const lib = (r.data.libraries || []).find(l => l.id === library_id);
       if (!lib) return { content: [{ type: 'text', text: `Library not found: ${library_id} (in ${r.data.browserBrand})` }], isError: true };
+      let outLib;
+      if (mode === 'minimal') {
+        outLib = {
+          id:          lib.id,
+          title:       lib.title,
+          description: lib.description || '',
+          children:    flattenForMinimal(lib.children || [], 'library', library_id),
+          notes:       liteNotes(lib.notes),
+        };
+      } else if (mode === 'lite') {
+        const sanitized = sanitizeNode(lib);
+        outLib = {
+          id:          sanitized.id,
+          title:       sanitized.title,
+          description: sanitized.description || '',
+          children:    (sanitized.children || []).map(c => liteNode(c, 'library', library_id)),
+          notes:       liteNotes(sanitized.notes),
+        };
+      } else { // full
+        const sanitized = sanitizeNode(lib);
+        outLib = include_favicons ? sanitized : stripFavicons(sanitized);
+      }
       return { content: [{ type: 'text', text: JSON.stringify({
-        browser: r.data.browserBrand,
-        library: sanitizeNode(lib),
+        browser:   r.data.browserBrand,
+        scope:     'library',
+        libraryId: library_id,
+        mode,
+        library:   outLib,
       }) }] };
     }
   );
