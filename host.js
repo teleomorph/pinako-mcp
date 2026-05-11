@@ -291,11 +291,20 @@ function handleNmMessage(msg) {
     const bookmarks = (msg.data && 'bookmarks' in msg.data)
       ? (msg.data.bookmarks || [])
       : (prior?.bookmarks || []);
+    // 2026-05-11: same preserve-when-omitted pattern for docs (user guide
+    // sections). The extension sends docs only on the initial getTree at
+    // bridge start (and after extension updates that change the guide);
+    // subsequent treeUpdates omit them. Preserve cached so we don't wipe
+    // the search_docs corpus on every pushTreeUpdate.
+    const docs = (msg.data && 'docs' in msg.data)
+      ? (msg.data.docs || [])
+      : (prior?.docs || []);
     cachedData.set(browserId, {
       tree:           msg.data.tree         || [],
       libraries:      msg.data.libraries    || [],
       globalNotes:    msg.data.globalNotes  || [],
       bookmarks,
+      docs,
       updatedAt:      Date.now(),
       browserId,
       browserBrand,
@@ -997,6 +1006,27 @@ TERMINOLOGY
 - Tags: categorization labels (string array) attached per node.
 - Ghost tab: a closed tab preserved in the tree (chromeId = null). Not currently open in Chrome.
 
+DOCS LOOKUP
+search_docs(query, max_results?) gives you fast local access to Pinako's user guide (~10ms, bundled with this bridge, no internet needed). Treat it as a peer reference, not a fallback after failure.
+
+Call search_docs BEFORE acting when any of these is true:
+
+1. A PINAKO-SPECIFIC TERM is uncertain. Examples: "memo" vs "note", "group row color" or "group node color" vs Chrome "Tab Group" color, "folder" vs "group", "ghost tab", "library group", "snapshot". These have product-specific meanings that differ from generic tab-manager intuition; don't guess from the term alone.
+
+2. The user uses ORDINARY-ENGLISH PHRASING that doesn't map 1:1 to a write tool. "Save this tab" — add_to_library? ghost_node? "Organize my research" — move_node, create_library, or bulk_apply? "Archive these" — ghost_node, move to library, or delete_live_node? "Color-code by topic" — set_row_color or set_star_color? When the verb is vague or could plausibly match multiple ops, check the guide before choosing.
+
+3. The request is COMPLEX OR MULTI-STEP and you're unsure Pinako supports the constituent operations. Confirm capability before designing a multi-bulk_apply plan. Capability questions: "is there scheduling?", "does selective sync exist?", "can I link notes across libraries?". Shape questions: "are notes per-node or per-library?", "do tags propagate to children?".
+
+4. BEFORE SAYING "I CAN'T DO THAT." Pinako has real limits (no live web fetch, no page-content access without read_page consent, no JS execution on tabs) AND unexpected affordances (library groups, snapshots, three-panel view, sync devices, blockchain backup). Verify before refusing.
+
+5. The user asks an INTERNAL question about Pinako behavior, features, or workflow. Patterns: "How does X work?", "How do I X?", "Can Pinako X?", "What happens when I X?", "Why didn't X work?", "Does Pinako support X?", "Where do I find X?". Examples: "Can I undo this?", "What happens when I ghost a tab?", "Why didn't this sync?", "How do shared libraries work?", "How do I export a library?", "Can Pinako sync to mobile?", "Can Pinako schedule tabs to reopen?", "Can Pinako back up to blockchain?" — answer from the guide, not from generic tab-manager intuition.
+
+When citing the guide back to the user, include the section anchor (e.g., "see #guide-library-groups in your user guide") so they can jump directly to that section in their own copy.
+
+Cost of search_docs is negligible (local read, no LLM call). When in doubt, call it.
+
+Skip search_docs when the request is direct and the tool is obvious ("tag this 'history'" → set_tags), or you've already established the vocabulary earlier in this conversation.
+
 SEARCH SCOPE
 When the user asks a lookup question over their saved data — "how many tabs about X do I have", "find Y", "where are my Z", "list everything tagged W" — search BOTH the main tree AND every library by default:
 - Main tree: search_tabs (covers live + ghost tabs; matches title, URL, tags, memo text).
@@ -1156,7 +1186,7 @@ function createMcpServer() {
   srv.registerTool(
     'list_browsers',
     {
-      description: 'Lists all Pinako installs currently connected to this MCP server. Each entry: browserBrand (human-readable name like "Chrome" or "Brave"), browserId (stable per-install id), updatedAt (timestamp of last data update), windowCount (live windows), libraryCount. Use the browserBrand or browserId as the "browser" argument to other tools when multiple browsers are connected.',
+      description: 'Lists all Pinako installs currently connected to this MCP server. Each entry: browserBrand (human-readable name like "Chrome" or "Brave"), browserId (stable per-install id), updatedAt (timestamp of last data update), windowCount (live windows), libraryCount, bookmarkCount, docsCount (number of cached user-guide sections searchable via search_docs). Use the browserBrand or browserId as the "browser" argument to other tools when multiple browsers are connected.',
     },
     async () => {
       const browsers = [...cachedData.values()].map(d => ({
@@ -1166,8 +1196,79 @@ function createMcpServer() {
         windowCount:   (d.tree || []).filter(n => !n.incognito).length,
         libraryCount:  (d.libraries || []).length,
         bookmarkCount: (d.bookmarks || []).reduce((acc, root) => acc + countBookmarksRecursive(root), 0),
+        docsCount:     Array.isArray(d.docs) ? d.docs.length : 0,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ browsers, count: browsers.length }) }] };
+    }
+  );
+
+  // Phase 3 follow-up: search_docs (bundled user-guide lookup). Pinako's user
+  // guide ships as three HTML fragments inside the extension package
+  // (user-guide-content.html + user-guide-ai-connect-content.html +
+  // user-guide-import-content.html). The extension's SW parses them into
+  // anchored sections on first NM connect and pushes them via the `docs`
+  // field on treeResponse. Bridge caches them per-browser; this tool searches
+  // titles + body across the cached sections and returns ranked excerpts.
+  //
+  // Search is intentionally simple: token-overlap with title weighted 10×
+  // text. No embeddings — docs are small (~150 sections), AI agents are
+  // already great at synthesizing once they have the right sections in hand.
+  function _searchDocsSections(docs, query, maxN) {
+    const tokens = (query || '').toLowerCase().split(/\W+/).filter(t => t.length > 1);
+    if (tokens.length === 0) return [];
+    const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const scored = [];
+    for (const d of docs) {
+      const title = (d.title || '').toLowerCase();
+      const text  = (d.text  || '').toLowerCase();
+      let score = 0;
+      for (const t of tokens) {
+        if (title.includes(t)) score += 10;
+        const matches = text.match(new RegExp(escapeRe(t), 'g'));
+        if (matches) score += matches.length;
+      }
+      if (score > 0) scored.push({ d, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, maxN).map(({ d, score }) => ({
+      id:      d.id,
+      title:   d.title,
+      source:  d.source,
+      excerpt: (d.text || '').length > 500 ? (d.text || '').slice(0, 500) + '…' : (d.text || ''),
+      score,
+    }));
+  }
+
+  srv.registerTool(
+    'search_docs',
+    {
+      description: 'Searches the Pinako user guide. Returns sections matching the query with title, anchor id, source ("user-guide" / "ai-connect" / "import"), excerpt, and score. The guide is bundled with this bridge and served from local cache (~10ms, no internet). See the DOCS LOOKUP section in server instructions for WHEN to call this. Cite anchor ids back to the user ("see #guide-library-groups") so they can jump to that section in their own copy of the guide.',
+      inputSchema: {
+        query: z.string().describe('Search query — keywords or short phrase (case-insensitive).'),
+        max_results: z.number().int().min(1).max(20).optional().describe('Cap on returned sections. Default 5.'),
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ query, max_results, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const docs = Array.isArray(r.data.docs) ? r.data.docs : [];
+      if (docs.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:  r.data.browserBrand,
+          query,
+          results:  [],
+          count:    0,
+          note:     'No docs cached yet for this browser. The extension pushes the user guide on its first connect; if this just rotated, re-call after the next treeUpdate.',
+        }) }] };
+      }
+      const results = _searchDocsSections(docs, query, max_results || 5);
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser: r.data.browserBrand,
+        query,
+        results,
+        count:   results.length,
+      }) }] };
     }
   );
 
