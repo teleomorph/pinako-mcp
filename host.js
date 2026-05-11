@@ -1757,9 +1757,17 @@ const httpServer = http.createServer(async (req, res) => {
           const srv = createMcpServer();
           await srv.connect(transport);
         } else {
-          log(`POST /mcp rejected: no session (mcp-session-id=${sessionId})`);
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: call initialize first' }, id: null }));
+          // Unknown session ID for a non-initialize call. Per MCP streamable
+          // HTTP spec, servers MUST return 404 (not 400) so SDK clients can
+          // auto-recover by re-sending `initialize` on a fresh session. The
+          // common case where this fires today is leader rotation: AI client
+          // holds a session id from the previous leader, sends its next tool
+          // call, lands on a new leader that has an empty activeSessions Map.
+          // 404 here lets the official @modelcontextprotocol SDK transparently
+          // re-handshake instead of surfacing "Bad Request" to the AI.
+          log(`POST /mcp 404: unrecognized session (mcp-session-id=${sessionId}, method=${parsed?.method})`);
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found — reinitialize.' }, id: null }));
           return;
         }
 
@@ -1777,8 +1785,12 @@ const httpServer = http.createServer(async (req, res) => {
       const sessionId = req.headers['mcp-session-id'];
       const transport = sessionId ? activeSessions.get(sessionId) : undefined;
       if (!transport) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: session not found' }, id: null }));
+        // Spec-compliant 404 for unknown session — see POST /mcp handler for
+        // the rationale. Lets compliant MCP SDKs re-handshake transparently
+        // instead of failing the request.
+        log(`${req.method} /mcp 404: unrecognized session (mcp-session-id=${sessionId})`);
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found — reinitialize.' }, id: null }));
         return;
       }
       await transport.handleRequest(req, res);
