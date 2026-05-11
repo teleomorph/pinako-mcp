@@ -1222,32 +1222,65 @@ function createMcpServer() {
   // field on treeResponse. Bridge caches them per-browser; this tool searches
   // titles + body across the cached sections and returns ranked excerpts.
   //
-  // Search is intentionally simple: token-overlap with title weighted 10×
-  // text. No embeddings — docs are small (~150 sections), AI agents are
-  // already great at synthesizing once they have the right sections in hand.
+  // Search is intentionally simple: token-overlap with title and subheadings
+  // weighted 10× text. No embeddings — docs are small (~150 sections), AI
+  // agents are already great at synthesizing once they have the right sections
+  // in hand. Stopword filter prevents natural-language phrasings ("difference
+  // between memo and note") from drowning real signal in body-match counts of
+  // common words like "and", "to", "between".
+  const _STOPWORDS = new Set([
+    'a','an','the','and','or','but','if','of','in','on','at','to','for','from',
+    'by','with','into','onto','about','against','through','during','before',
+    'after','between','among','over','under','out','up','down','off',
+    'is','are','was','were','be','been','being','am','do','does','did','have',
+    'has','had','can','could','will','would','may','might','must','should',
+    'shall','i','me','my','you','your','he','she','it','its','we','us','our',
+    'they','them','their','this','that','these','those','what','which','who',
+    'whom','whose','where','when','why','how','not','no','also','just','only',
+    'more','most','some','any','all','each','every','both','either','neither',
+    'very','too','than','then','so','yet',
+  ]);
   function _searchDocsSections(docs, query, maxN) {
-    const tokens = (query || '').toLowerCase().split(/\W+/).filter(t => t.length > 1);
+    const tokens = (query || '').toLowerCase().split(/\W+/)
+      .filter(t => t.length > 1 && !_STOPWORDS.has(t));
     if (tokens.length === 0) return [];
     const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const scored = [];
     for (const d of docs) {
       const title = (d.title || '').toLowerCase();
       const text  = (d.text  || '').toLowerCase();
+      const subs  = Array.isArray(d.subheadings) ? d.subheadings : [];
       let score = 0;
+      let bestSubAnchorId = null;
+      let bestSubAnchorScore = 0;
       for (const t of tokens) {
         if (title.includes(t)) score += 10;
+        for (const sub of subs) {
+          const subTitle = (sub.title || '').toLowerCase();
+          if (subTitle.includes(t)) {
+            score += 10;
+            // Track which H3/H4 subheading scored highest so the AI can cite
+            // a deeper anchor (#guide-memos) instead of just the H2 parent.
+            const subHits = (subTitle.match(new RegExp(escapeRe(t), 'g')) || []).length;
+            if (subHits > bestSubAnchorScore) {
+              bestSubAnchorScore = subHits;
+              bestSubAnchorId    = sub.id;
+            }
+          }
+        }
         const matches = text.match(new RegExp(escapeRe(t), 'g'));
         if (matches) score += matches.length;
       }
-      if (score > 0) scored.push({ d, score });
+      if (score > 0) scored.push({ d, score, subAnchor: bestSubAnchorId });
     }
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, maxN).map(({ d, score }) => ({
+    return scored.slice(0, maxN).map(({ d, score, subAnchor }) => ({
       id:      d.id,
       title:   d.title,
       source:  d.source,
       excerpt: (d.text || '').length > 500 ? (d.text || '').slice(0, 500) + '…' : (d.text || ''),
       score,
+      ...(subAnchor ? { subAnchor } : {}),
     }));
   }
 
