@@ -225,8 +225,16 @@ function _markNmStdoutBroken(reason) {
   // FORWARDER_DISCONNECTED via SSE close, but LEADER_CHANGED is the more
   // accurate diagnosis when the leader is the one going down).
   try {
+    // Slice W-1 diagnostic: log which requestIds get LEADER_CHANGED on exit
+    // so the post-mortem can correlate against the bridge log timeline.
+    // Also surface dispatchedAt → exitTime for each so we know how long each
+    // edit waited before the leader gave up.
+    const now = Date.now();
+    const summaries = [];
     for (const [requestId, entry] of pendingEdits) {
       try { clearTimeout(entry.timer); } catch (_) {}
+      const waitedMs = entry.dispatchedAt ? (now - entry.dispatchedAt) : null;
+      summaries.push(`${requestId.slice(0,8)}(path=${entry.path},waitedMs=${waitedMs})`);
       try {
         entry.resolve({
           ok: false,
@@ -239,6 +247,26 @@ function _markNmStdoutBroken(reason) {
       } catch (_) {}
     }
     pendingEdits.clear();
+    if (summaries.length > 0) {
+      try { log(`LEADER_CHANGED resolved ${summaries.length} pending edit(s): ${summaries.join(', ')}`); } catch (_) {}
+    }
+    // Slice W-1 diagnostic: also drain _pendingPings so any probe await
+    // inside an EDIT_TIMEOUT callback resolves FAST and gets a chance to
+    // flush its log line before the 200ms process.exit kicks in. Without
+    // this, when EPIPE fires async via the 'error' event, the probe's
+    // setTimeout(2s) outlives the bridge process and the diagnostic line
+    // is lost.
+    if (typeof _pendingPings !== 'undefined' && _pendingPings.size > 0) {
+      try {
+        const pingCount = _pendingPings.size;
+        for (const [pingId, p] of _pendingPings) {
+          try { clearTimeout(p.timer); } catch (_) {}
+          try { p.resolve({ status: 'nm_stdout_broken_during_probe', pingId, elapsedMs: Date.now() - p.sentAt }); } catch (_) {}
+        }
+        _pendingPings.clear();
+        log(`LEADER_CHANGED drained ${pingCount} pending diagnostic ping(s)`);
+      } catch (_) {}
+    }
   } catch (e) {
     try { log(`LEADER_CHANGED cleanup error: ${e.message}`); } catch (_) {}
   }
