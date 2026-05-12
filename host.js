@@ -2390,14 +2390,59 @@ if (!BRIDGE_URL) {
 // end user's machine.
 async function runStdioBridge(httpUrl) {
   const stdio  = new StdioServerTransport();
-  const remote = new StreamableHTTPClientTransport(new URL(httpUrl));
+  let remote   = new StreamableHTTPClientTransport(new URL(httpUrl));
+
+  // remote → stdio (forward responses back to Claude Desktop). Defined as
+  // a function so we can rebind onto a freshly-created transport after a
+  // stale-session re-handshake.
+  function wireRemoteListeners() {
+    remote.onmessage = async (msg) => {
+      try {
+        await stdio.send(msg);
+      } catch (err) {
+        process.stderr.write(`[stdio-mcp] reply error: ${err.message}\n`);
+      }
+    };
+    remote.onerror = (err) => {
+      process.stderr.write(`[stdio-mcp] remote transport error: ${err.message}\n`);
+    };
+  }
+  wireRemoteListeners();
+
+  // Slice W-4: transparent stale-session re-handshake. After a leader
+  // rotation (zombie recovery + forwarder promotion), the new bridge
+  // returns HTTP 404 (code -32001 "Session not found — reinitialize.")
+  // for the proxy's cached Mcp-Session-Id per Slice W's spec compliance.
+  // The SDK's StreamableHTTPClientTransport surfaces this as a send error
+  // but doesn't auto-reset the session, leaving the proxy 404-stuck until
+  // Claude Desktop is reloaded. We detect the error here, recreate the
+  // transport (which forces a fresh initialize on next send), retry the
+  // request once, and hide the rotation from the upstream MCP client.
+  const STALE_SESSION_RE = /Session not found|-32001|reinitialize|HTTP 404|status code 404/i;
 
   // stdio (from Claude Desktop) → remote (HTTP MCP server)
   stdio.onmessage = async (msg) => {
     try {
       await remote.send(msg);
     } catch (err) {
-      process.stderr.write(`[stdio-mcp] forward error: ${err.message}\n`);
+      let effectiveErr = err;
+      const errStr = (err && err.message) ? err.message : String(err) || '';
+      if (STALE_SESSION_RE.test(errStr)) {
+        process.stderr.write(`[stdio-mcp] session lost (${errStr}); re-handshaking transparently...\n`);
+        try {
+          try { await remote.close(); } catch (_) {}
+          remote = new StreamableHTTPClientTransport(new URL(httpUrl));
+          wireRemoteListeners();
+          await remote.start();
+          await remote.send(msg);
+          process.stderr.write(`[stdio-mcp] re-handshake succeeded; request retried\n`);
+          return; // success on retry — skip the error-reply path below
+        } catch (retryErr) {
+          process.stderr.write(`[stdio-mcp] re-handshake failed: ${retryErr.message}\n`);
+          effectiveErr = retryErr;
+        }
+      }
+      process.stderr.write(`[stdio-mcp] forward error: ${effectiveErr.message}\n`);
       // Return a JSON-RPC error if this was a request (has id)
       if (msg && msg.id !== undefined && msg.id !== null) {
         try {
@@ -2406,7 +2451,7 @@ async function runStdioBridge(httpUrl) {
             id: msg.id,
             error: {
               code: -32603,
-              message: `Pinako bridge: ${err.message}. Make sure the Pinako extension is open.`,
+              message: `Pinako bridge: ${effectiveErr.message}. Make sure the Pinako extension is open.`,
             },
           });
         } catch (_) { /* stdio gone, give up */ }
@@ -2414,18 +2459,6 @@ async function runStdioBridge(httpUrl) {
     }
   };
 
-  // remote → stdio (forward responses back to Claude Desktop)
-  remote.onmessage = async (msg) => {
-    try {
-      await stdio.send(msg);
-    } catch (err) {
-      process.stderr.write(`[stdio-mcp] reply error: ${err.message}\n`);
-    }
-  };
-
-  remote.onerror = (err) => {
-    process.stderr.write(`[stdio-mcp] remote transport error: ${err.message}\n`);
-  };
   stdio.onerror = (err) => {
     process.stderr.write(`[stdio-mcp] stdio transport error: ${err.message}\n`);
   };
