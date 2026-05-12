@@ -140,8 +140,20 @@ const _myForwarderToken = randomBytes(16).toString('hex');
 // write tools in Phase 3). Each entry resolves when the matching editApplied /
 // editFailed message arrives back over NM, or rejects on timeout. Single-browser
 // only in Slice A; Slice B adds SSE forwarder routing for non-leader browsers.
-const pendingEdits = new Map();   // requestId -> { resolve, timer, browserId, dispatchedAt }
+const pendingEdits = new Map();   // requestId -> { resolve, timer, heartbeatTimer, browserId, path, dispatchedAt }
 const EDIT_TIMEOUT_MS = 30_000;
+
+// W-1 defense-in-depth (2026-05-12): NM heartbeat interval. While an applyEdit
+// is in flight on the local NM path, the bridge writes a {type:'heartbeat'}
+// NM message every NM_HEARTBEAT_MS. Each message reaches the SW's mcpPort
+// listener, which is "activity" by Chrome's accounting and resets the 30s
+// idle timer. Belt-and-suspenders complement to the SW→popup port heartbeat
+// (background.js + pinako.js, also 2026-05-12) — that fix handles the common
+// "popup slow but making progress" case; this layer handles "popup event
+// loop completely blocked, can't fire its own setInterval." 25s is well
+// under the 30s idle timer with margin for scheduling jitter. Heartbeats
+// only fire while pendingEdits has at least one entry — no idle traffic.
+const NM_HEARTBEAT_MS = 25_000;
 
 // ─── Slice W-1 diagnostic instrumentation ─────────────────────────────────────
 // Probes SW liveness at the moment EDIT_TIMEOUT fires so we know whether the
@@ -233,6 +245,7 @@ function _markNmStdoutBroken(reason) {
     const summaries = [];
     for (const [requestId, entry] of pendingEdits) {
       try { clearTimeout(entry.timer); } catch (_) {}
+      if (entry.heartbeatTimer) { try { clearInterval(entry.heartbeatTimer); } catch (_) {} }
       const waitedMs = entry.dispatchedAt ? (now - entry.dispatchedAt) : null;
       summaries.push(`${requestId.slice(0,8)}(path=${entry.path},waitedMs=${waitedMs})`);
       try {
@@ -398,6 +411,7 @@ function handleNmMessage(msg) {
     const pending = pendingEdits.get(msg.requestId);
     if (!pending) return;
     clearTimeout(pending.timer);
+    if (pending.heartbeatTimer) { try { clearInterval(pending.heartbeatTimer); } catch (_) {} }
     pendingEdits.delete(msg.requestId);
     if (msg.type === 'editApplied') {
       pending.resolve(msg.result || { ok: true, requestId: msg.requestId });
@@ -484,7 +498,15 @@ function dispatchEdit(op, browserId) {
       return;
     }
     const dispatchedAt = Date.now();
+    // W-1 defense-in-depth: NM heartbeat every 25s while this edit is in
+    // flight. Each heartbeat reaches the SW's mcpPort listener (no-op handler
+    // there), which counts as activity and resets Chrome's 30s SW idle timer
+    // even if the popup-side port heartbeat has stalled.
+    const heartbeatTimer = setInterval(() => {
+      try { nmWrite({ type: 'heartbeat', requestId }); } catch (_) {}
+    }, NM_HEARTBEAT_MS);
     const timer = setTimeout(async () => {
+      try { clearInterval(heartbeatTimer); } catch (_) {}
       // Slice W-1 diagnostic: probe SW state BEFORE resolving with timeout so
       // we capture ground truth on what was responsive at the 30s mark.
       let probe;
@@ -498,15 +520,17 @@ function dispatchEdit(op, browserId) {
         error: { code: 'EDIT_TIMEOUT', message: `applyEdit ${requestId} timed out after ${EDIT_TIMEOUT_MS}ms` },
       });
     }, EDIT_TIMEOUT_MS);
-    pendingEdits.set(requestId, { resolve, timer, browserId, path: 'local', dispatchedAt });
-    // The extension's SW NM listener picks this up, forwards to the popup
-    // via chrome.runtime.sendMessage, popup runs mutateTreeForAgent, replies
-    // editApplied / editFailed back over NM. nmWrite returns false (instead
-    // of throwing) when stdout is broken; we resolve immediately in that
-    // case so the request doesn't hang for the full 30s timeout.
+    pendingEdits.set(requestId, { resolve, timer, heartbeatTimer, browserId, path: 'local', dispatchedAt });
+    // The extension's SW NM listener picks this up, opens a long-lived port
+    // to the popup (W-1 fix, 2026-05-12), popup runs mutateTreeForAgent and
+    // posts the result back. SW relays editApplied/editFailed over NM.
+    // nmWrite returns false (instead of throwing) when stdout is broken; we
+    // resolve immediately in that case so the request doesn't hang for the
+    // full 30s timeout.
     const ok = nmWrite({ type: 'applyEdit', op, requestId, browserId });
     if (!ok) {
       clearTimeout(timer);
+      try { clearInterval(heartbeatTimer); } catch (_) {}
       pendingEdits.delete(requestId);
       resolve({
         ok: false,
