@@ -1251,6 +1251,13 @@ DESTRUCTIVE OPS need explicit user approval. Set confirmedByUser:true on these t
 - delete_library_group with cascadeMembers:true (also deletes member libraries' content)
 Note: ghost_node (closes live tabs, preserves tree record) is NOT destructive — the user can re-open from the tree.
 
+BOOKMARK SAFETY
+Pinako doesn't currently cloud-sync or mirror Chrome bookmarks, so bookmark-scope mutations are harder to undo across devices than tree-side changes. Before larger bookmark changes (deleting folders, batch reorganization, multi-bookmark moves), suggest the user save a backup first. Two options worth offering them:
+- Pinako's bookmark backup: preserves Pinako-specific metadata (tags, memos, star colors, custom nesting structure). Best when the user has organized bookmarks in Pinako and wants that structure preserved.
+- Browser's native export (Chrome: Bookmarks → Bookmark Manager → menu → Export bookmarks): produces a standard HTML file. Doesn't preserve Pinako-specific metadata, but is the simplest option for users who only care about the bookmark URLs and folder structure.
+
+Use judgment: for small individual edits (rename one folder, move one bookmark), suggesting a backup is overkill. For batch operations affecting many bookmarks, mentioning a backup is worth a sentence.
+
 CREATE-* OPS ARE NOT IDEMPOTENT. On transient failures (EDIT_TIMEOUT, NM_WRITE_FAILED, LEADER_CHANGED, FORWARDER_DISCONNECTED), DO NOT auto-retry — query state (list_libraries / get_global_notes / get_library) first to check whether the previous attempt succeeded. Otherwise you may silently create duplicates.
 
 DELETE/GHOST OPS ARE IDEMPOTENT-ON-RETRY. NODE_NOT_FOUND (delete_node) or NODE_NOT_LIVE (ghost_node) on a retry typically means the previous call succeeded but the response was lost — treat as success rather than re-asking the user.
@@ -1349,6 +1356,13 @@ function createMcpServer() {
 
   const BROWSER_ARG_DESC = 'Which Pinako install to query (browser brand like "Brave" or "Chrome", or browserId from list_browsers). Required when multiple browsers are connected; omit when only one is connected.';
 
+  // Slice Y (2026-05-12): the bridge cache auto-refreshes on user activity
+  // within ~1-2s via popup-side debounced pushTreeUpdate. This hint appended
+  // to every Slice-Y-covered read tool teaches the agent to re-invoke fresh
+  // when the user reports a change, rather than relying on prior conversation
+  // responses that may pre-date the user's activity.
+  const FRESHNESS_HINT = ' Cache is auto-refreshed on user activity within ~1-2s. For any "what\'s there now" or "current state" question, re-invoke this tool rather than relying on prior responses in this conversation. If the user references data that doesn\'t appear in your most recent tool response (a tab, library, note, or property they say they added or changed), re-invoke immediately rather than telling them you can\'t find it. The user\'s report is the source of truth; the cache may simply have refreshed since your last call.';
+
   // Common helper: normalize a caller's `mode` arg.
   const _normalizeMode = (m) => MODES.has(m) ? m : 'lite';
 
@@ -1360,7 +1374,8 @@ function createMcpServer() {
         '"minimal" (FLAT list, compact URLs, drops children/collapsed/ghost, keeps openedDate — best for semantic search across 500+ tab trees); ' +
         '"lite" (DEFAULT — tree shape with children/collapsed/ghost, full URLs, keeps openedDate, no favicons); ' +
         '"full" (everything in source data EXCEPT favicons; useful only for visual-field workflows). ' +
-        'Favicons are NEVER returned unless include_favicons:true (they\'re 1-3KB base64 blobs of zero agent value).',
+        'Favicons are NEVER returned unless include_favicons:true (they\'re 1-3KB base64 blobs of zero agent value).' +
+        FRESHNESS_HINT,
       inputSchema: {
         mode: z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "lite". Use "minimal" for semantic-search scans.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs (chromeId=null). Default true.'),
@@ -1388,7 +1403,7 @@ function createMcpServer() {
   srv.registerTool(
     'search_tabs',
     {
-      description: 'LITERAL substring search across main-tree tabs. Matches title, URL, memo text, and tags against the exact query string. Use ONLY when the user names a literal substring ("tabs from stackoverflow.com", "the tab titled exactly X"). For SEMANTIC / categorical intent ("find my exercise tabs", "anything about gardening") do NOT iterate this tool with synonyms — instead call get_tree({mode:"minimal"}) + list_libraries({include_tabs:true, mode:"minimal"}) and match in your own head. See SEARCH SCOPE in server instructions. Mode param: "minimal" (flat, compact URLs — default for this tool since results are already a focused list), "lite" (tree shape), "full" (everything except favicons).',
+      description: 'LITERAL substring search across main-tree tabs. Matches title, URL, memo text, and tags against the exact query string. Use ONLY when the user names a literal substring ("tabs from stackoverflow.com", "the tab titled exactly X"). For SEMANTIC / categorical intent ("find my exercise tabs", "anything about gardening") do NOT iterate this tool with synonyms — instead call get_tree({mode:"minimal"}) + list_libraries({include_tabs:true, mode:"minimal"}) and match in your own head. See SEARCH SCOPE in server instructions. Mode param: "minimal" (flat, compact URLs — default for this tool since results are already a focused list), "lite" (tree shape), "full" (everything except favicons).' + FRESHNESS_HINT,
       inputSchema: {
         query: z.string().describe('LITERAL substring (case-insensitive). For semantic intent, prefer get_tree.'),
         mode:  z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "minimal" since search results are already a focused list.'),
@@ -1415,7 +1430,7 @@ function createMcpServer() {
   srv.registerTool(
     'list_libraries',
     {
-      description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies.',
+      description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies.' + FRESHNESS_HINT,
       inputSchema: {
         include_tabs: z.boolean().optional().describe('Embed each library\'s tabs in the response. Default false. Use this for cross-library semantic search in one call.'),
         mode:         z.enum(['minimal', 'lite', 'full']).optional().describe('Mode for embedded tabs (only used when include_tabs:true). Default "minimal".'),
@@ -1451,7 +1466,7 @@ function createMcpServer() {
   srv.registerTool(
     'get_library',
     {
-      description: 'Returns one library\'s contents. Three modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties.',
+      description: 'Returns one library\'s contents. Three modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties.' + FRESHNESS_HINT,
       inputSchema: {
         library_id: z.string().describe('Library id from list_libraries'),
         mode:       z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "lite".'),
@@ -1500,7 +1515,7 @@ function createMcpServer() {
   srv.registerTool(
     'get_global_notes',
     {
-      description: 'Returns global notes — rich text documents not attached to any specific tab or library. Cloud-synced, identical across browsers.',
+      description: 'Returns global notes — rich text documents not attached to any specific tab or library. Cloud-synced, identical across browsers.' + FRESHNESS_HINT,
       inputSchema: {
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
