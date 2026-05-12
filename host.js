@@ -1871,10 +1871,10 @@ function createMcpServer() {
 
   // ─── Metadata ops ───────────────────────────────────────────────────────────
   srv.registerTool('set_memo', {
-    description: 'Sets the memo (short plain-text annotation, max 2500 chars) on a node. Pass empty string to clear. Memos are per-node and concise; for richer rich-text documents use create_note / set_note_content (which target a library or the global notes, not individual nodes).',
+    description: 'Sets the memo (short plain-text annotation, max 2500 chars) on a node. Pass empty string to clear. Memos are per-node and concise; for richer rich-text documents use create_note / set_note_content (which target a library or the global notes, not individual nodes). The memo content field is named "text" in this tool; "memo" is also accepted as an alias for resilience (if both are present, "text" wins).',
     inputSchema: {
       nodeId:    z.string().describe('Target node id.'),
-      text:      z.string().describe('Memo text (max 2500 chars). Empty string clears the memo.'),
+      text:      z.string().describe('Memo text (max 2500 chars). Empty string clears the memo. Alias: "memo".'),
       scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
