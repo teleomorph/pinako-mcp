@@ -369,10 +369,27 @@ function handleNmMessage(msg) {
     const docs = (msg.data && 'docs' in msg.data)
       ? (msg.data.docs || [])
       : (prior?.docs || []);
+    // 2026-05-12 Slice Y bookmark expansion: preserve-when-omitted for
+    // tree/libraries/globalNotes too. SW-side bookmark-only pushes
+    // (triggered by chrome.bookmarks events from the SW listener,
+    // independent of popup state) send ONLY bookmarks in data; preserve
+    // cached tree/libraries/globalNotes when those fields are absent.
+    // Backwards compatible: existing pushes that include all fields
+    // continue to update those fields exactly as before (the 'in' check
+    // detects presence regardless of value).
+    const tree = (msg.data && 'tree' in msg.data)
+      ? (msg.data.tree || [])
+      : (prior?.tree || []);
+    const libraries = (msg.data && 'libraries' in msg.data)
+      ? (msg.data.libraries || [])
+      : (prior?.libraries || []);
+    const globalNotes = (msg.data && 'globalNotes' in msg.data)
+      ? (msg.data.globalNotes || [])
+      : (prior?.globalNotes || []);
     cachedData.set(browserId, {
-      tree:           msg.data.tree         || [],
-      libraries:      msg.data.libraries    || [],
-      globalNotes:    msg.data.globalNotes  || [],
+      tree,
+      libraries,
+      globalNotes,
       bookmarks,
       docs,
       updatedAt:      Date.now(),
@@ -2052,18 +2069,35 @@ const httpServer = http.createServer(async (req, res) => {
           // (popup-open + reconnect, dev-mode toggle, etc.) — one path
           // populates docs via NM, then a forwarder relays a docsless update
           // that would wipe them. Preserve cached docs when the incoming
-          // payload omits the field. Same shape for bookmarks would have
-          // helped earlier; leaving the literal bookmarks fallback in place
-          // for now since it matches what extension always sends today.
+          // payload omits the field.
+          // 2026-05-12 Slice Y bookmark expansion: same pattern extended to
+          // tree/libraries/globalNotes/bookmarks. SW-side bookmark-only
+          // pushes (forwarder forwards them via /update too) send ONLY
+          // bookmarks in data; preserve cached tree/libraries/globalNotes
+          // when those fields are absent. Symmetric with the NM path so
+          // forwarder browsers get the same cache freshness guarantees as
+          // the leader's local browser.
           const priorCache = cachedData.get(id);
           const docsField = (data && 'docs' in data)
             ? (data.docs || [])
             : (priorCache?.docs || []);
+          const treeField = (data && 'tree' in data)
+            ? (data.tree || [])
+            : (priorCache?.tree || []);
+          const librariesField = (data && 'libraries' in data)
+            ? (data.libraries || [])
+            : (priorCache?.libraries || []);
+          const globalNotesField = (data && 'globalNotes' in data)
+            ? (data.globalNotes || [])
+            : (priorCache?.globalNotes || []);
+          const bookmarksField = (data && 'bookmarks' in data)
+            ? (data.bookmarks || [])
+            : (priorCache?.bookmarks || []);
           cachedData.set(id, {
-            tree:           data.tree         || [],
-            libraries:      data.libraries    || [],
-            globalNotes:    data.globalNotes  || [],
-            bookmarks:      data.bookmarks    || [],
+            tree:           treeField,
+            libraries:      librariesField,
+            globalNotes:    globalNotesField,
+            bookmarks:      bookmarksField,
             docs:           docsField,
             updatedAt:      Date.now(),
             browserId:      id,
