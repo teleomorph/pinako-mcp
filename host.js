@@ -140,8 +140,37 @@ const _myForwarderToken = randomBytes(16).toString('hex');
 // write tools in Phase 3). Each entry resolves when the matching editApplied /
 // editFailed message arrives back over NM, or rejects on timeout. Single-browser
 // only in Slice A; Slice B adds SSE forwarder routing for non-leader browsers.
-const pendingEdits = new Map();   // requestId -> { resolve, timer, browserId }
+const pendingEdits = new Map();   // requestId -> { resolve, timer, browserId, dispatchedAt }
 const EDIT_TIMEOUT_MS = 30_000;
+
+// ─── Slice W-1 diagnostic instrumentation ─────────────────────────────────────
+// Probes SW liveness at the moment EDIT_TIMEOUT fires so we know whether the
+// 30s spent waiting was on a suspended SW vs a hung popup vs a routing fault.
+// The local-NM path sends a `diagnosticPing` via nmWrite, waits up to 2s for a
+// `diagnosticPong`, then logs the verdict before resolving the edit with
+// EDIT_TIMEOUT. SSE path just logs forwarder state — the diagnostic ping
+// design only works for the leader's directly-connected browser.
+const _pendingPings = new Map();  // pingId -> { resolve, timer, sentAt }
+const PING_TIMEOUT_MS = 2_000;
+
+function _dispatchDiagnosticPing(reason) {
+  return new Promise((resolve) => {
+    if (_nmStdoutBroken) { resolve({ status: 'nm_stdout_broken' }); return; }
+    const pingId = randomBytes(6).toString('hex');
+    const sentAt = Date.now();
+    const timer = setTimeout(() => {
+      _pendingPings.delete(pingId);
+      resolve({ status: 'no_reply', pingId, elapsedMs: Date.now() - sentAt });
+    }, PING_TIMEOUT_MS);
+    _pendingPings.set(pingId, { resolve, timer, sentAt });
+    const ok = nmWrite({ type: 'diagnosticPing', pingId, reason });
+    if (!ok) {
+      clearTimeout(timer);
+      _pendingPings.delete(pingId);
+      resolve({ status: 'nm_write_failed', pingId });
+    }
+  });
+}
 
 // localBrowserId — the browserId of the extension connected to THIS bridge
 // process via direct NM stdio (as opposed to forwarded entries that arrived
@@ -351,6 +380,27 @@ function handleNmMessage(msg) {
         error: msg.error || { code: 'UNKNOWN_EDIT_FAILURE', message: 'editFailed without error details' },
       });
     }
+  } else if (msg.type === 'applyEditReceived') {
+    // Slice W-1 diagnostic: SW acks dispatch BEFORE forwarding to popup. RTT
+    // here = how long the message sat in the NM pipe / SW event loop. A small
+    // RTT (<200ms) means SW is responsive; a large RTT means SW was suspended
+    // and the NM stdin message was buffered.
+    const pending = pendingEdits.get(msg.requestId);
+    const rttMs = pending ? Date.now() - pending.dispatchedAt : null;
+    log(`applyEditReceived ${(msg.requestId||'').slice(0,8)} rtt=${rttMs}ms swUptime=${msg.swUptime}ms`);
+  } else if (msg.type === 'diagnosticPong') {
+    const pending = _pendingPings.get(msg.pingId);
+    if (!pending) return; // late reply or unknown ping
+    clearTimeout(pending.timer);
+    _pendingPings.delete(msg.pingId);
+    pending.resolve({
+      status: 'replied',
+      pingId: msg.pingId,
+      elapsedMs: Date.now() - pending.sentAt,
+      swUptime: msg.swUptime,
+      contexts: msg.contexts,
+      popup: msg.popup,
+    });
   }
 }
 
@@ -405,7 +455,14 @@ function dispatchEdit(op, browserId) {
       });
       return;
     }
-    const timer = setTimeout(() => {
+    const dispatchedAt = Date.now();
+    const timer = setTimeout(async () => {
+      // Slice W-1 diagnostic: probe SW state BEFORE resolving with timeout so
+      // we capture ground truth on what was responsive at the 30s mark.
+      let probe;
+      try { probe = await _dispatchDiagnosticPing(`edit_timeout local ${requestId.slice(0,8)}`); }
+      catch (e) { probe = { status: 'probe_threw', error: e && e.message || String(e) }; }
+      log(`EDIT_TIMEOUT local ${requestId.slice(0,8)} probe=${JSON.stringify(probe)}`);
       pendingEdits.delete(requestId);
       resolve({
         ok: false,
@@ -413,7 +470,7 @@ function dispatchEdit(op, browserId) {
         error: { code: 'EDIT_TIMEOUT', message: `applyEdit ${requestId} timed out after ${EDIT_TIMEOUT_MS}ms` },
       });
     }, EDIT_TIMEOUT_MS);
-    pendingEdits.set(requestId, { resolve, timer, browserId, path: 'local' });
+    pendingEdits.set(requestId, { resolve, timer, browserId, path: 'local', dispatchedAt });
     // The extension's SW NM listener picks this up, forwards to the popup
     // via chrome.runtime.sendMessage, popup runs mutateTreeForAgent, replies
     // editApplied / editFailed back over NM. nmWrite returns false (instead
@@ -468,7 +525,15 @@ function _doSseDispatch(op, browserId) {
       });
       return;
     }
+    const dispatchedAt = Date.now();
     const timer = setTimeout(() => {
+      // Slice W-1 diagnostic for SSE path. We can't NM-ping the SSE-routed
+      // browser (NM stdio reaches only the leader's local browser); the
+      // closest signal is whether the forwarder SSE channel is still bound.
+      const fwd = forwarders.get(browserId);
+      const cache = cachedData.get(browserId);
+      const updateAgeMs = cache ? Date.now() - cache.updatedAt : null;
+      log(`EDIT_TIMEOUT sse ${requestId.slice(0,8)} forwarder=${fwd ? 'present' : 'absent'} updateAgeMs=${updateAgeMs}`);
       pendingEdits.delete(requestId);
       resolve({
         ok: false,
@@ -476,7 +541,7 @@ function _doSseDispatch(op, browserId) {
         error: { code: 'EDIT_TIMEOUT', message: `applyEdit ${requestId} timed out after ${EDIT_TIMEOUT_MS}ms` },
       });
     }, EDIT_TIMEOUT_MS);
-    pendingEdits.set(requestId, { resolve, timer, browserId, path: 'sse' });
+    pendingEdits.set(requestId, { resolve, timer, browserId, path: 'sse', dispatchedAt });
     try {
       forwarder.sseRes.write(`event: applyEdit\ndata: ${JSON.stringify({ requestId, op, browserId })}\n\n`);
     } catch (err) {
