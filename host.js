@@ -402,6 +402,18 @@ function handleNmMessage(msg) {
       // a token (NM-direct is implicitly trusted via Chrome's allowed_origins).
       forwarderToken: prior?.forwarderToken || null,
     });
+    // Slice Y bonus: broadcast resource-updated notifications for fields
+    // that were present in this push. Subscribed clients use this to know
+    // when to re-read; the bridge cache is already current by this point.
+    {
+      const updatedFields = [];
+      if (msg.data && 'tree'        in msg.data) updatedFields.push('tree');
+      if (msg.data && 'libraries'   in msg.data) updatedFields.push('libraries');
+      if (msg.data && 'globalNotes' in msg.data) updatedFields.push('globalNotes');
+      if (msg.data && 'bookmarks'   in msg.data) updatedFields.push('bookmarks');
+      if (msg.data && 'docs'        in msg.data) updatedFields.push('docs');
+      if (updatedFields.length > 0) broadcastResourceUpdated(updatedFields);
+    }
     process.stderr.write(`[pinako-mcp] Tree updated from ${browserBrand} (${browserId.slice(0,16)}…): ${msg.data.tree?.length || 0} windows.\n`);
     // Diagnostic: surface docs/bookmarks counts on every NM update so we can
     // tell at a glance whether the extension is pushing them. Logged to the
@@ -1689,6 +1701,127 @@ function createMcpServer() {
     }
   );
 
+  // ═══ MCP resources (Slice Y bonus, 2026-05-12) ════════════════════════════
+  // Five fixed-URI resources mirror the five cache slices. Each one exposes
+  // the same data as the corresponding read tool, just via the MCP resource
+  // protocol. The point isn't access (clients can already read via tools);
+  // the point is enabling subscriptions: when a client subscribes to a
+  // resource URI, the server emits notifications/resources/updated whenever
+  // that resource's content changes. Cache-mutation paths
+  // (handleNmMessage + /update HTTP) call broadcastResourceUpdated() with
+  // the list of fields that were present in the incoming push.
+  //
+  // Multi-browser caveat: these resource URIs don't carry a browser parameter.
+  // If multiple browsers are connected, resources/read returns an ambiguity
+  // error (same shape as the corresponding tool). The tools support a
+  // `browser` argument for that case. ResourceTemplate-based per-browser
+  // URIs are a future refinement when client adoption of resource
+  // subscriptions matures (Claude Desktop doesn't subscribe yet as of
+  // 2026-05-12; MCP Inspector does).
+  const _resourceJsonContents = (uri, payload) => ({
+    contents: [{
+      uri: uri.toString(),
+      mimeType: 'application/json',
+      text: JSON.stringify(payload),
+    }],
+  });
+
+  srv.registerResource(
+    'tree',
+    RESOURCE_URIS.tree,
+    {
+      title:       'Pinako tab tree',
+      description: 'Current tab tree (Windows → Groups → Tabs) for the connected Pinako browser. Subscribe to receive notifications/resources/updated when the tree mutates. For multi-browser scenarios, use the get_tree tool with a browser argument.',
+      mimeType:    'application/json',
+    },
+    async (uri) => {
+      const r = resolveBrowserData();
+      if (r.error) return _resourceJsonContents(uri, { error: r.error.content?.[0]?.text || 'unavailable' });
+      return _resourceJsonContents(uri, {
+        browser:   r.data.browserBrand,
+        browserId: r.data.browserId,
+        tree:      r.data.tree || [],
+        updatedAt: r.data.updatedAt,
+      });
+    }
+  );
+
+  srv.registerResource(
+    'libraries',
+    RESOURCE_URIS.libraries,
+    {
+      title:       'Pinako libraries',
+      description: 'Current list of Pinako libraries with metadata (id, title, description, tabCount, note metadata). Subscribe to receive notifications/resources/updated when libraries mutate.',
+      mimeType:    'application/json',
+    },
+    async (uri) => {
+      const r = resolveBrowserData();
+      if (r.error) return _resourceJsonContents(uri, { error: r.error.content?.[0]?.text || 'unavailable' });
+      return _resourceJsonContents(uri, {
+        browser:   r.data.browserBrand,
+        libraries: r.data.libraries || [],
+        updatedAt: r.data.updatedAt,
+      });
+    }
+  );
+
+  srv.registerResource(
+    'globalNotes',
+    RESOURCE_URIS.globalNotes,
+    {
+      title:       'Pinako global notes',
+      description: 'Global rich-text notes not attached to any tab or library. Cloud-synced across the user\'s browsers. Subscribe to receive notifications/resources/updated when global notes mutate.',
+      mimeType:    'application/json',
+    },
+    async (uri) => {
+      const r = resolveBrowserData();
+      if (r.error) return _resourceJsonContents(uri, { error: r.error.content?.[0]?.text || 'unavailable' });
+      return _resourceJsonContents(uri, {
+        browser:     r.data.browserBrand,
+        globalNotes: r.data.globalNotes || [],
+        updatedAt:   r.data.updatedAt,
+      });
+    }
+  );
+
+  srv.registerResource(
+    'bookmarks',
+    RESOURCE_URIS.bookmarks,
+    {
+      title:       'Chrome bookmarks',
+      description: 'User\'s Chrome bookmark tree as cached by the bridge. Subscribe to receive notifications/resources/updated when bookmarks mutate.',
+      mimeType:    'application/json',
+    },
+    async (uri) => {
+      const r = resolveBrowserData();
+      if (r.error) return _resourceJsonContents(uri, { error: r.error.content?.[0]?.text || 'unavailable' });
+      return _resourceJsonContents(uri, {
+        browser:   r.data.browserBrand,
+        bookmarks: r.data.bookmarks || [],
+        updatedAt: r.data.updatedAt,
+      });
+    }
+  );
+
+  srv.registerResource(
+    'docs',
+    RESOURCE_URIS.docs,
+    {
+      title:       'Pinako user guide sections',
+      description: 'Cached user-guide sections (titles, anchors, text) searchable via the search_docs tool. Subscribe to receive notifications/resources/updated when the bundled guide changes (typically only on extension updates).',
+      mimeType:    'application/json',
+    },
+    async (uri) => {
+      const r = resolveBrowserData();
+      if (r.error) return _resourceJsonContents(uri, { error: r.error.content?.[0]?.text || 'unavailable' });
+      return _resourceJsonContents(uri, {
+        browser: r.data.browserBrand,
+        docs:    r.data.docs || [],
+        updatedAt: r.data.updatedAt,
+      });
+    }
+  );
+
   // ═══ Write tools (Phase 3 Slice A) ═════════════════════════════════════════
   // Agent ops registered as MCP tools so AI clients (Claude Desktop, Cursor,
   // Cline, Continue.dev, etc.) can drive the same engine surface that's already
@@ -2019,6 +2152,40 @@ function createMcpServer() {
 // Each MCP session gets its own transport instance (required by the SDK).
 // Sessions are tracked by the Mcp-Session-Id header the server assigns.
 const activeSessions = new Map(); // sessionId → StreamableHTTPServerTransport
+// Slice Y bonus (2026-05-12): parallel map of McpServer instances so the
+// cache-mutation paths can broadcast notifications/resources/updated to
+// every connected client. Populated alongside activeSessions in the
+// onsessioninitialized callback; cleaned up in transport.onclose.
+const activeServers = new Map();  // sessionId → McpServer
+
+// Resource URI scheme. Five fixed URIs mirror the five cache slices the
+// bridge tracks. Clients can subscribe to any subset; notifications fire
+// only for the resources whose data actually changed (based on which
+// fields were present in the incoming push).
+const RESOURCE_URIS = {
+  tree:        'pinako://tree',
+  libraries:   'pinako://libraries',
+  globalNotes: 'pinako://globalNotes',
+  bookmarks:   'pinako://bookmarks',
+  docs:        'pinako://docs',
+};
+
+function broadcastResourceUpdated(fields) {
+  if (!Array.isArray(fields) || fields.length === 0) return;
+  if (activeServers.size === 0) return;
+  for (const field of fields) {
+    const uri = RESOURCE_URIS[field];
+    if (!uri) continue;
+    for (const srv of activeServers.values()) {
+      try {
+        // sendResourceUpdated returns a Promise; swallow errors so a
+        // disconnected client's send failure doesn't break the broadcast
+        // to other clients.
+        srv.server.sendResourceUpdated({ uri }).catch(() => {});
+      } catch (_) {}
+    }
+  }
+}
 
 const httpServer = http.createServer(async (req, res) => {
   // Health check
@@ -2106,6 +2273,18 @@ const httpServer = http.createServer(async (req, res) => {
             userId:         uid,
             forwarderToken: fwToken,
           });
+          // Slice Y bonus: broadcast resource-updated notifications for
+          // fields that were present in this /update push (parallel to
+          // the NM path's broadcast in handleNmMessage).
+          {
+            const updatedFields = [];
+            if (data && 'tree'        in data) updatedFields.push('tree');
+            if (data && 'libraries'   in data) updatedFields.push('libraries');
+            if (data && 'globalNotes' in data) updatedFields.push('globalNotes');
+            if (data && 'bookmarks'   in data) updatedFields.push('bookmarks');
+            if (data && 'docs'        in data) updatedFields.push('docs');
+            if (updatedFields.length > 0) broadcastResourceUpdated(updatedFields);
+          }
           // Same diagnostic line as the NM path so we can tell at a glance
           // whether docs were preserved or overwritten.
           try {
@@ -2310,19 +2489,26 @@ const httpServer = http.createServer(async (req, res) => {
           transport = activeSessions.get(sessionId);
         } else if (parsed?.method === 'initialize') {
           // New session — create a fresh transport + McpServer pair
+          const srv = createMcpServer();
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (id) => {
               activeSessions.set(id, transport);
+              // Slice Y bonus: register the server so broadcastResourceUpdated
+              // can reach it on subsequent cache mutations.
+              activeServers.set(id, srv);
               log(`MCP session created: ${id}`);
             },
             enableJsonResponse: true,
           });
           transport.onclose = () => {
             const id = [...activeSessions.entries()].find(([, t]) => t === transport)?.[0];
-            if (id) { activeSessions.delete(id); log(`MCP session closed: ${id}`); }
+            if (id) {
+              activeSessions.delete(id);
+              activeServers.delete(id);
+              log(`MCP session closed: ${id}`);
+            }
           };
-          const srv = createMcpServer();
           await srv.connect(transport);
         } else {
           // Unknown session ID for a non-initialize call. Per MCP streamable
