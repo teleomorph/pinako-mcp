@@ -2392,11 +2392,32 @@ async function runStdioBridge(httpUrl) {
   const stdio  = new StdioServerTransport();
   let remote   = new StreamableHTTPClientTransport(new URL(httpUrl));
 
+  // Slice W-4 (refined): we need to replay `initialize` on re-handshake
+  // because the new bridge has an empty activeSessions Map and rejects
+  // any tools/call without a valid session. The SDK's
+  // StreamableHTTPClientTransport doesn't synthesize initialize on its
+  // own — it just forwards whatever message we hand it. So we cache the
+  // initialize request as it flows through from Claude Desktop on first
+  // connect, and replay it before retrying the original failing message.
+  // The initialize-replay response is intercepted so Claude Desktop
+  // doesn't see a duplicate handshake completion.
+  let cachedInitialize = null;   // the original {jsonrpc:'2.0',id:N,method:'initialize',params:...}
+  let cachedInitNotif  = null;   // the optional {jsonrpc:'2.0',method:'notifications/initialized'} (no id)
+  let suppressInitReplayId = null;  // id of an in-flight replay; intercept its response
+  let reHandshakeInFlight = null;   // mutex so concurrent failing requests don't double-recreate the transport
+
   // remote → stdio (forward responses back to Claude Desktop). Defined as
   // a function so we can rebind onto a freshly-created transport after a
   // stale-session re-handshake.
   function wireRemoteListeners() {
     remote.onmessage = async (msg) => {
+      // Slice W-4: swallow the initialize-replay response — the upstream
+      // client already saw a handshake completion at the start of the
+      // session; re-emitting one would confuse it.
+      if (suppressInitReplayId !== null && msg && msg.id !== undefined && msg.id === suppressInitReplayId) {
+        suppressInitReplayId = null;
+        return;
+      }
       try {
         await stdio.send(msg);
       } catch (err) {
@@ -2412,31 +2433,64 @@ async function runStdioBridge(httpUrl) {
   // Slice W-4: transparent stale-session re-handshake. After a leader
   // rotation (zombie recovery + forwarder promotion), the new bridge
   // returns HTTP 404 (code -32001 "Session not found — reinitialize.")
-  // for the proxy's cached Mcp-Session-Id per Slice W's spec compliance.
-  // The SDK's StreamableHTTPClientTransport surfaces this as a send error
-  // but doesn't auto-reset the session, leaving the proxy 404-stuck until
-  // Claude Desktop is reloaded. We detect the error here, recreate the
-  // transport (which forces a fresh initialize on next send), retry the
-  // request once, and hide the rotation from the upstream MCP client.
+  // per Slice W's spec compliance. The SDK's StreamableHTTPClientTransport
+  // surfaces this as a send error but doesn't auto-reset the session.
+  // We detect the error, close the transport, build a fresh one, replay
+  // the cached initialize (extracting the new session id from the
+  // response headers via the transport's internal state), optionally
+  // replay the cached `notifications/initialized`, and retry the
+  // original failing message.
   const STALE_SESSION_RE = /Session not found|-32001|reinitialize|HTTP 404|status code 404/i;
+
+  async function performReHandshake() {
+    if (!cachedInitialize) {
+      throw new Error('cannot re-handshake: no cached initialize message');
+    }
+    process.stderr.write(`[stdio-mcp] re-handshaking transparently...\n`);
+    try { await remote.close(); } catch (_) {}
+    remote = new StreamableHTTPClientTransport(new URL(httpUrl));
+    wireRemoteListeners();
+    await remote.start();
+    // Intercept the initialize response (matches by id) so Claude Desktop
+    // doesn't see a second handshake-complete reply.
+    suppressInitReplayId = (cachedInitialize.id !== undefined) ? cachedInitialize.id : null;
+    await remote.send(cachedInitialize);
+    // Replay the initialized notification if we saw one. Notifications
+    // have no id and no response; just fire-and-forget.
+    if (cachedInitNotif) {
+      try { await remote.send(cachedInitNotif); } catch (_) { /* tolerate */ }
+    }
+    process.stderr.write(`[stdio-mcp] re-handshake complete\n`);
+  }
 
   // stdio (from Claude Desktop) → remote (HTTP MCP server)
   stdio.onmessage = async (msg) => {
+    // Slice W-4: cache initialize + the optional initialized notification
+    // on the way through so we can replay them on re-handshake. We cache
+    // the LAST initialize we saw (typically only one per session, but if
+    // Claude Desktop ever re-initializes we'd want the latest).
+    if (msg && msg.method === 'initialize') {
+      cachedInitialize = msg;
+    } else if (msg && msg.method === 'notifications/initialized') {
+      cachedInitNotif = msg;
+    }
     try {
       await remote.send(msg);
     } catch (err) {
       let effectiveErr = err;
       const errStr = (err && err.message) ? err.message : String(err) || '';
-      if (STALE_SESSION_RE.test(errStr)) {
-        process.stderr.write(`[stdio-mcp] session lost (${errStr}); re-handshaking transparently...\n`);
+      if (STALE_SESSION_RE.test(errStr) && cachedInitialize) {
         try {
-          try { await remote.close(); } catch (_) {}
-          remote = new StreamableHTTPClientTransport(new URL(httpUrl));
-          wireRemoteListeners();
-          await remote.start();
+          // Serialize concurrent re-handshakes — N in-flight failed sends
+          // shouldn't all create N fresh transports.
+          if (!reHandshakeInFlight) {
+            reHandshakeInFlight = performReHandshake().finally(() => { reHandshakeInFlight = null; });
+          }
+          await reHandshakeInFlight;
+          // Now retry the original message on the fresh session.
           await remote.send(msg);
-          process.stderr.write(`[stdio-mcp] re-handshake succeeded; request retried\n`);
-          return; // success on retry — skip the error-reply path below
+          process.stderr.write(`[stdio-mcp] request retried after re-handshake\n`);
+          return;
         } catch (retryErr) {
           process.stderr.write(`[stdio-mcp] re-handshake failed: ${retryErr.message}\n`);
           effectiveErr = retryErr;
