@@ -1410,7 +1410,7 @@ WRITES across multi-source results:
 For "tag/memo all my X tabs as Y": issue ONE bulk_apply per scope (one for scope:'tree' main-tree nodes, one per affected library with scope:'library'+libraryId). Each bulk_apply is one undo step for the user — acceptable for now (cross-scope single-undo is on the roadmap).
 
 MULTI-BROWSER
-The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the same time. Each install is a separate data source. Tools accept an optional 'browser' parameter (e.g., browser="Brave") to pick a specific install. Use list_browsers to discover what's connected and to see each install's updatedAt. Libraries and main tree notes are cloud-synced (identical across browsers); live tab/window state and per-tab metadata differ per install.
+The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the same time. Each install's tree, libraries, main tree notes, bookmarks, tags, and memos are independent data sources. Some may stay in step when both installs are signed into the same Pinako Pro account and cloud sync is current, but do not assume cross-install identity for any domain. Different accounts, signed-out installs, or in-flight sync can diverge them. Tools accept an optional 'browser' parameter (e.g., browser="Brave") to pick a specific install. Use list_browsers to discover what's connected and to see each install's updatedAt.
 
 Selection rules:
 - One browser connected: omit 'browser'; tools resolve automatically.
