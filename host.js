@@ -386,12 +386,26 @@ function handleNmMessage(msg) {
     const globalNotes = (msg.data && 'globalNotes' in msg.data)
       ? (msg.data.globalNotes || [])
       : (prior?.globalNotes || []);
+    // Slice Z (2026-05-12): library panel structure follows the same
+    // preserve-when-omitted contract as tree/libraries/globalNotes.
+    // Older popup builds (pre-Slice Z) send pushes WITHOUT these fields;
+    // we preserve prior cache values rather than wiping. The fields ride
+    // the same wire as libraries — when libraries mutate, panel structure
+    // typically ships alongside, so reads always see a consistent snapshot.
+    const libraryGroups = (msg.data && 'libraryGroups' in msg.data)
+      ? (msg.data.libraryGroups || [])
+      : (prior?.libraryGroups || []);
+    const libraryPanelOrder = (msg.data && 'libraryPanelOrder' in msg.data)
+      ? (msg.data.libraryPanelOrder || [])
+      : (prior?.libraryPanelOrder || []);
     cachedData.set(browserId, {
       tree,
       libraries,
       globalNotes,
       bookmarks,
       docs,
+      libraryGroups,
+      libraryPanelOrder,
       updatedAt:      Date.now(),
       browserId,
       browserBrand,
@@ -405,10 +419,21 @@ function handleNmMessage(msg) {
     // Slice Y bonus: broadcast resource-updated notifications for fields
     // that were present in this push. Subscribed clients use this to know
     // when to re-read; the bridge cache is already current by this point.
+    //
+    // Slice Z (2026-05-12, Option A folded): libraryGroups / libraryPanelOrder
+    // are metadata ABOUT libraries, so a change in either fires the
+    // pinako://libraries resource notification (rather than introducing
+    // separate panel resources that would clutter resource lists for the
+    // marginal subscription granularity benefit).
     {
       const updatedFields = [];
       if (msg.data && 'tree'        in msg.data) updatedFields.push('tree');
-      if (msg.data && 'libraries'   in msg.data) updatedFields.push('libraries');
+      const librariesPresent = msg.data && (
+        'libraries'         in msg.data ||
+        'libraryGroups'     in msg.data ||
+        'libraryPanelOrder' in msg.data
+      );
+      if (librariesPresent) updatedFields.push('libraries');
       if (msg.data && 'globalNotes' in msg.data) updatedFields.push('globalNotes');
       if (msg.data && 'bookmarks'   in msg.data) updatedFields.push('bookmarks');
       if (msg.data && 'docs'        in msg.data) updatedFields.push('docs');
@@ -423,7 +448,9 @@ function handleNmMessage(msg) {
       const bmLen = Array.isArray(msg.data?.bookmarks)
         ? msg.data.bookmarks.reduce((acc, r) => acc + countBookmarksRecursive(r), 0)
         : '<absent>';
-      log(`NM update from ${browserBrand}: docs=${docsLen} bookmarks=${bmLen} windows=${msg.data?.tree?.length || 0}`);
+      const grpLen = Array.isArray(msg.data?.libraryGroups) ? msg.data.libraryGroups.length : '<absent>';
+      const panelLen = Array.isArray(msg.data?.libraryPanelOrder) ? msg.data.libraryPanelOrder.length : '<absent>';
+      log(`NM update from ${browserBrand}: docs=${docsLen} bookmarks=${bmLen} windows=${msg.data?.tree?.length || 0} groups=${grpLen} panel=${panelLen}`);
     } catch (e) {
       try { log(`NM update log failed: ${e.message}`); } catch (_) {}
     }
@@ -1271,7 +1298,7 @@ Read tools (get_tree, search_tabs, list_libraries, get_library, get_global_notes
 Write tools fall into four categories:
 - METADATA: set_tags, add_tags, remove_tags, set_memo, set_star_color, set_row_color, set_title.
 - TREE STRUCTURE: move_node, indent_node, outdent_node, create_group, delete_node, ghost_node, delete_live_node, create_folder.
-- LIBRARY SYSTEM: create_library, add_to_library, set_note_content, create_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group.
+- LIBRARY SYSTEM: create_library, add_to_library, set_note_content, create_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group. For panel reordering, call list_libraries first to get the current groups + panel_order, then pass the modified panel_order to reorder_library_panel. Never construct the panel array blindly — group ids and panel positions must come from a fresh list_libraries call.
 - COMPOSITE: bulk_apply (up to 100 sub-ops, atomic, undoable as a single unit).
 
 DESTRUCTIVE OPS need explicit user approval. Set confirmedByUser:true on these tools ONLY after the user has confirmed THIS specific action (not as a default, not on retry after a failure):
@@ -1459,7 +1486,7 @@ function createMcpServer() {
   srv.registerTool(
     'list_libraries',
     {
-      description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies.' + FRESHNESS_HINT,
+      description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies. Also returns the panel structure (groups + panel_order) needed as input to reorder_library_panel — always call this before any reorder op to source fresh group ids and panel positions.' + FRESHNESS_HINT,
       inputSchema: {
         include_tabs: z.boolean().optional().describe('Embed each library\'s tabs in the response. Default false. Use this for cross-library semantic search in one call.'),
         mode:         z.enum(['minimal', 'lite', 'full']).optional().describe('Mode for embedded tabs (only used when include_tabs:true). Default "minimal".'),
@@ -1484,10 +1511,25 @@ function createMcpServer() {
         }
         return entry;
       });
+      // Slice Z (2026-05-12): expose library panel structure so agents can
+      // construct a valid reorder_library_panel call. `groups` lists every
+      // library group with its membership; `panel_order` is the unified
+      // ordering of standalone libraries + groups on the cards panel
+      // (each entry: {type:'library'|'group', id}). Both are sourced from
+      // the popup's in-memory state via the same push pipeline as libraries.
+      const groups = (r.data.libraryGroups || []).map(g => ({
+        id:          g.id,
+        title:       g.title,
+        description: g.description || '',
+        library_ids: g.libraryIds || [],
+      }));
+      const panel_order = r.data.libraryPanelOrder || [];
       return { content: [{ type: 'text', text: JSON.stringify({
-        browser:   r.data.browserBrand,
-        mode:      include_tabs ? mode : undefined,
-        libraries: libs,
+        browser:     r.data.browserBrand,
+        mode:        include_tabs ? mode : undefined,
+        libraries:   libs,
+        groups,
+        panel_order,
       }) }] };
     }
   );
@@ -1751,16 +1793,29 @@ function createMcpServer() {
     RESOURCE_URIS.libraries,
     {
       title:       'Pinako libraries',
-      description: 'Current list of Pinako libraries with metadata (id, title, description, tabCount, note metadata). Subscribe to receive notifications/resources/updated when libraries mutate.',
+      description: 'Current list of Pinako libraries with metadata (id, title, description, tabCount, note metadata) PLUS library panel structure (groups, panel_order) — same shape as list_libraries. Subscribe to receive notifications/resources/updated when libraries OR panel structure mutate.',
       mimeType:    'application/json',
     },
     async (uri) => {
       const r = resolveBrowserData();
       if (r.error) return _resourceJsonContents(uri, { error: r.error.content?.[0]?.text || 'unavailable' });
+      // Slice Z (2026-05-12, Option A folded): include groups + panel_order
+      // here so resource subscribers see the same shape list_libraries
+      // returns. Since pinako://libraries notification now fires for
+      // libraryGroups / libraryPanelOrder mutations too, the resource read
+      // must surface those fields or subscribers can't act on the signal.
+      const groups = (r.data.libraryGroups || []).map(g => ({
+        id:          g.id,
+        title:       g.title,
+        description: g.description || '',
+        library_ids: g.libraryIds || [],
+      }));
       return _resourceJsonContents(uri, {
-        browser:   r.data.browserBrand,
-        libraries: r.data.libraries || [],
-        updatedAt: r.data.updatedAt,
+        browser:     r.data.browserBrand,
+        libraries:   r.data.libraries || [],
+        groups,
+        panel_order: r.data.libraryPanelOrder || [],
+        updatedAt:   r.data.updatedAt,
       });
     }
   );
@@ -2097,7 +2152,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_library_group_description', args));
 
   srv.registerTool('reorder_library_panel', {
-    description: 'Reorders the cards in the library panel (standalone library cards + library group cards). Pass the COMPLETE current list of entries in the desired order. Each entry is {type:"library"|"group", id:<id>}. ORDER ONLY — every existing entry must be present (rejects with PANEL_ORDER_MISMATCH if count differs, PANEL_ORDER_UNKNOWN_ENTRY if an unknown id is introduced). Use create_library / delete_library_group / etc. to change membership; this op cannot add or remove cards. Use list_libraries first to see current ordering, then submit the rearranged list. Max 200 entries.',
+    description: 'Reorders the cards in the library panel (standalone library cards + library group cards). Pass the COMPLETE current list of entries in the desired order. Each entry is {type:"library"|"group", id:<id>}. ORDER ONLY — every existing entry must be present (rejects with PANEL_ORDER_MISMATCH if count differs, PANEL_ORDER_UNKNOWN_ENTRY if an unknown id is introduced). Use create_library / delete_library_group / etc. to change membership; this op cannot add or remove cards. Always call list_libraries first to fetch the current panel_order array — never construct the entries array blindly; group ids and panel positions must come from a fresh list_libraries call (the panel_order field in its response maps 1:1 to this op\'s entries arg). Max 200 entries.',
     inputSchema: {
       entries: z.array(z.object({
         type: z.string().describe('"library" or "group"'),
@@ -2260,12 +2315,22 @@ const httpServer = http.createServer(async (req, res) => {
           const bookmarksField = (data && 'bookmarks' in data)
             ? (data.bookmarks || [])
             : (priorCache?.bookmarks || []);
+          // Slice Z (2026-05-12): mirror the NM path's preserve-when-omitted
+          // for library panel structure.
+          const libraryGroupsField = (data && 'libraryGroups' in data)
+            ? (data.libraryGroups || [])
+            : (priorCache?.libraryGroups || []);
+          const libraryPanelOrderField = (data && 'libraryPanelOrder' in data)
+            ? (data.libraryPanelOrder || [])
+            : (priorCache?.libraryPanelOrder || []);
           cachedData.set(id, {
-            tree:           treeField,
-            libraries:      librariesField,
-            globalNotes:    globalNotesField,
-            bookmarks:      bookmarksField,
-            docs:           docsField,
+            tree:              treeField,
+            libraries:         librariesField,
+            globalNotes:       globalNotesField,
+            bookmarks:         bookmarksField,
+            docs:              docsField,
+            libraryGroups:     libraryGroupsField,
+            libraryPanelOrder: libraryPanelOrderField,
             updatedAt:      Date.now(),
             browserId:      id,
             browserBrand:   brand,
@@ -2276,10 +2341,18 @@ const httpServer = http.createServer(async (req, res) => {
           // Slice Y bonus: broadcast resource-updated notifications for
           // fields that were present in this /update push (parallel to
           // the NM path's broadcast in handleNmMessage).
+          //
+          // Slice Z (2026-05-12, Option A folded): libraryGroups /
+          // libraryPanelOrder fold into pinako://libraries notification.
           {
             const updatedFields = [];
             if (data && 'tree'        in data) updatedFields.push('tree');
-            if (data && 'libraries'   in data) updatedFields.push('libraries');
+            const librariesPresent = data && (
+              'libraries'         in data ||
+              'libraryGroups'     in data ||
+              'libraryPanelOrder' in data
+            );
+            if (librariesPresent) updatedFields.push('libraries');
             if (data && 'globalNotes' in data) updatedFields.push('globalNotes');
             if (data && 'bookmarks'   in data) updatedFields.push('bookmarks');
             if (data && 'docs'        in data) updatedFields.push('docs');
@@ -2289,7 +2362,9 @@ const httpServer = http.createServer(async (req, res) => {
           // whether docs were preserved or overwritten.
           try {
             const incomingDocs = Array.isArray(data?.docs) ? data.docs.length : '<absent>';
-            log(`/update from ${brand}: incoming docs=${incomingDocs} → stored docs=${docsField.length} windows=${data?.tree?.length || 0}`);
+            const grpLen = Array.isArray(data?.libraryGroups) ? data.libraryGroups.length : '<absent>';
+            const panelLen = Array.isArray(data?.libraryPanelOrder) ? data.libraryPanelOrder.length : '<absent>';
+            log(`/update from ${brand}: incoming docs=${incomingDocs} → stored docs=${docsField.length} windows=${data?.tree?.length || 0} groups=${grpLen} panel=${panelLen}`);
           } catch (_) {}
           extensionConnected = true;
           if (shutdownTimer) { clearTimeout(shutdownTimer); shutdownTimer = null; }
