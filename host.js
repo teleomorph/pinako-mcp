@@ -434,7 +434,7 @@ function handleNmMessage(msg) {
         'libraryPanelOrder' in msg.data
       );
       if (librariesPresent) updatedFields.push('libraries');
-      if (msg.data && 'globalNotes' in msg.data) updatedFields.push('globalNotes');
+      if (msg.data && 'globalNotes' in msg.data) updatedFields.push('mainTreeNotes');
       if (msg.data && 'bookmarks'   in msg.data) updatedFields.push('bookmarks');
       if (msg.data && 'docs'        in msg.data) updatedFields.push('docs');
       if (updatedFields.length > 0) broadcastResourceUpdated(updatedFields);
@@ -921,6 +921,15 @@ async function executeEdit(op, browserArg) {
   if (r.error) {
     return { ok: false, error: { code: 'BROWSER_NOT_FOUND', message: r.error.content[0].text } };
   }
+  // Agent-boundary scope normalization. Tool descriptions present
+  // 'main-tree-notes' as the canonical scope value (the user-facing term);
+  // the extension's wire format still uses the legacy 'global-notes' string.
+  // Translate at this single chokepoint so MCP tools, the /edit HTTP endpoint,
+  // and any future entry into executeEdit all behave the same.
+  _normalizeNotesScope(op);
+  if (op.type === 'bulk_apply' && Array.isArray(op.ops)) {
+    for (const sub of op.ops) _normalizeNotesScope(sub);
+  }
   log(`executeEdit: op.type=${op.type} browserId=${r.data.browserId.slice(0,16)}… brand=${r.data.browserBrand}`);
 
   // Phase 3 Slice D: destructive-op confirmation gate. Bypass-proof at the
@@ -1022,6 +1031,10 @@ async function writeToolHandler(opType, args) {
     content: [{ type: 'text', text: JSON.stringify(result) }],
     ...(result.ok ? {} : { isError: true }),
   };
+}
+
+function _normalizeNotesScope(op) {
+  if (op && op.scope === 'main-tree-notes') op.scope = 'global-notes';
 }
 
 // ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -1293,7 +1306,7 @@ function countBookmarksRecursive(node) {
 const SERVER_INSTRUCTIONS = `Pinako is a browser tab manager Chrome extension. This MCP server gives you READ and WRITE access to the user's live tab data, libraries, library groups, notes, and browser bookmarks.
 
 WRITE TOOLS (Pro tier 1+)
-Read tools (get_tree, search_tabs, list_libraries, get_library, get_global_notes, get_bookmarks, list_browsers) require no special handling.
+Read tools (get_tree, search_tabs, list_libraries, get_library, get_main_tree_notes, get_bookmarks, list_browsers) require no special handling.
 
 Write tools fall into four categories:
 - METADATA: set_tags, add_tags, remove_tags, set_memo, set_star_color, set_row_color, set_title.
@@ -1314,7 +1327,7 @@ Pinako doesn't currently cloud-sync or mirror Chrome bookmarks, so bookmark-scop
 
 Use judgment: for small individual edits (rename one folder, move one bookmark), suggesting a backup is overkill. For batch operations affecting many bookmarks, mentioning a backup is worth a sentence.
 
-CREATE-* OPS ARE NOT IDEMPOTENT. On transient failures (EDIT_TIMEOUT, NM_WRITE_FAILED, LEADER_CHANGED, FORWARDER_DISCONNECTED), DO NOT auto-retry — query state (list_libraries / get_global_notes / get_library) first to check whether the previous attempt succeeded. Otherwise you may silently create duplicates.
+CREATE-* OPS ARE NOT IDEMPOTENT. On transient failures (EDIT_TIMEOUT, NM_WRITE_FAILED, LEADER_CHANGED, FORWARDER_DISCONNECTED), DO NOT auto-retry — query state (list_libraries / get_main_tree_notes / get_library) first to check whether the previous attempt succeeded. Otherwise you may silently create duplicates.
 
 DELETE/GHOST OPS ARE IDEMPOTENT-ON-RETRY. NODE_NOT_FOUND (delete_node) or NODE_NOT_LIVE (ghost_node) on a retry typically means the previous call succeeded but the response was lost — treat as success rather than re-asking the user.
 
@@ -1326,7 +1339,7 @@ The tab tree is hierarchical: Windows → Groups → Tabs.
 - Ghost tabs (chromeId = null) are tabs the user closed in the browser but chose to preserve in the Pinako tree. They can be reopened on demand. Treat them as saved/bookmarked tabs — they are NOT currently open in Chrome.
 - Groups have a title and color. Windows have a title.
 - Libraries are user-created collections of saved tabs organized into folders — like bookmarks but richer, with notes, tags, and memos.
-- Global notes are rich text documents not attached to any specific tab or library.
+- Main tree notes are rich text documents attached to the user's main tree (the live tab tree) rather than to a library or an individual tab. Refer to them as "main tree notes" in any user-facing language. ("global notes" is a legacy codebase term you may still encounter in older docs and internal field names; treat it as a synonym, but do not surface it to the user.)
 
 CHRONOLOGY
 openedDate (Unix ms) records when each tab was opened or saved. Use this for time-based queries like "tabs I opened today", "recent tabs", "what was I looking at last week". Compare against the current date.
@@ -1383,7 +1396,7 @@ DO NOT call search_tabs multiple times with synonyms ("exercise", then "workout"
 
 Both patterns cover tree + libraries by default. Skip bookmarks unless the user explicitly references them ("in my bookmarks", "across everything", "including bookmarks") — bookmark trees are often 10K+ entries and would dominate without adding signal.
 
-When the query is about TABS / LINKS / WINDOWS / TREE structure, DO NOT include note content in the search. Notes are a separate surface — rich-text docs attached to a tree or library, not to individual tabs. Conflating "I have a tab about gardening" with "I wrote a note mentioning gardening" misleads the user. list_libraries and get_library return note metadata (id+title) but not content by default; that's intentional. Include note content only when the user explicitly says "notes" ("search my notes for X", "find the note about Y") — use get_global_notes or get_library({lite:false}) then.
+When the query is about TABS / LINKS / WINDOWS / TREE structure, DO NOT include note content in the search. Notes are a separate surface — rich-text docs attached to a tree or library, not to individual tabs. Conflating "I have a tab about gardening" with "I wrote a note mentioning gardening" misleads the user. list_libraries and get_library return note metadata (id+title) but not content by default; that's intentional. Include note content only when the user explicitly says "notes" ("search my notes for X", "find the note about Y") — use get_main_tree_notes or get_library({lite:false}) then.
 
 Report results BY SOURCE rather than as a bare total: "24 total — 3 live tabs, 8 ghosts in the main tree, 11 in 'Travel: Yucatán' library, 2 in 'Research Notes' library." The breakdown is often as useful as the count.
 
@@ -1397,7 +1410,14 @@ WRITES across multi-source results:
 For "tag/memo all my X tabs as Y": issue ONE bulk_apply per scope (one for scope:'tree' main-tree nodes, one per affected library with scope:'library'+libraryId). Each bulk_apply is one undo step for the user — acceptable for now (cross-scope single-undo is on the roadmap).
 
 MULTI-BROWSER
-The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the same time. Each install is a separate data source. Tools accept an optional 'browser' parameter (e.g., browser="Brave") to pick a specific install. When multiple browsers are connected and the user does NOT specify which to use, tools return an ambiguity error — ask the user which browser they want, then retry with the chosen 'browser' value. Use list_browsers to discover what's connected. Libraries and global notes are cloud-synced so their content is identical across the user's browsers, but live tab/window state and per-tab metadata differ per browser.
+The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the same time. Each install is a separate data source. Tools accept an optional 'browser' parameter (e.g., browser="Brave") to pick a specific install. Use list_browsers to discover what's connected and to see each install's updatedAt. Libraries and main tree notes are cloud-synced (identical across browsers); live tab/window state and per-tab metadata differ per install.
+
+Selection rules:
+- One browser connected: omit 'browser'; tools resolve automatically.
+- Multiple connected, no browser chosen yet this conversation: tools return an ambiguity error. Ask the user which one, then retry with the chosen 'browser' value.
+- After the user has named a browser (explicitly, or by answering the ambiguity prompt), treat it as the sticky default for the rest of the conversation. Reuse the same 'browser' value on every subsequent call without re-asking. Do NOT split the work across browsers, and do NOT re-ask which browser to use.
+- Focus-shift exception: if a DIFFERENT browser's updatedAt is newer than the sticky choice's most recent updatedAt, the user has likely shifted attention to that browser. Ask once: "I noticed recent activity in <X>. Apply this to <X>, stay on <Y>, or do both?" Then adopt the answer as the new sticky default. updatedAt advances on any tree mutation (tab open/close, memo edit, note write), not strictly on window focus, so treat this as a heuristic and do NOT fire it again until updatedAt shifts further.
+- Explicit overrides ("in both browsers", "do it in Chrome instead", "across all installs") win for that one call. If the user's phrasing sounds durable ("from now on use Chrome"), update the sticky default too.
 
 CONNECTION RECOVERY
 If a tool returns "No data yet — open the Pinako extension first", or list_browsers returns an empty list when the user expects browsers to be connected, the Pinako extension's connection to this MCP server has lapsed. Tell the user to open the Pinako extension popup (click the Pinako icon in their browser toolbar). That re-establishes the native-messaging connection and brings the data back. This rarely happens after initial install, but can occur after PC sleep/wake, browser restart, or extended idle periods. The user does not need to restart your client (Claude Desktop, Cursor, etc.) — just opening the popup is enough.
@@ -1584,9 +1604,9 @@ function createMcpServer() {
   );
 
   srv.registerTool(
-    'get_global_notes',
+    'get_main_tree_notes',
     {
-      description: 'Returns global notes — rich text documents not attached to any specific tab or library. Cloud-synced, identical across browsers.' + FRESHNESS_HINT,
+      description: 'Returns the main tree notes — rich text documents attached to the user\'s main tree (the live tab tree), as opposed to notes attached to a specific library. Cloud-synced, identical across browsers. (Legacy codebase name: "global notes". Surface as "main tree notes" in any user-facing language.)' + FRESHNESS_HINT,
       inputSchema: {
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
@@ -1596,7 +1616,7 @@ function createMcpServer() {
       if (r.error) return r.error;
       return { content: [{ type: 'text', text: JSON.stringify({
         browser: r.data.browserBrand,
-        globalNotes: r.data.globalNotes || [],
+        mainTreeNotes: r.data.globalNotes || [],
       }) }] };
     }
   );
@@ -1821,20 +1841,20 @@ function createMcpServer() {
   );
 
   srv.registerResource(
-    'globalNotes',
-    RESOURCE_URIS.globalNotes,
+    'mainTreeNotes',
+    RESOURCE_URIS.mainTreeNotes,
     {
-      title:       'Pinako global notes',
-      description: 'Global rich-text notes not attached to any tab or library. Cloud-synced across the user\'s browsers. Subscribe to receive notifications/resources/updated when global notes mutate.',
+      title:       'Pinako main tree notes',
+      description: 'Rich-text notes attached to the user\'s main tree (as opposed to library notes or per-tab memos). Cloud-synced across the user\'s browsers. Subscribe to receive notifications/resources/updated when main tree notes mutate. (Legacy codebase name: "global notes".)',
       mimeType:    'application/json',
     },
     async (uri) => {
       const r = resolveBrowserData();
       if (r.error) return _resourceJsonContents(uri, { error: r.error.content?.[0]?.text || 'unavailable' });
       return _resourceJsonContents(uri, {
-        browser:     r.data.browserBrand,
-        globalNotes: r.data.globalNotes || [],
-        updatedAt:   r.data.updatedAt,
+        browser:       r.data.browserBrand,
+        mainTreeNotes: r.data.globalNotes || [],
+        updatedAt:     r.data.updatedAt,
       });
     }
   );
@@ -1887,7 +1907,7 @@ function createMcpServer() {
   // ═════════════════════════════════════════════════════════════════════════
 
   const SCOPE_TREE_OR_LIBRARY = "Scope: 'tree' (default), 'library' (libraryId required), or 'bookmarks'. Most node-targeted ops only need scope when working outside the main tree.";
-  const SCOPE_NOTES = "Required: 'library-notes' (notes attached to a specific library; libraryId required) or 'global-notes' (notes attached to the main tree). NOTE: when wrapped in bulk_apply, you must set scope on EACH sub-op individually — bulk's outer scope is NOT inherited by create_note / set_note_content sub-ops because their schemas accept two scopes.";
+  const SCOPE_NOTES = "Required: 'library-notes' (notes attached to a specific library; libraryId required) or 'main-tree-notes' (notes attached to the main tree). NOTE: when wrapped in bulk_apply, you must set scope on EACH sub-op individually — bulk's outer scope is NOT inherited by create_note / set_note_content sub-ops because their schemas accept two scopes.";
   const POSITION_DESC = "Optional 0-indexed insertion position; omit to append. Negative or out-of-range values clamp to ends.";
 
   // ─── Tag ops ────────────────────────────────────────────────────────────────
@@ -1926,7 +1946,7 @@ function createMcpServer() {
 
   // ─── Metadata ops ───────────────────────────────────────────────────────────
   srv.registerTool('set_memo', {
-    description: 'Sets the memo (short plain-text annotation, max 2500 chars) on a node. Pass empty string to clear. Memos are per-node and concise; for richer rich-text documents use create_note / set_note_content (which target a library or the global notes, not individual nodes). The memo content field is named "text" in this tool; "memo" is also accepted as an alias for resilience (if both are present, "text" wins).',
+    description: 'Sets the memo (short plain-text annotation, max 2500 chars) on a node. Pass empty string to clear. Memos are per-node and concise; for richer rich-text documents use create_note / set_note_content (which target a library or the main tree notes, not individual nodes). The memo content field is named "text" in this tool; "memo" is also accepted as an alias for resilience (if both are present, "text" wins).',
     inputSchema: {
       nodeId:    z.string().describe('Target node id.'),
       text:      z.string().describe('Memo text (max 2500 chars). Empty string clears the memo. Alias: "memo".'),
@@ -2084,7 +2104,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_note_content', args));
 
   srv.registerTool('create_note', {
-    description: 'Creates a new note in a library or in global notes. Use this when the user says "create a note about X", "save these findings as a new note", etc. For UPDATING an existing note, use set_note_content. Returns createdNoteId. Char limit is tier-gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. NOT IDEMPOTENT: each call creates a new note. On transient failures, DO NOT auto-retry — call get_library or get_global_notes to check whether the previous attempt succeeded before retrying.',
+    description: 'Creates a new note in a library or in the main tree notes. Use this when the user says "create a note about X", "save these findings as a new note", etc. For UPDATING an existing note, use set_note_content. Returns createdNoteId. Char limit is tier-gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. NOT IDEMPOTENT: each call creates a new note. On transient failures, DO NOT auto-retry — call get_library or get_main_tree_notes to check whether the previous attempt succeeded before retrying.',
     inputSchema: {
       title:     z.string().describe('Note title (trimmed, non-empty, max 200 chars).'),
       content:   z.string().optional().describe('Initial content (default empty). Char limit varies by tier.'),
@@ -2191,7 +2211,7 @@ function createMcpServer() {
 
   // ─── Composite ─────────────────────────────────────────────────────────────
   srv.registerTool('bulk_apply', {
-    description: 'Atomically applies up to 100 sub-ops as a SINGLE undoable unit. Use for multi-step reorganizations ("move these 12 tabs into a new library called Research") so the user can undo the whole thing in one click. SUB-OP SCOPE INHERITANCE: sub-ops without explicit scope/libraryId inherit the bulk\'s; explicitly setting a different value is rejected (BULK_SCOPE_MISMATCH / BULK_LIBRARY_MISMATCH). EXCEPTION for create_note and set_note_content: their schemas accept two valid scopes (library-notes, global-notes), so EVERY sub-op of those types must include its own explicit scope field — bulk\'s outer scope is NOT auto-filled in. NESTING: bulk_apply cannot contain another bulk_apply. PER-SUB-OP CONFIRMATION: each destructive sub-op (delete_node, delete_live_node, delete_library_group with cascadeMembers:true) requires its OWN confirmedByUser:true field — the bulk_apply wrapper does NOT confer confirmation to sub-ops; obtain user approval for each destructive action individually. ERROR LOCATION: on failure, error.context.subOpIndex (and a "Sub-op N:" prefix in the message) identifies the failing sub-op — correct and resubmit just that one in a new bulk_apply, or fix and resubmit the whole batch.',
+    description: 'Atomically applies up to 100 sub-ops as a SINGLE undoable unit. Use for multi-step reorganizations ("move these 12 tabs into a new library called Research") so the user can undo the whole thing in one click. SUB-OP SCOPE INHERITANCE: sub-ops without explicit scope/libraryId inherit the bulk\'s; explicitly setting a different value is rejected (BULK_SCOPE_MISMATCH / BULK_LIBRARY_MISMATCH). EXCEPTION for create_note and set_note_content: their schemas accept two valid scopes (library-notes, main-tree-notes), so EVERY sub-op of those types must include its own explicit scope field — bulk\'s outer scope is NOT auto-filled in. NESTING: bulk_apply cannot contain another bulk_apply. PER-SUB-OP CONFIRMATION: each destructive sub-op (delete_node, delete_live_node, delete_library_group with cascadeMembers:true) requires its OWN confirmedByUser:true field — the bulk_apply wrapper does NOT confer confirmation to sub-ops; obtain user approval for each destructive action individually. ERROR LOCATION: on failure, error.context.subOpIndex (and a "Sub-op N:" prefix in the message) identifies the failing sub-op — correct and resubmit just that one in a new bulk_apply, or fix and resubmit the whole batch.',
     inputSchema: {
       ops:       z.array(z.object({}).passthrough()).min(1).describe('Array of agent ops (each with type + fields). Max 100.'),
       scope:     z.string().optional().describe('Default scope for sub-ops that omit it. NOT applied to create_note / set_note_content sub-ops (must specify per sub-op).'),
@@ -2218,11 +2238,11 @@ const activeServers = new Map();  // sessionId → McpServer
 // only for the resources whose data actually changed (based on which
 // fields were present in the incoming push).
 const RESOURCE_URIS = {
-  tree:        'pinako://tree',
-  libraries:   'pinako://libraries',
-  globalNotes: 'pinako://globalNotes',
-  bookmarks:   'pinako://bookmarks',
-  docs:        'pinako://docs',
+  tree:          'pinako://tree',
+  libraries:     'pinako://libraries',
+  mainTreeNotes: 'pinako://mainTreeNotes',
+  bookmarks:     'pinako://bookmarks',
+  docs:          'pinako://docs',
 };
 
 function broadcastResourceUpdated(fields) {
@@ -2353,7 +2373,7 @@ const httpServer = http.createServer(async (req, res) => {
               'libraryPanelOrder' in data
             );
             if (librariesPresent) updatedFields.push('libraries');
-            if (data && 'globalNotes' in data) updatedFields.push('globalNotes');
+            if (data && 'globalNotes' in data) updatedFields.push('mainTreeNotes');
             if (data && 'bookmarks'   in data) updatedFields.push('bookmarks');
             if (data && 'docs'        in data) updatedFields.push('docs');
             if (updatedFields.length > 0) broadcastResourceUpdated(updatedFields);
