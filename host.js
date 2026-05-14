@@ -3717,9 +3717,9 @@ function createMcpServer() {
         '- workflowStep=\'step-3\'|\'step-4\': user is still editing the bucket structure. Wait + ask the user to confirm in the popup before proceeding.\n' +
         '- workflowStep=\'sorting\': user has confirmed. Begin apply_heuristic_organize + the LLM sift loop.\n' +
         '- workflowStep=\'paused\': user clicked Pause. Stop the sift loop at the next safe boundary, summarize progress, and tell the user you\'re halted. They will click Reset (returns to step-3) or Resume (returns to sorting) in the popup.\n' +
-        '- workflowStep=\'polish\': sift has finished and complete_organize_sift has been called. The user can edit folders; the agent presents the polish menu.\n\n' +
+        '- workflowStep=\'polish\': sift has finished and complete_organize_sort has been called. The user can edit folders; the agent presents the polish menu.\n\n' +
         'Each bucket\'s `bookmarkFolderId` is the chrome.bookmarks folder id where the agent should move items via move_node / bulk_apply. Use this as the targetId when bulk-moving matched items into a category.\n\n' +
-        'duplicateContext (Slice S2f, 2026-05-14): if find_duplicates was called for this scope, this field summarizes the cached scan: {setCount, totalInstances, scannedAt, scope, libraryId, scopeMatchesWorkflow}. When scopeMatchesWorkflow is true, the cached duplicate sets (with parentPaths) are usable as semantic signal during the LLM sift (Step 7) and reconcilable post-sift via resolve_duplicate_landings (Step 9). If null, no recent dedup scan exists for the active scope — call find_duplicates first if Step 2 of LARGE TREE ORGANIZATION applies.',
+        'duplicateContext (Slice S2f, 2026-05-14): if find_duplicates was called for this scope, this field summarizes the cached scan: {setCount, totalInstances, scannedAt, scope, libraryId, scopeMatchesWorkflow}. When scopeMatchesWorkflow is true, the cached duplicate sets (with parentPaths) are usable as semantic signal during the LLM sift (Step 8) and reconcilable post-sift via resolve_duplicate_landings (Step 10). If null, no recent dedup scan exists for the active scope — call find_duplicates first if Step 2 of LARGE TREE ORGANIZATION applies.',
       inputSchema: {
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
