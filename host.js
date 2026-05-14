@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, randomBytes } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 // ─── Debug log file ───────────────────────────────────────────────────────────
 // Cross-platform log path (host.js is bundled independently — no import from setup/paths.js)
@@ -78,6 +79,27 @@ const STDIN_GRACE_MS = 30_000;
 // stays as defense-in-depth for in-process callers (chat panel in Phase 4).
 const NOTE_CHAR_LIMITS = { 0: 50000, 1: 50000, 2: 150000, 3: 250000, 4: 500000 };
 
+// Slice S1 (2026-05-13): per-tier read-tool size guard. Triggers a structured
+// warning when a single tree/library/bookmarks/notes read would exceed the
+// agent's context budget. Generous thresholds — not a hard cap; the caller
+// can bypass with acknowledge_size:true if they explicitly want the full
+// payload (e.g., model with a much bigger context window than typical).
+// Calibration is TBD via real-tree measurement; initial values map roughly to
+// "comfortable working budget" per tier assuming minimal mode.
+const READ_TOKEN_LIMITS = {
+  0: 30_000,    // free       — ~500 nodes at ~60 tok/node
+  1: 120_000,   // Pro        — ~2000 nodes
+  2: 300_000,   // Pro+       — ~5000 nodes
+  3: 600_000,   // Premium    — ~10k nodes
+  4: Infinity,  // Enterprise — no guard
+};
+
+// Per-mode token-per-node estimate for tree/bookmark/library payloads.
+// Approximate; the size guard uses these to estimate the response weight
+// before serializing it. Higher figures for richer modes (lite carries
+// children/collapsed/ghost; full carries everything except favicons).
+const TOKENS_PER_NODE = { minimal: 60, lite: 120, full: 250 };
+
 // Last-resort handlers so an uncaught error in any async path is at least
 // logged to disk before the process dies. Without these, an async throw in
 // the /edit handler or NM listener would crash the host silently from the
@@ -112,6 +134,20 @@ const BRIDGE_URL = (() => {
 // one entry; tools called without `browser` while >1 entries exist return an
 // "ambiguous, please specify" error so the AI prompts the user.
 const cachedData = new Map();
+
+// ─── Auto-organize observation log (S2c, 2026-05-13) ──────────────────────────
+// Per-browser observation log for the LLM sift loop. Agents call
+// record_observation to track patterns spanning batches ("noticed many
+// cooking blogs across 7 batches"); get_observations returns the digest so
+// the agent can inject it into the next batch prompt. Cleared automatically
+// when the workflow ends (organizeStateUpdate handler flips workflowStep to
+// 'idle'). Bounded per-browser at MAX_OBSERVATIONS_PER_SESSION to keep memory
+// honest if an agent goes wild.
+//
+// Map<browserId, Array<{ pattern, count, examples, batch_n, recordedAt }>>
+const _organizeObservationLog = new Map();
+const MAX_OBSERVATIONS_PER_SESSION = 100;
+
 let extensionConnected = false;
 let shutdownTimer = null;
 let forwardToExisting = null; // set on EADDRINUSE — forward data to old instance then exit
@@ -415,6 +451,17 @@ function handleNmMessage(msg) {
       // by the most recent /update; treeUpdate via direct NM doesn't carry
       // a token (NM-direct is implicitly trusted via Chrome's allowed_origins).
       forwarderToken: prior?.forwarderToken || null,
+      // S2f Phase 3b bugfix (2026-05-14): preserve organizeState across
+      // treeUpdate pushes. The sift loop fires many bulk_apply ops; each one
+      // triggers a pushTreeUpdate from the popup. Without this preservation,
+      // every push REPLACED the cachedData entry and dropped the
+      // organizeState that auto_organize_bookmarks's Confirm-time push had
+      // set — so by the time the agent finished the sift and called
+      // complete_organize_sort, get_organize_state returned 'idle' and the
+      // polish transition couldn't fire. The popup is the single source of
+      // organize-workflow state truth; treeUpdate carries unrelated data
+      // and should never clobber it.
+      organizeState: prior?.organizeState || null,
     });
     // Slice Y bonus: broadcast resource-updated notifications for fields
     // that were present in this push. Subscribed clients use this to know
@@ -499,6 +546,43 @@ function handleNmMessage(msg) {
       contexts: msg.contexts,
       popup: msg.popup,
     });
+  } else if (msg.type === 'organizeStateUpdate') {
+    // S2c (2026-05-13): popup → SW → bridge state push for the auto-organize
+    // workflow. Cached on the per-browser entry so the get_organize_state MCP
+    // tool can return it. Workflow steps: 'idle' | 'step-3' | 'step-4' |
+    // 'sorting' | 'paused'. Agent loop pattern:
+    //   1. Call auto_organize_bookmarks(scope) — Pinako popup opens, user reviews/
+    //      confirms folder structure (Steps 3 + 4).
+    //   2. User clicks Confirm & start sift — popup pushes workflowStep:
+    //      'sorting' with the confirmed buckets here.
+    //   3. Agent polls get_organize_state until workflowStep === 'sorting',
+    //      then calls apply_heuristic_organize for the heuristic broad-sweep
+    //      and the cursor-paginated LLM sift loop.
+    //   4. If user clicks Pause, workflowStep flips to 'paused' — agent checks
+    //      between batches and halts gracefully.
+    const browserId = msg.browserId;
+    if (!browserId) return;
+    const prior = cachedData.get(browserId) || {};
+    const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
+    prior.organizeState = {
+      workflowStep:      typeof payload.workflowStep === 'string' ? payload.workflowStep : 'idle',
+      scope:             typeof payload.scope === 'string' ? payload.scope : null,
+      libraryId:         typeof payload.libraryId === 'string' ? payload.libraryId : null,
+      includeOtherRoots: !!payload.includeOtherRoots,
+      buckets:           Array.isArray(payload.buckets) ? payload.buckets : [],
+      confirmedAt:       Number.isFinite(payload.confirmedAt) ? payload.confirmedAt : Date.now(),
+      pushedAt:          Date.now(),
+    };
+    // S2c: clear the observation log when the workflow ends. Observations are
+    // tied to a single sift-loop session — once the panel closes (workflowStep
+    // → 'idle') they're no longer relevant. On 'step-3' / 'step-4' / 'sorting'
+    // / 'paused' the log is preserved.
+    if (prior.organizeState.workflowStep === 'idle' && _organizeObservationLog.has(browserId)) {
+      _organizeObservationLog.delete(browserId);
+      log(`organizeObservationLog cleared for ${msg.browserBrand || 'unknown'} (workflowStep → idle).`);
+    }
+    cachedData.set(browserId, prior);
+    log(`organizeStateUpdate from ${msg.browserBrand || 'unknown'}: workflowStep=${prior.organizeState.workflowStep} buckets=${prior.organizeState.buckets.length}`);
   }
 }
 
@@ -881,6 +965,584 @@ function _resolveExistingNoteContent(browserData, scope, libraryId, noteId) {
     return (note && note.content) || '';
   }
   return '';
+}
+
+// ─── Slice S1: read-tool size guard helpers ────────────────────────────────
+// Counts nodes recursively in a tree or array of trees. Used by the size guard
+// to estimate the payload weight of a read tool's response before serializing.
+function _countNodesDeep(treeOrNode) {
+  let count = 0;
+  function walk(node) {
+    if (!node) return;
+    count++;
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) walk(child);
+    }
+  }
+  if (Array.isArray(treeOrNode)) {
+    for (const root of treeOrNode) walk(root);
+  } else {
+    walk(treeOrNode);
+  }
+  return count;
+}
+
+// Token estimate for tree/bookmark/library payload shapes.
+function _estimateTreeTokens(nodeCount, mode) {
+  const perNode = TOKENS_PER_NODE[mode] || TOKENS_PER_NODE.lite;
+  return nodeCount * perNode;
+}
+
+// Token estimate for notes payloads. Notes are content-heavy not node-heavy;
+// estimate from cumulative character length (chars-to-tokens ~4:1).
+function _estimateNotesTokens(notes) {
+  if (!Array.isArray(notes)) return 0;
+  let chars = 0;
+  for (const n of notes) {
+    chars += String((n && n.content) || '').length;
+    chars += String((n && n.title) || '').length;
+  }
+  return Math.ceil(chars / 4);
+}
+
+// Returns a structured warning object when the estimated payload exceeds the
+// per-tier token budget AND acknowledge is falsy. Returns null otherwise (no
+// guard fired; proceed with normal payload). Caller passes estTokens (computed
+// via the appropriate estimator), nodeCount (for the warning shape), the mode
+// label, the scope label, browserData (for tier lookup), the tool-specific
+// suggested_actions array, and the acknowledge_size flag from the caller.
+function _checkReadSizeGuard({ estTokens, nodeCount, mode, scope, browserData, suggestedActions, acknowledge }) {
+  if (acknowledge) return null;
+  const tier = Number.isFinite(browserData?.userTier) ? browserData.userTier : 0;
+  const tokenLimit = READ_TOKEN_LIMITS[tier] != null ? READ_TOKEN_LIMITS[tier] : READ_TOKEN_LIMITS[0];
+  if (!Number.isFinite(tokenLimit) || estTokens <= tokenLimit) return null;
+  return {
+    warning: 'tree_too_large',
+    counts: { nodes: nodeCount, est_tokens: estTokens, mode: mode || null },
+    threshold: { tier, est_tokens_limit: tokenLimit },
+    scope,
+    suggested_actions: suggestedActions,
+    bypass: 'Pass acknowledge_size:true to skip this guard and receive the full payload anyway.',
+  };
+}
+
+// ─── Slice S2 Prep 2: exact-URL duplicate detection ─────────────────────────
+// Walks a tree/bookmark/library structure and groups nodes by URL. Returns the
+// duplicate sets (URLs appearing more than once), ordered by frequency
+// descending. Skips nodes without a URL (folders, windows, groups). Exact byte
+// match only — no query-string normalization, no fuzzy match. v2 polish
+// (followups #22) covers near-duplicate matching.
+//
+// Per-instance parent breadcrumb (parentPath): slash-joined string of the
+// non-empty ancestor titles ABOVE each URL-bearing node. Powers the Slice S2f
+// dedup-as-sift-signal flow — duplicate instances enter the LLM sift loop
+// with their original folder names available as semantic hints, then
+// resolve_duplicate_landings reconciles them post-sift. Empty-title ancestors
+// (chrome.bookmarks' outer root, unnamed Pinako windows) are skipped so
+// "Bookmarks bar" prefixes don't pollute the path; "Other Bookmarks" and
+// "Mobile Bookmarks" (which DO carry signal vs Bookmarks bar) are preserved.
+function _findDuplicateUrls(tree) {
+  // url → array of { id, title, parentPath }
+  const urlMap = new Map();
+  let scanned = 0;
+  const pathStack = [];
+  function walk(node) {
+    if (!node) return;
+    const url = node && typeof node.url === 'string' ? node.url : '';
+    if (url.length > 0) {
+      scanned++;
+      let arr = urlMap.get(url);
+      if (!arr) { arr = []; urlMap.set(url, arr); }
+      arr.push({
+        id: node.id,
+        title: String(node.title || ''),
+        parentPath: pathStack.join('/'),
+      });
+    }
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      const title = node.title ? String(node.title) : '';
+      const pushed = title.length > 0;
+      if (pushed) pathStack.push(title);
+      for (const child of node.children) walk(child);
+      if (pushed) pathStack.pop();
+    }
+  }
+  if (Array.isArray(tree)) {
+    for (const root of tree) walk(root);
+  } else {
+    walk(tree);
+  }
+  const duplicateSets = [];
+  let totalDuplicateInstances = 0;
+  for (const [url, instances] of urlMap.entries()) {
+    if (instances.length > 1) {
+      // Up to 3 distinct sample titles (helps the agent surface what the URL is)
+      const seen = new Set();
+      const sampleTitles = [];
+      for (const inst of instances) {
+        if (inst.title && !seen.has(inst.title)) {
+          seen.add(inst.title);
+          sampleTitles.push(inst.title);
+          if (sampleTitles.length >= 3) break;
+        }
+      }
+      duplicateSets.push({
+        url,
+        count: instances.length,
+        nodeIds: instances.map(x => x.id),
+        parentPaths: instances.map(x => x.parentPath),
+        sampleTitles,
+      });
+      totalDuplicateInstances += instances.length - 1;
+    }
+  }
+  duplicateSets.sort((a, b) => b.count - a.count);
+  return {
+    duplicateSets,
+    totalDuplicateInstances,
+    uniqueDuplicateUrls: duplicateSets.length,
+    totalScannedWithUrl: scanned,
+  };
+}
+
+// ─── Slice S2a (2026-05-13): cursor pagination helpers ──────────────────────
+// Cursor = last-seen stable Pinako node id (or Chrome bookmark id for
+// bookmarks). Pagination is opt-in: callers that pass `after` OR `limit` get
+// a paginated response shape (items[] + nextCursor); callers that omit both
+// keep the original tree-shape response. Pagination ALWAYS returns a FLAT
+// list of mode-shaped items — children stripped, parentId preserved for
+// hierarchy reconstruction. This matches the auto-organize Step 7 sift loop
+// (read 500 items, sift, bulk_apply move, read next 500 via cursor).
+//
+// Cursor robustness: when `after` doesn't match a node in the current list
+// (the cursor node was moved or deleted between calls), pagination falls
+// back to startIdx=0. The agent should still make forward progress because
+// items already moved out of the source folder won't reappear in the
+// flat list. This handles list churn during the sift loop naturally.
+const PAGINATION_DEFAULT_LIMITS = {
+  tree:           500,
+  bookmarks:      500,
+  library:        500,
+  'main-tree-notes': 100,
+  libraries:      50,
+};
+
+// Mode-aware flat-item shaper for tree-like data (tree, library children).
+// Each output item is one node (no nested children) with parentId set so the
+// agent can reconstruct hierarchy if needed. Returns a fresh array.
+function _flattenTreeWithMode(nodes, scope, libraryId, mode, includeFavicons, parentId = null, out = []) {
+  if (!Array.isArray(nodes)) return out;
+  for (const node of nodes) {
+    if (!node) continue;
+    let shaped;
+    if (mode === 'minimal') {
+      shaped = minimalNode(node, scope, libraryId, parentId);
+    } else if (mode === 'lite') {
+      shaped = {
+        id:    node.id,
+        type:  node.type,
+        title: node.title || '',
+      };
+      if (scope)     shaped.scope     = scope;
+      if (libraryId) shaped.libraryId = libraryId;
+      if (parentId)  shaped.parentId  = parentId;
+      if (node.url) shaped.url = node.url;
+      if (node.type === 'tab' && node.chromeId === null) shaped.ghost = true;
+      if (node.type === 'tab' && node.openedDate) shaped.openedDate = node.openedDate;
+      if (Array.isArray(node.tags) && node.tags.length > 0) shaped.tags = node.tags;
+      if (node.memoText) shaped.memoText = node.memoText;
+      if (node.collapsed) shaped.collapsed = true;
+    } else { // full
+      const sanitized = sanitizeNode(node);
+      const noFavicons = includeFavicons ? sanitized : stripFavicons(sanitized);
+      const { children: _ignore, ...rest } = noFavicons;
+      shaped = { ...rest };
+      if (parentId)  shaped.parentId  = parentId;
+      if (scope)     shaped.scope     = scope;
+      if (libraryId) shaped.libraryId = libraryId;
+    }
+    out.push(shaped);
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      _flattenTreeWithMode(node.children, scope, libraryId, mode, includeFavicons, node.id, out);
+    }
+  }
+  return out;
+}
+
+// Flatten the raw chrome.bookmarks tree (different shape from Pinako nodes)
+// into a flat DFS pre-order list. Each item carries id, title, url (if leaf),
+// parentId, dateAdded, index. Folders are included (no url field) so the
+// agent can see structure; the sift loop typically filters to url-bearing
+// nodes itself.
+function _flattenBookmarksTree(nodes, parentId = null, out = []) {
+  if (!Array.isArray(nodes)) return out;
+  for (const node of nodes) {
+    if (!node) continue;
+    const item = {
+      id:       node.id,
+      title:    node.title || '',
+      parentId: parentId,
+    };
+    if (typeof node.url === 'string')   item.url       = node.url;
+    if (typeof node.dateAdded === 'number') item.dateAdded = node.dateAdded;
+    if (typeof node.index === 'number') item.index     = node.index;
+    out.push(item);
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      _flattenBookmarksTree(node.children, node.id, out);
+    }
+  }
+  return out;
+}
+
+// Slice a flat list by cursor + limit. Returns { items, nextCursor,
+// totalItems, startIdx }. When `after` is provided but not found, falls
+// back to startIdx=0 (handles list churn — the cursor node may have been
+// moved out by a prior bulk_apply in the sift loop).
+function _paginateByCursor(flatList, after, limit, idField = 'id') {
+  let startIdx = 0;
+  let cursorFound = true;
+  if (after) {
+    const foundIdx = flatList.findIndex(item => item[idField] === after);
+    if (foundIdx >= 0) {
+      startIdx = foundIdx + 1;
+    } else {
+      cursorFound = false;
+      startIdx = 0;
+    }
+  }
+  const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : flatList.length;
+  const slice = flatList.slice(startIdx, startIdx + safeLimit);
+  const endIdx = startIdx + slice.length;
+  const nextCursor = (endIdx < flatList.length && slice.length > 0)
+    ? slice[slice.length - 1][idField]
+    : null;
+  return {
+    items:        slice,
+    nextCursor,
+    totalItems:   flatList.length,
+    startIdx,
+    cursorFound,
+  };
+}
+
+// True when the caller passed pagination params. Both undefined → no
+// pagination; either one set → paginate with sensible defaults.
+function _isPaginationRequested(after, limit) {
+  return after != null || limit != null;
+}
+
+// ─── Slice S2a (2026-05-13): get_tree_summary helpers ────────────────────────
+// Lightweight structural summary of a tree/bookmarks/library scope, used by
+// the auto-organize workflow at kickoff to decide WHETHER to proceed and at
+// what scope. Returns counts, depth, top domains, top path-token patterns,
+// and a small sample of titles. Crucially does NOT trigger the size guard —
+// the whole point is "summarize before reading."
+
+const _SUMMARY_STOP_TOKENS = new Set([
+  'index','html','htm','php','aspx','jsp','main','home','page','default',
+  'http','https','www','com','org','net','about','contact','login','signin',
+  'logout','signup','register','help','support','faq','search','results',
+  'view','viewtopic','watch','play','show','read','article','articles',
+  'post','posts','category','categories','tag','tags','tagged','user','users',
+  'profile','feed','rss','atom','sitemap','privacy','terms','tos','en','de',
+  'fr','es','pt','it','ja','zh','ru','app','apps','api','v1','v2','v3',
+  'docs','doc','documentation','www2','m','mobile','share','sharing',
+]);
+
+function _extractDomain(url) {
+  if (!url || typeof url !== 'string') return null;
+  try {
+    const u = new URL(url);
+    let host = u.hostname.toLowerCase();
+    if (host.startsWith('www.')) host = host.slice(4);
+    return host || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function _extractPathTokens(url) {
+  if (!url || typeof url !== 'string') return [];
+  try {
+    const u = new URL(url);
+    // Split path on /, -, _, ., +. Lowercase. Filter to tokens >= 4 chars,
+    // not all-numeric, not in stop-list. Dedupe within a single URL so
+    // repeated tokens (e.g., /blog/blog/) don't over-inflate the count.
+    const segs = u.pathname.split(/[\/\-_.+]+/).map(s => s.toLowerCase());
+    const seen = new Set();
+    const out = [];
+    for (const s of segs) {
+      if (s.length < 4) continue;
+      if (/^\d+$/.test(s)) continue;
+      if (_SUMMARY_STOP_TOKENS.has(s)) continue;
+      if (seen.has(s)) continue;
+      seen.add(s);
+      out.push(s);
+    }
+    return out;
+  } catch (_) {
+    return [];
+  }
+}
+
+// ─── Slice S2a (2026-05-13): heuristic rules + propose_categories ───────────
+// Default rule library lives at pinako-mcp/src/heuristic-rules.json. Cached
+// after first load (file is small, ~50KB, doesn't change at runtime).
+
+let _heuristicRulesCache = null;
+let _heuristicRulesCacheError = null;
+
+function _loadHeuristicRules() {
+  if (_heuristicRulesCache !== null) return _heuristicRulesCache;
+  try {
+    // host.js is at pinako-mcp/host.js; rules at pinako-mcp/src/heuristic-rules.json.
+    // fileURLToPath decodes percent-encoded path segments correctly (URL
+    // pathname encodes spaces as %20; fs.readFileSync needs the raw path).
+    const scriptPath = fileURLToPath(import.meta.url);
+    const scriptDir  = path.dirname(scriptPath);
+    const rulesPath  = path.join(scriptDir, 'src', 'heuristic-rules.json');
+    const json = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));
+    _heuristicRulesCache = Array.isArray(json.rules) ? json.rules : [];
+    log(`heuristic rules loaded: ${_heuristicRulesCache.length} rules from ${rulesPath}`);
+  } catch (err) {
+    _heuristicRulesCacheError = err.message;
+    log(`heuristic rules load failed: ${err.message}`);
+    _heuristicRulesCache = [];
+  }
+  return _heuristicRulesCache;
+}
+
+// True if `url` matches `rule.match` (domain + optional path glob).
+// Domain matches as exact OR subdomain ("spotify.com" matches "open.spotify.com").
+// Wildcards in match.domain: leading "*." matches any subdomain (e.g., "*.gov"
+// matches "irs.gov", "usa.gov"). Path glob uses "*" wildcards.
+function _ruleMatchesUrl(rule, url) {
+  if (!url || typeof url !== 'string') return false;
+  let u;
+  try { u = new URL(url); } catch (_) { return false; }
+  const hostname = u.hostname.toLowerCase();
+  const urlPath  = u.pathname;
+
+  const matchDomain = rule.match && rule.match.domain;
+  if (matchDomain) {
+    const md = String(matchDomain).toLowerCase();
+    if (md.startsWith('*.')) {
+      // "*.gov" → match any hostname ending in ".gov"
+      const suffix = md.slice(1); // ".gov"
+      if (!hostname.endsWith(suffix)) return false;
+    } else {
+      // Exact OR subdomain match
+      if (hostname !== md && !hostname.endsWith('.' + md)) return false;
+    }
+  }
+
+  const matchPath = rule.match && rule.match.path;
+  if (matchPath) {
+    const escaped = String(matchPath).replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+    const re = new RegExp('^' + escaped + '$');
+    if (!re.test(urlPath)) return false;
+  }
+  return true;
+}
+
+// S2d Phase 3 (2026-05-14): find a folder in the raw chrome.bookmarks tree
+// by its chrome.bookmarks id. Used by refine_folder_outliers to scope items
+// for the LLM scan to a single bucket. Walks recursively from any root —
+// the tree shape from chrome.bookmarks.getTree() is [{id:'0', children:[
+// BookmarksBar, OtherBookmarks, MobileBookmarks]}], so a top-level call
+// passes that wrapper array.
+function _findBookmarkFolderByChromeId(nodes, folderId) {
+  if (!Array.isArray(nodes)) return null;
+  for (const n of nodes) {
+    if (!n) continue;
+    if (n.id === folderId && Array.isArray(n.children)) return n;
+    const f = _findBookmarkFolderByChromeId(n.children, folderId);
+    if (f) return f;
+  }
+  return null;
+}
+
+// Walk a tree and split nodes into matched (per first matching rule) vs
+// unmatched (no rule fires). Low-confidence rules are skipped during this
+// broad-sweep classification — they don't apply directly, only bias LLM
+// categorization downstream.
+function _applyHeuristicsToTree(roots, rules) {
+  const matched   = [];
+  const unmatched = [];
+  function walk(node) {
+    if (!node) return;
+    const url = typeof node.url === 'string' ? node.url : '';
+    if (url) {
+      let hit = null;
+      for (const rule of rules) {
+        if (rule.confidence === 'low') continue;
+        if (_ruleMatchesUrl(rule, url)) { hit = rule; break; }
+      }
+      if (hit) {
+        matched.push({ node, ruleId: hit.ruleId, target: hit.target, confidence: hit.confidence });
+      } else {
+        unmatched.push(node);
+      }
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) walk(child);
+    }
+  }
+  if (Array.isArray(roots)) {
+    for (const r of roots) walk(r);
+  } else if (roots) {
+    walk(roots);
+  }
+  return { matched, unmatched };
+}
+
+// Generate suggested category folder names from the unmatched residue.
+// Algorithm: group residue by domain, take top domains by count, propose
+// a folder name per domain. Then add path-token suggestions (tokens
+// appearing >= minMatchCount across the residue) that aren't already
+// covered by a domain suggestion. Returns 8-15 suggestions.
+function _proposeCategoriesFromResidue(unmatched, opts = {}) {
+  const minMatchCount = Number.isFinite(opts.minMatchCount) && opts.minMatchCount > 0
+    ? opts.minMatchCount
+    : 100;
+  const maxSuggestions = Number.isFinite(opts.maxSuggestions) && opts.maxSuggestions > 0
+    ? opts.maxSuggestions
+    : 15;
+
+  const byDomain = new Map();
+  const pathTokenCounts = new Map();
+  for (const node of unmatched) {
+    const url = node.url;
+    const domain = _extractDomain(url);
+    if (domain) {
+      if (!byDomain.has(domain)) byDomain.set(domain, []);
+      byDomain.get(domain).push(node);
+    }
+    for (const t of _extractPathTokens(url)) {
+      pathTokenCounts.set(t, (pathTokenCounts.get(t) || 0) + 1);
+    }
+  }
+
+  const suggestions = [];
+
+  // Domain-based suggestions first (more reliable signal).
+  const domainEntries = [...byDomain.entries()]
+    .filter(([_d, nodes]) => nodes.length >= minMatchCount)
+    .sort((a, b) => b[1].length - a[1].length);
+  for (const [domain, nodes] of domainEntries) {
+    if (suggestions.length >= maxSuggestions) break;
+    suggestions.push({
+      target: _domainToCategoryName(domain),
+      domain,
+      count: nodes.length,
+      basis: 'domain-frequency',
+      sampleTitles: nodes.slice(0, 3).map(n => String(n.title || '')).filter(Boolean),
+    });
+  }
+
+  // Path-token suggestions: only if not already covered by a domain
+  // suggestion targeting the same conceptual name.
+  const seenTargets = new Set(suggestions.map(s => s.target.toLowerCase()));
+  const tokenEntries = [...pathTokenCounts.entries()]
+    .filter(([t, c]) => c >= minMatchCount && !seenTargets.has(_tokenToCategoryName(t).toLowerCase()))
+    .sort((a, b) => b[1] - a[1]);
+  for (const [token, count] of tokenEntries) {
+    if (suggestions.length >= maxSuggestions) break;
+    suggestions.push({
+      target: _tokenToCategoryName(token),
+      pattern: `*${token}*`,
+      count,
+      basis: 'path-token',
+    });
+  }
+
+  return suggestions;
+}
+
+function _domainToCategoryName(domain) {
+  if (!domain) return 'Unknown';
+  // "youtube.com" → "Youtube"; user can rename in the auto-organize panel.
+  const base = String(domain).split('.')[0];
+  return base.charAt(0).toUpperCase() + base.slice(1);
+}
+
+function _tokenToCategoryName(token) {
+  if (!token) return 'Other';
+  const cap = String(token).charAt(0).toUpperCase() + String(token).slice(1);
+  return cap.endsWith('s') ? cap : cap + 's';
+}
+
+function _summarizeTreeStructure(roots, opts = {}) {
+  const titlePool = [];
+  let totalNodes  = 0;
+  let urlBearing  = 0;
+  let maxDepth    = 0;
+  const depths    = [];
+  const domainCounts    = new Map();
+  const pathTokenCounts = new Map();
+  const MAX_TITLE_POOL = 500;
+
+  function walk(node, depth) {
+    if (!node) return;
+    totalNodes++;
+    if (depth > maxDepth) maxDepth = depth;
+    const url = typeof node.url === 'string' ? node.url : '';
+    if (url) {
+      urlBearing++;
+      depths.push(depth);
+      const domain = _extractDomain(url);
+      if (domain) domainCounts.set(domain, (domainCounts.get(domain) || 0) + 1);
+      for (const t of _extractPathTokens(url)) {
+        pathTokenCounts.set(t, (pathTokenCounts.get(t) || 0) + 1);
+      }
+      const title = String((node.title || '')).trim();
+      if (title && titlePool.length < MAX_TITLE_POOL) titlePool.push(title);
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) walk(child, depth + 1);
+    }
+  }
+  if (Array.isArray(roots)) {
+    for (const r of roots) walk(r, 0);
+  } else if (roots) {
+    walk(roots, 0);
+  }
+
+  depths.sort((a, b) => a - b);
+  const medianDepth = depths.length
+    ? depths[Math.floor(depths.length / 2)]
+    : 0;
+
+  const topDomains = [...domainCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 15)
+    .map(([domain, count]) => ({ domain, count }));
+
+  const samplePatterns = [...pathTokenCounts.entries()]
+    .filter(([_token, count]) => count >= 3)  // noise floor
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 15)
+    .map(([token, count]) => ({ pattern: `*${token}*`, token, count }));
+
+  // Sample titles: deterministic stride over the pool so the result is
+  // stable across calls (no Math.random — reproducible diagnostics). Cap at
+  // 20.
+  const sampleN = Math.min(20, titlePool.length);
+  const sampleTitles = [];
+  if (sampleN > 0) {
+    const stride = Math.max(1, Math.floor(titlePool.length / sampleN));
+    for (let i = 0, taken = 0; taken < sampleN && i < titlePool.length; i += stride, taken++) {
+      sampleTitles.push(titlePool[i]);
+    }
+  }
+
+  return {
+    counts: { nodes: totalNodes, url_bearing_nodes: urlBearing },
+    depth:  { max: maxDepth, median: medianDepth },
+    topDomains,
+    samplePatterns,
+    sampleTitles,
+  };
 }
 
 function _checkNoteContentTierAtBridge(op, browserData, fallbackScope, fallbackLibraryId) {
@@ -1305,8 +1967,24 @@ function countBookmarksRecursive(node) {
 // Tool handlers read from the global cachedData (no per-session state needed).
 const SERVER_INSTRUCTIONS = `Pinako is a browser tab manager Chrome extension. This MCP server gives you READ and WRITE access to the user's live tab data, libraries, library groups, notes, and browser bookmarks.
 
+ROUTING — when the user expresses one of these intents, CALL THE LISTED TOOL FIRST instead of planning the task yourself by reading the tree:
+
+  "organize / reorganize / clean up / sort / categorize / auto-organize / tidy / structure my bookmarks"
+    → auto_organize_bookmarks  (drives the bookmark reorganization workflow end-to-end via an interactive popup panel; works on small AND large trees; do NOT read get_bookmarks and plan manually). BUT: this tool is Step 3 of the workflow. BEFORE calling it, offer the user a backup (Step 1) AND unconditionally run a dedup-scan-and-record pass (Step 2 — call find_duplicates without asking the user first; it's a read-only millisecond local scan that produces parentPath signal for better sorting). See AUTO-ORGANIZE BOOKMARKS WORKFLOW section below for the full sequence — read it before kickoff. Do NOT ask the user "want me to check for duplicates first?" — that's an old framing; the new flow folds dedup findings into a single combined kickoff message.
+
+  "find / remove duplicate bookmarks" / "dedupe"
+    → find_duplicates  (then ASK the user whether to (1) move duplicates to a 'Duplicates' folder for visual review or (2) delete the duplicate copies directly via bulk_apply delete_node({confirmedByUser:true}). Both are normal Pinako operations; present them as equal options, don\'t default-pick.)
+
+  Questions about Pinako features / terminology / "how does X work"
+    → search_docs  FIRST.  Pinako has product-specific meanings for "group", "folder", "memo", "ghost tab", "library group", "snapshot" etc. that differ from generic tab-manager intuition. Cheap local lookup; never guess from the term alone.
+
+  Multiple browsers connected (Chrome + Brave both showing in list_browsers)
+    → list_browsers  to learn names, then pass the chosen browser to subsequent tools via the browser argument.
+
 WRITE TOOLS (Pro tier 1+)
-Read tools (get_tree, search_tabs, list_libraries, get_library, get_main_tree_notes, get_bookmarks, list_browsers) require no special handling.
+Read tools (get_tree, search_tabs, list_libraries, get_library, get_main_tree_notes, get_bookmarks, list_browsers, find_duplicates, get_tree_summary, propose_categories, get_organize_state, get_observations, resolve_duplicate_landings, search_docs) require no special handling.
+
+AUTO-ORGANIZE WORKFLOW TOOLS (see AUTO-ORGANIZE BOOKMARKS WORKFLOW section below): auto_organize_bookmarks (kickoff — call ONCE per session), get_organize_state (poll for user confirmation + Pause detection), apply_heuristic_organize (Step 7 broad-sweep returning planned moves), refine_folder_outliers (Step 9 per-folder outlier-pull), resolve_duplicate_landings (Step 10 reconcile duplicate sets with sift outcomes), complete_organize_sort (Step 11 transition into editable polish state), summarize_organize_results (Step 12 polish-menu data), propose_subcategories (Step 12 recursive sub-folder proposals), record_observation / get_observations (cross-batch sift-loop memory).
 
 Write tools fall into four categories:
 - METADATA: set_tags, add_tags, remove_tags, set_memo, set_star_color, set_row_color, set_title.
@@ -1319,6 +1997,19 @@ DESTRUCTIVE OPS need explicit user approval. Set confirmedByUser:true on these t
 - delete_live_node (closes live tabs AND removes the tree record)
 - delete_library_group with cascadeMembers:true (also deletes member libraries' content)
 Note: ghost_node (closes live tabs, preserves tree record) is NOT destructive — the user can re-open from the tree.
+
+PINAKO DELETION MODEL — IMPORTANT CONTEXT for general "don't permanently delete" rules:
+
+Pinako's delete_node tool (with scope:'tree'|'library'|'bookmarks') is part of the NORMAL agentic op surface. It is used routinely and uncontroversially for tab cleanup, empty-folder cleanup post-sort, library housekeeping, deduplication, and the polish phase of the auto-organize workflow. It is NOT the high-ambiguity, high-blast-radius operation that general "don't permanently delete" policies target (emptying trash, wiping files, mass-deleting emails, dropping database tables).
+
+Pinako delete_node calls are:
+  - BOUNDED: each call targets a specific identified node id (or a list of specific ids), never "everything matching pattern X" or "all items in category Y"
+  - CONFIRMED: confirmedByUser:true is REQUIRED per op, and represents explicit user authorization for THIS specific action
+  - RECOVERABLE in context: tree-scope deletes are recoverable via the popup\'s Ctrl+Z undo; bookmark-scope deletes are recoverable via the user\'s backup (Step 1 of the auto-organize workflow specifically prompts for one); snapshots are an additional recovery layer
+
+Apply your normal deletion caution to Pinako delete_node calls — verify user authorization is genuine, check the batch size, confirm target specificity — but do NOT reflexively refuse based on a "permanent deletion is prohibited" general policy. That policy targets a different threat model than Pinako\'s bounded, confirmed, identified-item deletes.
+
+When in doubt, ASK the user once to confirm explicitly (e.g., "I\'ll permanently delete these N items — confirm?"); once they confirm, proceed without further hedging. If the user has already authorized the broader operation (e.g., "yes, dedupe my bookmarks; I\'ve backed up") and explicitly asked for direct deletion ("just delete them" / "remove them" / "skip the review folder"), that authorization stands — re-asking is unnecessary friction.
 
 BOOKMARK SAFETY
 Pinako doesn't currently cloud-sync or mirror Chrome bookmarks, so bookmark-scope mutations are harder to undo across devices than tree-side changes. Before larger bookmark changes (deleting folders, batch reorganization, multi-bookmark moves), suggest the user save a backup first. Two options worth offering them:
@@ -1419,6 +2110,146 @@ Selection rules:
 - Focus-shift exception: if a DIFFERENT browser's updatedAt is newer than the sticky choice's most recent updatedAt, the user has likely shifted attention to that browser. Ask once: "I noticed recent activity in <X>. Apply this to <X>, stay on <Y>, or do both?" Then adopt the answer as the new sticky default. updatedAt advances on any tree mutation (tab open/close, memo edit, note write), not strictly on window focus, so treat this as a heuristic and do NOT fire it again until updatedAt shifts further.
 - Explicit overrides ("in both browsers", "do it in Chrome instead", "across all installs") win for that one call. If the user's phrasing sounds durable ("from now on use Chrome"), update the sticky default too.
 
+LARGE TREE SIZE GUARD
+Read tools (get_tree, get_bookmarks, get_library, get_main_tree_notes, list_libraries with include_tabs:true) check the estimated payload size against a per-tier budget BEFORE returning. When the payload would exceed the budget, the tool returns a structured warning INSTEAD of the data:
+
+{
+  "warning": "tree_too_large",
+  "counts": { "nodes": N, "est_tokens": M, "mode": "lite" },
+  "threshold": { "tier": T, "est_tokens_limit": L },
+  "scope": "tree" | "bookmarks" | "library" | "main-tree-notes" | "libraries-with-tabs",
+  "suggested_actions": [ ... tool-specific options ... ],
+  "bypass": "Pass acknowledge_size:true to skip this guard and receive the full payload anyway."
+}
+
+When you receive this response:
+1. Read suggested_actions. Each entry has {type, param, note}. Pick the option that matches the user's intent:
+   - type:'mode', param:'minimal' — call the same tool again with mode:'minimal' (smaller payload, no tree structure / no rich content)
+   - type:'scope', param:'per-library' — drop include_tabs and fetch one library at a time via get_library
+   - type:'workflow', param:'auto_organize' — for organize/reorganize tasks, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow below
+   - type:'acknowledge', param:'true' — only when the user genuinely needs the full payload and your model has sufficient context
+
+2. NEVER paper over the warning by silently retrying with acknowledge_size:true. The guard exists to keep the agent from burning context on a payload too large to reason over.
+
+3. For very large bookmark trees (10k+ entries) the warning is the rule, not the exception. Defer to auto-organize workflow for any reorganization task.
+
+If the user's actual intent is reorganization rather than just "show me the tree," the right move is the auto-organize workflow (designed for this exact scale problem). Cost-optimization note: model choice matters. For pure categorization-into-folders tasks at scale, a small/cheap model (Haiku, GPT-4-mini, Grok-fast) is sufficient — categorization is a narrow pattern-match task that does NOT require frontier model capabilities. If the user is currently on a premium model and looking at a large-tree reorganize, mention that switching to a cheaper model for the bulk pass and reserving the premium for refinement can reduce cost roughly 3-5x with minimal quality loss. Final cost math is for you to estimate based on your current model's pricing and the est_tokens in the warning — Pinako stays out of model-pricing maintenance.
+
+AUTO-ORGANIZE BOOKMARKS WORKFLOW
+
+When the user asks you to "organize my bookmarks", "reorganize", "clean up my bookmarks", "auto-categorize", "sort my bookmarks into folders", or anything that maps to bulk reorganization of their bookmark collection, DO NOT plan it yourself by reading get_bookmarks and proposing categories manually. Pinako ships a dedicated workflow for this exact task with an interactive panel UI. You DRIVE the workflow from MCP tool calls; the USER drives the panel UI for the folder-structure decisions.
+
+PRE-FLIGHT — BEFORE you call auto_organize_bookmarks, you MUST handle these in order:
+  (a) Offer the user a backup (Step 1 below). For 1000+ bookmarks, insist. For a few hundred, mention it. WAIT for the user's response before continuing.
+  (b) ALWAYS call find_duplicates({scope:'bookmarks', browser}) as part of pre-flight — do NOT ask permission first; it's a read-only millisecond local scan with zero side effects. This produces the parentPath context that the Step 8 LLM sift uses for better placement.
+  (c) Roll the dedup findings + the destructive-consent ask into the SAME message that announces kickoff (see Step 2 for the prescribed phrasing). The user's "OK" approves both: (i) starting auto-organize AND (ii) the Step 10 auto-deletion of converged duplicate copies (delete_node with confirmedByUser:true). One combined consent. Then call auto_organize_bookmarks.
+Skipping the backup offer is the most common mistake. ALWAYS at least mention the backup option before kickoff.
+
+DO NOT ask the user "want me to check for duplicates?" as a separate question. The scan is part of standard pre-flight and runs unconditionally. The user's only consent is the combined kickoff prompt.
+
+WORKFLOW STEPS (12-step, condensed)
+
+1. SUGGEST A BACKUP. Pinako bookmark backup (preserves Pinako-specific metadata) or Chrome's native export (Bookmark Manager → menu → Export bookmarks). For a few hundred bookmarks, mention it; for 1000+ insist. ALWAYS surface this BEFORE calling auto_organize_bookmarks. Wait for the user's response; don't proceed until they have decided (back up, skip, or already done).
+
+2. DEDUP-RECORD PASS (mandatory pre-flight, dedup-as-signal). UNCONDITIONALLY call find_duplicates({scope:'bookmarks', browser}) after the user has decided about backup (Step 1) and BEFORE calling auto_organize_bookmarks. The bridge auto-caches the result (each duplicate set carries each instance's parentPath — slash-joined breadcrumb of its current folder location) on lastDuplicateScan; the auto-organize pipeline reads this in Step 8 to use folder names as semantic signal, then reconciles post-sift in Step 10 via resolve_duplicate_landings.
+
+   Do NOT move or delete duplicates here. Do NOT ask the user beforehand whether to scan — the scan is part of standard pre-flight. After the call returns, draft the COMBINED KICKOFF MESSAGE that bundles dedup findings + the destructive consent + the final OK-to-start prompt into ONE message to the user. Use this template:
+
+   "Found [totalDuplicateInstances] duplicate copies across [uniqueDuplicateUrls] URLs. I'll use each copy's current folder as a sorting hint, then auto-delete redundant copies that land in the same bucket and bring divergent ones (different buckets) to you for review. Ready to start sorting?"
+
+   Adapt the wording if zero duplicates: "No duplicates found — clean tree. Ready to start sorting?"
+
+   The user's "yes" / "OK" / "go ahead" is the single consent that authorizes BOTH (a) calling auto_organize_bookmarks now AND (b) the Step 10 auto-deletion of converged duplicate copies via delete_node({confirmedByUser:true}). You do NOT need a second prompt at Step 10 — the consent here covers it.
+
+   EXPLICIT-SKIP-DEDUP CASE: only if the user volunteers "skip dedup", "just organize without dedup", or similar, may you bypass the scan. This should be rare — the scan is free and improves placements. Do not preemptively offer the skip option; let the user volunteer it.
+
+   STANDALONE DEDUP CASE: if the user wants to dedup OUTSIDE the auto-organize workflow (e.g. "clean up duplicates" with no mention of organizing), the original two-option flow applies — see find_duplicates tool description case A (move-to-Duplicates-folder vs delete-directly). That path is for users who want dedup as the final action, not as sorting setup.
+
+3-5. KICKOFF. Call auto_organize_bookmarks({scope:'bookmarks', browser}) EXACTLY ONCE. This call does two things atomically:
+  (a) computes heuristic-suggested category folders from the user's bookmark URL patterns — returned in the response as suggestions:[{target, count, sampleTitles}]
+  (b) opens the auto-organize panel in the popup. The panel starts with the user's EXISTING bookmark folder structure (their current folders are the baseline buckets). The heuristic suggestions are overlaid in Step 4 as proposed ADDITIONS the user can accept, rename, or reject.
+
+  CRITICAL FRAMING for your chat reply: do NOT present the matched-categories list as "the structure your bookmarks will use." That misframes the workflow. The user\'s EXISTING folders are the starting buckets; the heuristic suggestions are additions surfaced in Step 4 for user choice. A correct framing names both: "Your existing folders (tunes, Read, Travel, …) are the starting buckets. I\'ll then propose [N] additional categories for the [M] items the rules can auto-place." NEVER list the heuristic matches as if the user has agreed to that structure.
+
+  After the call, tell the user the auto-organize panel is opening in the Pinako popup. Tell them to review their existing folder structure, trim or add as needed, click "Continue" to see the heuristic suggestion overlay, and click "Confirm & start sift" when ready. Do NOT call this tool more than once per session.
+
+6. WAIT FOR USER CONFIRMATION. Poll get_organize_state({browser}) until workflowStep === 'sorting'. If workflowStep is still 'step-3' or 'step-4', the user is still editing the bucket structure — remind them in chat what to click. Don't proceed until 'sorting'.
+
+  Once workflowStep === 'sorting', read state.buckets[] for the confirmed folder structure. Each bucket has {id, title, bookmarkFolderId, isSuggestion, isExisting, children}. bookmarkFolderId is the chrome.bookmarks folder id where moves go.
+
+  STEP 5 (RULES, optional): BETWEEN the user clicking Confirm and you calling apply_heuristic_organize, ASK them once: "Before I sort, any special rules to apply? For example: links older than 5 years → Archive, all reddit.com → Social, anything matching nytimes.com/cooking → Recipes. Or just sort with the defaults." If they give rules, acknowledge them (you can\'t register custom rules in the heuristic library yet — v1 limitation — but you CAN apply them yourself during the Step 8 LLM sift loop by checking each item against the user\'s rules before falling back to LLM categorization). If they say "just go" or don\'t respond with rules, proceed. Don\'t pester — ask once, then move on.
+
+7. HEURISTIC BROAD-SWEEP. Call apply_heuristic_organize({browser}) once. Returns:
+  - moves[] {nodeId, title, url, newParentId, targetTitle, ruleId, confidence} — ready-to-apply moves
+  - skippedTargets[] — heuristics that matched but where the user has no corresponding bucket. SURFACE THESE to the user ("I see 80 GitHub bookmarks but you didn't create a Programming folder — want one?"). They can Pause → Reset → add the folder → re-Confirm.
+  - bucketSummary[] {title, bookmarkFolderId, willReceive} — preview of moves per bucket
+  - unmatched_residue: count of bookmarks needing the LLM sift loop in Step 8
+
+  APPLY THE MOVES via bulk_apply chunked at 100 ops per call, scope:'bookmarks'. Each op: {type:'move_node', nodeId, newParentId}. The chrome.bookmarks ids are translated to Pinako node ids server-side automatically; pass them through as-is.
+
+8. LLM BATCH SIFT LOOP. For the unmatched_residue, you do the categorization yourself batch by batch:
+  cursor = null
+  loop:
+    batch = get_bookmarks({after:cursor, limit:500, browser})
+    if batch.items is empty: break
+    SCOPE FILTER: if state.includeOtherRoots is false (default), skip items whose parentId traces back to Other Bookmarks (id '2') or Mobile Bookmarks (id '3') roots — only Bookmarks Bar items are in scope. When true, include all roots.
+
+    DUPLICATE-SIGNAL INJECTION (Slice S2f, only when Step 2 dedup-record pass ran): before categorizing the batch, check duplicateContext from get_organize_state. If scopeMatchesWorkflow is true, build a Map<nodeId, parentPath> from the cached duplicate sets (each set has parallel nodeIds[] + parentPaths[] arrays). For each batch item whose id appears in that map, add a "path" field to the item's JSON entry when you construct the LLM categorization prompt — e.g. an item like {id:"17", title:"Daft Punk RAM", url:"spotify.com/..."} becomes {id:"17", title:"Daft Punk RAM", url:"spotify.com/...", path:"Gift ideas for mom"}. The path is the item's original folder location BEFORE this sort began, and is meaningful semantic signal (the user previously categorized this URL as part of their "Gift ideas for mom" collection — that biases the category). NON-DUPLICATE ITEMS GET NO PATH FIELD — keep them as {id, title, url} only; the dedup-coupled path injection is the ONLY case where path enters the sift payload. This bounds the token cost.
+
+    categorize each remaining item against the user's confirmed buckets (state.buckets[].title from get_organize_state; skip the Review bucket — that's reserved for low-confidence destinations, not a regular category). For each item, assign a confidence in [0, 1]. If confidence >= 0.7, move to the matching bucket via newParentId = bucket.bookmarkFolderId. If confidence < 0.7, move to state.reviewBucket.bookmarkFolderId (the system Review folder) — that's the safety net the user reviews at the end. NEVER force-place a low-confidence item in a category; the Review folder exists exactly for this case.
+    send bulk_apply with move_node ops for the categorized items (chunked at 100), scope:'bookmarks'
+    cursor = batch.nextCursor
+
+  BETWEEN BATCHES: call get_organize_state to check workflowStep. If it's 'paused', stop the loop, tell the user in chat ("Paused. Click Resume in the popup when you want me to continue, or Reset to return to setup."), and wait.
+
+  USE THE OBSERVATION LOG. As you notice cross-batch patterns ("many cooking blogs without a clear domain", "tiktok.com URLs splitting between users and posts"), call record_observation({pattern, count, examples, batch_n}) to persist it. Before each next batch, call get_observations and include the digest in your categorization reasoning — cross-batch memory.
+
+9. OUTLIER-PULL REFINEMENT (per populated folder). After Step 8 completes, scan each populated bucket for items that landed there but don't belong. Iterate over the user's confirmed buckets (state.buckets[] minus the Review bucket); for each, call refine_folder_outliers({folder_id: bucket.bookmarkFolderId, browser}). It returns the items in that folder + the sibling buckets. SCAN THE ITEMS for outliers — output should be SPARSE (5-15% relocations typical). For items that clearly belong in a sibling bucket, emit bulk_apply move_node ops with newParentId = siblingBucket.bookmarkFolderId. For ambiguous items (confidence < 0.7), route to reviewBucket.bookmarkFolderId. Most items stay; emit nothing for them.
+
+  PATTERN EMERGENCE: if you notice a strong sub-pattern within a folder (e.g., 40% of "Music" items are clearly podcasts, or "News" splits into "Tech News" + "World News"), call record_observation. The user will see these in the Step 12 polish menu as sub-folder suggestions.
+
+10. RESOLVE DUPLICATE LANDINGS (Slice S2f, only when Step 2 dedup-record pass ran). After Step 9 outlier-pull, call resolve_duplicate_landings({browser}). The tool partitions the recorded duplicate sets based on where each instance landed:
+
+    CONVERGED — all surviving instances in same bucket. Per the Step 2 pre-consent, AUTO-DELETE the redundant copies: send ONE bulk_apply containing a delete_node sub-op per deleteNodeId across all converged sets, with confirmedByUser:true and scope:'bookmarks'. Aggregate the total deletableCount and the bucket distribution into a one-line user report: "Auto-deleted 287 duplicate copies — kept one of each in [Music, Programming, Recipes, …]."
+
+    DIVERGED — instances split across multiple destinations. DO NOT auto-act. Hold the divergedSets[] for the Step 12 polish menu (the divergent count is surfaced there as a menu option). When the user picks that option, present each set per-row with options: consolidate to one bucket (delete the rest), leave as multiple homes (no action), or move minorities elsewhere.
+
+    RESIDUE — all instances still in their original folders (sift didn't categorize any of them). Leave alone; the user's original placement stands.
+
+    MISSING — instances that no longer exist (manual deletes during the workflow). Reported in summary.missing; the set is processed using surviving instances. Sets reduced to 1 surviving instance are skipped (no longer a duplicate).
+
+    AMBIGUOUS-CASE PARKING: items routed to the Review bucket in Steps 8 and 9 are still the safety net. Mention to the user as part of the summary: "I sorted N items. M went to Review for your judgment. K duplicates were auto-consolidated; L duplicate sets need your decision in the polish menu."
+
+11. ENTER POLISH STATE. After Step 10 completes, call complete_organize_sort({browser}) to transition the popup from the read-only sorting view to the editable polish view. The user can then add / rename / drag / delete-empty buckets while you drive the polish menu in chat. Without this call, the panel stays in sorting state and the user can't edit (by design — mid-sift editing is forbidden per the 2026-05-13 decision; refinement is deferred to Step 12).
+
+12. POLISH MENU. After complete_organize_sort returns, call summarize_organize_results({browser}) for the post-sort summary: per-bucket counts, Review folder count, observation digest, sub-folder candidates (high-count buckets), and (Slice S2f) duplicates counts if Step 2 ran. Present the polish menu to the user in chat:
+
+    "I sorted [totalSorted] items into your buckets:
+      - Music: 148
+      - Programming: 92
+      - Research: 23
+      - Review: 12 items I wasn't sure about
+      - Auto-consolidated [converged] duplicate set(s); [diverged] need your review
+    Want to refine further?
+      • Review the Review folder ([reviewCount] items) — I'll take a focused pass
+      • Resolve [diverged] divergent duplicate set(s) — pick one bucket per URL or keep multiple homes  [omit this option if diverged === 0]
+      • Suggest sub-folders for [a high-count bucket] — I'll propose sub-categorization
+      • Make corrections or add a new bucket — tell me what's wrong
+      • Done — finish and exit"
+
+    RECURSIVE LOOP — re-present the menu after each action until the user says Done. Actions map to existing tools:
+      - Review the Review folder → refine_folder_outliers({folder_id: reviewBucket.bookmarkFolderId}) and route items to better buckets
+      - Resolve divergent duplicate sets → use divergedSets[] from the resolve_duplicate_landings response. Walk the user through each set: show the URL, the sample title, and each instance's currentBucketTitle + originalParentPath. Ask: "[URL Title]: copies landed in [Music, Programming]; original folders were [Gift ideas for mom, March 2022]. Keep all, consolidate to Music (delete Programming copy), or consolidate to Programming?" Apply the user's choice via bulk_apply (delete_node for consolidations, no-op for keep-all). Loop through each diverged set.
+      - Suggest sub-folders → call propose_subcategories({folder_id: bucket.bookmarkFolderId}) for the bucket the user named. Returns sub-category proposals (domain-frequency + path-token, scoped to that folder's contents). Present to user. On accept: create each sub-folder via create_folder({scope:'bookmarks', parentId:folder_id, title:suggestion.target}), then bulk_apply move_node ops to relocate matching items. Recursion depth bounded to 3 — track depth client-side; don't sub-categorize a sub-folder of a sub-folder.
+      - Make corrections → if the user names a specific misplacement, use bulk_apply move_node directly; if they want new buckets, Pause → Reset → re-Confirm
+      - Done → tell the user the workflow is complete. They click Done in the popup panel to close it (which pushes workflowStep:'idle' to clear bridge state).
+
+SCOPE
+v1 ships scope:'bookmarks' only. tree + library scopes (auto-organize main tree into libraries, sub-folder a large library) are planned but not implemented yet.
+
+COST AND MODEL
+Categorization at scale is a narrow pattern-match task. If the user is on a premium model (Sonnet, GPT-4, etc.) and looking at a large tree, mention that switching to a cheaper model (Haiku, GPT-4-mini, Grok-fast) for the bulk Step-8 sift and reserving the premium model for any refinement step reduces cost roughly 3-5x with minimal quality loss.
+
 CONNECTION RECOVERY
 If a tool returns "No data yet — open the Pinako extension first", or list_browsers returns an empty list when the user expects browsers to be connected, the Pinako extension's connection to this MCP server has lapsed. Tell the user to open the Pinako extension popup (click the Pinako icon in their browser toolbar). That re-establishes the native-messaging connection and brings the data back. This rarely happens after initial install, but can occur after PC sleep/wake, browser restart, or extended idle periods. The user does not need to restart your client (Claude Desktop, Cursor, etc.) — just opening the popup is enough.
 
@@ -1450,21 +2281,66 @@ function createMcpServer() {
         '"minimal" (FLAT list, compact URLs, drops children/collapsed/ghost, keeps openedDate — best for semantic search across 500+ tab trees); ' +
         '"lite" (DEFAULT — tree shape with children/collapsed/ghost, full URLs, keeps openedDate, no favicons); ' +
         '"full" (everything in source data EXCEPT favicons; useful only for visual-field workflows). ' +
-        'Favicons are NEVER returned unless include_favicons:true (they\'re 1-3KB base64 blobs of zero agent value).' +
+        'Favicons are NEVER returned unless include_favicons:true (they\'re 1-3KB base64 blobs of zero agent value). ' +
+        'Returns a structured {warning:"tree_too_large", suggested_actions:[...]} response (instead of the tree) when the estimated payload exceeds the per-tier read budget — call again with mode:"minimal" to shrink, with pagination (after/limit) to chunk through, or with acknowledge_size:true to bypass the guard. ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N}. Items lose tree nesting but carry parentId so hierarchy can be reconstructed. Pagination bypasses the size guard automatically. Designed for the auto-organize sift loop — read 500 items, classify, bulk_apply moves, then read the next 500 via nextCursor. Cursor is robust to list churn: if the cursor node was moved between calls, pagination restarts from index 0 (the agent should still progress because moved items no longer appear in the flat list).' +
         FRESHNESS_HINT,
       inputSchema: {
         mode: z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "lite". Use "minimal" for semantic-search scans.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs (chromeId=null). Default true.'),
         include_favicons:   z.boolean().optional().describe('Include favIconUrl base64 data. Default false. Set true only for color-organization workflows.'),
+        acknowledge_size:   z.boolean().optional().describe('Bypass the per-tier read-size guard and return the full payload anyway. Default false. Use only when your model has a context window large enough to comfortably absorb the warning\'s reported est_tokens.'),
+        after:              z.string().optional().describe('Pagination cursor: last-seen node id from a previous paginated call. Omit on the first call. When present, returns items AFTER this id in DFS pre-order.'),
+        limit:              z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active. Triggers paginated response when set even without `after`.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ mode, include_ghost_tabs = true, include_favicons = false, browser }) => {
+    async ({ mode, include_ghost_tabs = true, include_favicons = false, acknowledge_size = false, after, limit, browser }) => {
       mode = _normalizeMode(mode);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const tree = getTree(r.data, include_ghost_tabs);
+
+      // Slice S2a: paginated path. Returns a flat items[] + nextCursor.
+      // Bypasses the size guard (pagination itself is the safety mechanism).
+      if (_isPaginationRequested(after, limit)) {
+        const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS.tree;
+        const flat = _flattenTreeWithMode(tree, 'tree', null, mode, include_favicons);
+        const page = _paginateByCursor(flat, after, effectiveLimit);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:    r.data.browserBrand,
+          browserId:  r.data.browserId,
+          scope:      'tree',
+          mode,
+          items:      page.items,
+          nextCursor: page.nextCursor,
+          totalItems: page.totalItems,
+          cursorFound: page.cursorFound,
+          updatedAt:  r.data.updatedAt,
+        }) }] };
+      }
+
       const out  = shapeTree(tree, 'tree', null, mode, include_favicons);
+
+      const nodeCount = _countNodesDeep(out);
+      const estTokens = _estimateTreeTokens(nodeCount, mode);
+      const guard = _checkReadSizeGuard({
+        estTokens, nodeCount, mode, scope: 'tree',
+        browserData: r.data, acknowledge: acknowledge_size,
+        suggestedActions: [
+          { type: 'mode', param: 'minimal', note: 'Compact mode reduces tokens per node ~2-4x' },
+          { type: 'pagination', param: 'after+limit', note: 'Pass limit:500 (and after:<lastId> on subsequent calls) for paginated reads — bypasses this guard and chunks the tree' },
+          { type: 'workflow', param: 'auto_organize', note: 'If the user wants to reorganize, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow (see SERVER_INSTRUCTIONS); it reads in cursor-paginated batches and writes in chunked bulk_apply' },
+        ],
+      });
+      if (guard) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:   r.data.browserBrand,
+          browserId: r.data.browserId,
+          ...guard,
+        }) }] };
+      }
+
       return { content: [{ type: 'text', text: JSON.stringify({
         browser:   r.data.browserBrand,
         browserId: r.data.browserId,
@@ -1506,15 +2382,19 @@ function createMcpServer() {
   srv.registerTool(
     'list_libraries',
     {
-      description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies. Also returns the panel structure (groups + panel_order) needed as input to reorder_library_panel — always call this before any reorder op to source fresh group ids and panel positions.' + FRESHNESS_HINT,
+      description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies. Also returns the panel structure (groups + panel_order) needed as input to reorder_library_panel — always call this before any reorder op to source fresh group ids and panel positions. When include_tabs:true and the combined library payload exceeds the per-tier read budget, returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — drop include_tabs and fetch one library at a time via get_library, or set acknowledge_size:true to bypass. ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen library id) and/or `limit` (default 50) to chunk through libraries when the user has many. Returns {items:[...libraries...], nextCursor:..., totalItems:N, groups:[...], panel_order:[...]}. Pagination applies to the libraries array only — groups and panel_order are always returned in full (they are small metadata). When include_tabs:true is set alongside pagination, embedded tabs are kept tree-shaped within each library entry (use get_library with pagination if you need to chunk through a single huge library\'s tabs).' + FRESHNESS_HINT,
       inputSchema: {
         include_tabs: z.boolean().optional().describe('Embed each library\'s tabs in the response. Default false. Use this for cross-library semantic search in one call.'),
         mode:         z.enum(['minimal', 'lite', 'full']).optional().describe('Mode for embedded tabs (only used when include_tabs:true). Default "minimal".'),
         include_favicons: z.boolean().optional().describe('Include favIconUrl on embedded tabs. Default false.'),
+        acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard (only applies when include_tabs:true). Default false.'),
+        after:        z.string().optional().describe('Pagination cursor: last-seen library id from a previous paginated call. Omit on the first call.'),
+        limit:        z.number().int().min(1).max(500).optional().describe('Max libraries per page. Default 50 when pagination is active.'),
         browser:      z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ include_tabs = false, mode, include_favicons = false, browser }) => {
+    async ({ include_tabs = false, mode, include_favicons = false, acknowledge_size = false, after, limit, browser }) => {
       mode = _normalizeMode(mode || 'minimal');
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
@@ -1531,6 +2411,31 @@ function createMcpServer() {
         }
         return entry;
       });
+
+      // Size guard only relevant when include_tabs:true — without tabs the
+      // response is just per-library metadata (small, even for 100+ libraries).
+      if (include_tabs) {
+        let nodeCount = 0;
+        for (const lib of libs) nodeCount += _countNodesDeep(lib.children || []);
+        const estTokens = _estimateTreeTokens(nodeCount, mode);
+        const guard = _checkReadSizeGuard({
+          estTokens, nodeCount, mode, scope: 'libraries-with-tabs',
+          browserData: r.data, acknowledge: acknowledge_size,
+          suggestedActions: [
+            { type: 'mode', param: 'minimal', note: 'Use mode:"minimal" to reduce per-node tokens (~2-4x compression)' },
+            { type: 'scope', param: 'per-library', note: 'Drop include_tabs and fetch one library at a time via get_library' },
+            { type: 'pagination', param: 'after+limit', note: 'Pass limit:50 to chunk through libraries (cross-library tabs still embedded per-library; use get_library pagination for a single huge library)' },
+            { type: 'workflow', param: 'auto_organize', note: 'If the user wants to reorganize, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow' },
+          ],
+        });
+        if (guard) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            browser: r.data.browserBrand,
+            ...guard,
+          }) }] };
+        }
+      }
+
       // Slice Z (2026-05-12): expose library panel structure so agents can
       // construct a valid reorder_library_panel call. `groups` lists every
       // library group with its membership; `panel_order` is the unified
@@ -1544,6 +2449,25 @@ function createMcpServer() {
         library_ids: g.libraryIds || [],
       }));
       const panel_order = r.data.libraryPanelOrder || [];
+
+      // Slice S2a: paginated path. Pagination applies to the libraries array
+      // only (groups + panel_order are small metadata, always returned in
+      // full). Useful when the user has dozens of libraries.
+      if (_isPaginationRequested(after, limit)) {
+        const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS.libraries;
+        const page = _paginateByCursor(libs, after, effectiveLimit);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:     r.data.browserBrand,
+          mode:        include_tabs ? mode : undefined,
+          items:       page.items,
+          nextCursor:  page.nextCursor,
+          totalItems:  page.totalItems,
+          cursorFound: page.cursorFound,
+          groups,
+          panel_order,
+        }) }] };
+      }
+
       return { content: [{ type: 'text', text: JSON.stringify({
         browser:     r.data.browserBrand,
         mode:        include_tabs ? mode : undefined,
@@ -1557,20 +2481,46 @@ function createMcpServer() {
   srv.registerTool(
     'get_library',
     {
-      description: 'Returns one library\'s contents. Three modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties.' + FRESHNESS_HINT,
+      description: 'Returns one library\'s contents. Three modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties. When the payload exceeds the per-tier read budget (large library + "full" mode is the typical trigger), returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — switch to mode:"lite" or "minimal", paginate via after/limit, or pass acknowledge_size:true to bypass. ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N, library:{id,title,description}, notes:[...]} — the library\'s tabs/windows/groups/folders are paginated; metadata + note titles are returned at the top level. Pagination bypasses the size guard automatically. Cursor is robust to list churn.' + FRESHNESS_HINT,
       inputSchema: {
         library_id: z.string().describe('Library id from list_libraries'),
         mode:       z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "lite".'),
         include_favicons: z.boolean().optional().describe('Include favIconUrl base64. Default false.'),
+        acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard. Default false.'),
+        after:      z.string().optional().describe('Pagination cursor: last-seen node id from a previous paginated call. Omit on the first call.'),
+        limit:      z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active.'),
         browser:    z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ library_id, mode, include_favicons = false, browser }) => {
+    async ({ library_id, mode, include_favicons = false, acknowledge_size = false, after, limit, browser }) => {
       mode = _normalizeMode(mode);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const lib = (r.data.libraries || []).find(l => l.id === library_id);
       if (!lib) return { content: [{ type: 'text', text: `Library not found: ${library_id} (in ${r.data.browserBrand})` }], isError: true };
+
+      // Slice S2a: paginated path. Returns flat items + library metadata.
+      // Library notes (titles only) are returned alongside, never paginated
+      // (notes are few and small at the metadata level).
+      if (_isPaginationRequested(after, limit)) {
+        const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS.library;
+        const flat = _flattenTreeWithMode(lib.children || [], 'library', library_id, mode, include_favicons);
+        const page = _paginateByCursor(flat, after, effectiveLimit);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:    r.data.browserBrand,
+          scope:      'library',
+          libraryId:  library_id,
+          mode,
+          library:    { id: lib.id, title: lib.title, description: lib.description || '' },
+          items:      page.items,
+          nextCursor: page.nextCursor,
+          totalItems: page.totalItems,
+          cursorFound: page.cursorFound,
+          notes:      liteNotes(lib.notes),
+        }) }] };
+      }
+
       let outLib;
       if (mode === 'minimal') {
         outLib = {
@@ -1593,6 +2543,30 @@ function createMcpServer() {
         const sanitized = sanitizeNode(lib);
         outLib = include_favicons ? sanitized : stripFavicons(sanitized);
       }
+
+      // Token estimate covers children weight + (in 'full' mode) note bodies.
+      const nodeCount = _countNodesDeep(outLib.children || []);
+      let estTokens   = _estimateTreeTokens(nodeCount, mode);
+      if (mode === 'full' && Array.isArray(outLib.notes)) {
+        estTokens += _estimateNotesTokens(outLib.notes);
+      }
+      const guard = _checkReadSizeGuard({
+        estTokens, nodeCount, mode, scope: 'library',
+        browserData: r.data, acknowledge: acknowledge_size,
+        suggestedActions: [
+          { type: 'mode', param: 'minimal', note: 'Use mode:"minimal" or "lite" to reduce per-node tokens' },
+          { type: 'pagination', param: 'after+limit', note: 'Pass limit:500 (and after:<lastId> on subsequent calls) for paginated reads — bypasses this guard and chunks the library' },
+          { type: 'workflow', param: 'auto_organize', note: 'If the user wants to reorganize this library, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow scoped to this library' },
+        ],
+      });
+      if (guard) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:   r.data.browserBrand,
+          libraryId: library_id,
+          ...guard,
+        }) }] };
+      }
+
       return { content: [{ type: 'text', text: JSON.stringify({
         browser:   r.data.browserBrand,
         scope:     'library',
@@ -1606,17 +2580,53 @@ function createMcpServer() {
   srv.registerTool(
     'get_main_tree_notes',
     {
-      description: 'Returns the main tree notes — rich text documents attached to the user\'s main tree (the live tab tree), as opposed to notes attached to a specific library. Cloud-synced, identical across browsers. (Legacy codebase name: "global notes". Surface as "main tree notes" in any user-facing language.)' + FRESHNESS_HINT,
+      description: 'Returns the main tree notes — rich text documents attached to the user\'s main tree (the live tab tree), as opposed to notes attached to a specific library. Cloud-synced, identical across browsers. (Legacy codebase name: "global notes". Surface as "main tree notes" in any user-facing language.) When the cumulative note content exceeds the per-tier read budget (this happens with a few very large notes), returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — pass acknowledge_size:true to bypass if your model can absorb the reported est_tokens. ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen note id) and/or `limit` (default 100) to receive notes one batch at a time: {items:[...notes...], nextCursor:..., totalItems:N}. Pagination returns notes in their stored order with full content bodies; pagination bypasses the size guard automatically. Useful when one or two notes are very large.' + FRESHNESS_HINT,
       inputSchema: {
+        acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard. Default false.'),
+        after:            z.string().optional().describe('Pagination cursor: last-seen note id from a previous paginated call. Omit on the first call.'),
+        limit:            z.number().int().min(1).max(1000).optional().describe('Max notes per page. Default 100 when pagination is active.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
     },
-    async ({ browser }) => {
+    async ({ acknowledge_size = false, after, limit, browser }) => {
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
+      const notes = r.data.globalNotes || [];
+
+      // Slice S2a: paginated path returns notes in stored order with full
+      // bodies, sliced by cursor. Bypasses the size guard.
+      if (_isPaginationRequested(after, limit)) {
+        const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS['main-tree-notes'];
+        const page = _paginateByCursor(notes, after, effectiveLimit);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:     r.data.browserBrand,
+          scope:       'main-tree-notes',
+          items:       page.items,
+          nextCursor:  page.nextCursor,
+          totalItems:  page.totalItems,
+          cursorFound: page.cursorFound,
+        }) }] };
+      }
+
+      const estTokens = _estimateNotesTokens(notes);
+      const guard = _checkReadSizeGuard({
+        estTokens, nodeCount: notes.length, mode: null, scope: 'main-tree-notes',
+        browserData: r.data, acknowledge: acknowledge_size,
+        suggestedActions: [
+          { type: 'pagination', param: 'after+limit', note: 'Pass limit:100 (and after:<lastNoteId> on subsequent calls) to read notes one batch at a time — bypasses this guard' },
+          { type: 'acknowledge', param: 'true', note: 'No per-note partial-read tool yet; if the user really needs a specific note read by the agent, pass acknowledge_size:true (the bypass returns the full notes array; ensure your model has enough context budget for the reported est_tokens).' },
+        ],
+      });
+      if (guard) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser: r.data.browserBrand,
+          ...guard,
+        }) }] };
+      }
       return { content: [{ type: 'text', text: JSON.stringify({
         browser: r.data.browserBrand,
-        mainTreeNotes: r.data.globalNotes || [],
+        mainTreeNotes: notes,
       }) }] };
     }
   );
@@ -1624,7 +2634,656 @@ function createMcpServer() {
   srv.registerTool(
     'get_bookmarks',
     {
-      description: 'Returns the user\'s Chrome bookmark tree (raw chrome.bookmarks.getTree() result). Use this to discover bookmark node ids before calling add_to_library with sourceScope="bookmarks". Each node has: id (stable Chrome bookmark id; persists across the bookmark\'s lifetime), title, url (set for bookmarks, missing for folders), children (array, present for folders), dateAdded (Unix ms timestamp), parentId, index (0-based position within parent). Top-level roots are typically "Bookmarks Bar" (id "1") and "Other Bookmarks" (id "2").' + FRESHNESS_HINT,
+      description: 'Returns the user\'s Chrome bookmark tree (raw chrome.bookmarks.getTree() result). Use this to discover bookmark node ids before calling add_to_library with sourceScope="bookmarks". Each node has: id (stable Chrome bookmark id; persists across the bookmark\'s lifetime), title, url (set for bookmarks, missing for folders), children (array, present for folders), dateAdded (Unix ms timestamp), parentId, index (0-based position within parent). Top-level roots are typically "Bookmarks Bar" (id "1") and "Other Bookmarks" (id "2"). When the bookmark tree exceeds the per-tier read budget (common — bookmark trees can hold 10K+ entries accumulated over years), returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow to read in cursor-paginated chunks, or pass acknowledge_size:true to bypass. ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen bookmark id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[{id,title,url?,parentId,dateAdded,index},...], nextCursor:..., totalItems:N}. DFS pre-order across all bookmark nodes (folders included). Pagination bypasses the size guard automatically. Designed for the auto-organize sift loop. Cursor is robust to list churn: if the cursor bookmark was moved between calls, pagination restarts from index 0.' + FRESHNESS_HINT,
+      inputSchema: {
+        acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard. Default false.'),
+        after:            z.string().optional().describe('Pagination cursor: last-seen bookmark id from a previous paginated call. Omit on the first call.'),
+        limit:            z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active. Triggers paginated response when set even without `after`.'),
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ acknowledge_size = false, after, limit, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const bookmarks = r.data.bookmarks || [];
+
+      // Slice S2a: paginated path. Returns a flat DFS list of all bookmark
+      // nodes (folders + leaves). Bypasses the size guard.
+      if (_isPaginationRequested(after, limit)) {
+        const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS.bookmarks;
+        const flat = _flattenBookmarksTree(bookmarks);
+        const page = _paginateByCursor(flat, after, effectiveLimit);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:    r.data.browserBrand,
+          browserId:  r.data.browserId,
+          scope:      'bookmarks',
+          items:      page.items,
+          nextCursor: page.nextCursor,
+          totalItems: page.totalItems,
+          cursorFound: page.cursorFound,
+          updatedAt:  r.data.updatedAt,
+        }) }] };
+      }
+
+      const nodeCount = _countNodesDeep(bookmarks);
+      // Bookmarks are denser per node than tabs (URL + title + dateAdded + parentId).
+      // Treat as 'lite' equivalent for token estimation.
+      const estTokens = _estimateTreeTokens(nodeCount, 'lite');
+      const guard = _checkReadSizeGuard({
+        estTokens, nodeCount, mode: 'lite', scope: 'bookmarks',
+        browserData: r.data, acknowledge: acknowledge_size,
+        suggestedActions: [
+          { type: 'pagination', param: 'after+limit', note: 'Pass limit:500 (and after:<lastId> on subsequent calls) for paginated reads — bypasses this guard and chunks the tree' },
+          { type: 'workflow', param: 'auto_organize', note: 'For organize/reorganize tasks, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow (see SERVER_INSTRUCTIONS); it reads in cursor-paginated batches' },
+          { type: 'acknowledge', param: 'true', note: 'If you only need a one-shot read and your model has a large context window, pass acknowledge_size:true' },
+        ],
+      });
+      if (guard) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:   r.data.browserBrand,
+          browserId: r.data.browserId,
+          ...guard,
+        }) }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:   r.data.browserBrand,
+        browserId: r.data.browserId,
+        bookmarks,
+        updatedAt: r.data.updatedAt,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'find_duplicates',
+    {
+      description: 'Finds exact-URL duplicates within a single scope (tree, bookmarks, or a specific library). Bridge-side scan; no LLM, no agent reasoning required. For v1 ships with exact URL match only — byte-identical URLs grouped together; URLs differing in tracking params (utm_source, fbclid, etc.) or fragment identifiers are treated as DISTINCT. Fuzzy / near-duplicate matching deferred to v2 polish.\n\n' +
+        'AGENT FLOW DEPENDS ON CONTEXT — two cases:\n\n' +
+        'CASE A: STANDALONE DEDUP (no auto-organize workflow active). Summarize counts + sample titles to the user → ASK which of two equally-valid paths:\n\n' +
+        '  Option 1 — Move to a "Duplicates" folder: bulk_apply with move_node to relocate the duplicate copies into a single "Duplicates" folder under Bookmarks Bar. The user can scroll through the folder in Chrome\'s Bookmark Manager and remove them at leisure (Ctrl+A inside the folder + Delete clears the lot in ~3 seconds).\n\n' +
+        '  Option 2 — Delete the duplicate copies directly: bulk_apply with delete_node({confirmedByUser:true}) on the duplicate node ids. Bounded (specific identified node ids), confirmed (user picked this path), recoverable via the user\'s Step 1 backup.\n\n' +
+        'Phrase the choice neutrally; both options are normal Pinako operations. See PINAKO DELETION MODEL above for context.\n\n' +
+        'CASE B: AUTO-ORGANIZE WORKFLOW (Step 2 of LARGE TREE ORGANIZATION). DO NOT ask the user "want me to check for duplicates?" first — this call is mandatory pre-flight, not optional. Do NOT move or delete duplicates here. The bridge auto-caches the duplicate sets (including each instance\'s parentPath) on lastDuplicateScan so the auto-organize pipeline can use each duplicate\'s original folder as semantic signal during the LLM sift (Step 8), then reconcile them post-sift via resolve_duplicate_landings (Step 10). After this call returns, draft ONE combined message that reports duplicate counts + auto-delete-on-converge consent + ready-to-start question — e.g. "Found N duplicates across M URLs. I\'ll use each copy\'s current folder as a sorting hint, then auto-delete redundant copies that land in the same bucket and bring divergent ones to you for review. Ready to start sorting?" The user\'s OK to that single message authorizes BOTH the auto_organize_bookmarks kickoff AND the Step 10 delete_node ops on converged duplicates (confirmedByUser:true). One consent, end-to-end.\n\n' +
+        'In CASE A, keep ONE copy of each URL — the duplicate SETS contain ALL nodes with that URL; you move/delete count-1 (e.g., a set of 3 → 2 moved/deleted). "totalDuplicateInstances" = sum(count-1) across all sets — the number that would be acted on.\n\n' +
+        'Response: duplicateSets ordered by frequency descending (most-duplicated URL first). Each set: {url, count, nodeIds[], parentPaths[] (parallel to nodeIds; slash-joined parent breadcrumb for each instance, e.g. "Music/Classical"; empty string for items at root level), sampleTitles[] (up to 3 distinct)}. Top-level also returns {cached:true, cachedAt} so the agent knows the parentPath context is available for downstream tools.',
+      inputSchema: {
+        scope: z.enum(['tree', 'bookmarks', 'library']).describe('Which data source to scan. "tree" = live tab tree (windows/groups/tabs). "bookmarks" = browser bookmark tree (Chrome bookmarks API source). "library" = a specific Pinako library (requires library_id).'),
+        library_id: z.string().optional().describe('Library id from list_libraries. Required when scope:"library".'),
+        match_mode: z.enum(['exact']).optional().describe('Match strategy. Currently only "exact" (byte-identical URL match) is supported.'),
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ scope, library_id, match_mode = 'exact', browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+
+      let scanTree;
+      let scopeIdentifier;
+      if (scope === 'tree') {
+        scanTree = r.data.tree || [];
+        scopeIdentifier = null;
+      } else if (scope === 'bookmarks') {
+        scanTree = r.data.bookmarks || [];
+        scopeIdentifier = null;
+      } else if (scope === 'library') {
+        if (!library_id) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            error: { code: 'LIBRARY_ID_REQUIRED', message: 'library_id is required when scope:"library"' },
+          }) }], isError: true };
+        }
+        const lib = (r.data.libraries || []).find(l => l.id === library_id);
+        if (!lib) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            error: { code: 'LIBRARY_NOT_FOUND', message: `Library not found: ${library_id} (in ${r.data.browserBrand})` },
+          }) }], isError: true };
+        }
+        scanTree = lib.children || [];
+        scopeIdentifier = library_id;
+      }
+
+      const result = _findDuplicateUrls(scanTree);
+
+      // Side effect: cache result on the per-browser cache entry so the
+      // auto-organize workflow (Step 7 sift loop, Step 9 resolve_duplicate_landings)
+      // can read each duplicate instance's parentPath as semantic signal. Always
+      // caches the latest scan, regardless of whether auto-organize is active —
+      // the workflow checks workflowStep + scope match before consuming.
+      const cachedAt = Date.now();
+      r.data.lastDuplicateScan = {
+        scope,
+        libraryId: scopeIdentifier,
+        matchMode: match_mode,
+        scannedAt: cachedAt,
+        duplicateSets: result.duplicateSets,
+        totalDuplicateInstances: result.totalDuplicateInstances,
+        uniqueDuplicateUrls: result.uniqueDuplicateUrls,
+        totalScannedWithUrl: result.totalScannedWithUrl,
+      };
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:    r.data.browserBrand,
+        browserId:  r.data.browserId,
+        scope,
+        libraryId:  scopeIdentifier,
+        matchMode:  match_mode,
+        cached:     true,
+        cachedAt,
+        ...result,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'get_tree_summary',
+    {
+      description: 'Returns a lightweight structural summary of a tree/bookmarks/library WITHOUT returning the actual nodes. Bridge-side; no LLM. Designed for the auto-organize workflow kickoff (and any "should I read this whole tree?" decision the agent faces): the summary fits in <2KB regardless of tree size and lets the agent decide whether to proceed, what scope makes sense, and ballpark the cost. Does NOT trigger the size guard — the whole point is "summarize before reading."\n\n' +
+        'Response shape: {browser, browserId, scope, libraryId?, counts:{nodes, url_bearing_nodes}, depth:{max, median}, topDomains:[{domain,count},...up to 15], samplePatterns:[{pattern,token,count},...up to 15], sampleTitles:[...up to 20]}. ' +
+        'topDomains = highest-frequency hostnames (www-stripped). samplePatterns = path-token frequency across all URLs (stop-words filtered: html, www, login, etc.); token of "recipe" with pattern "*recipe*" means 389 URLs had "recipe" somewhere in their path. sampleTitles = a deterministic stride sample of node titles (stable across calls — safe to cite back to the user).\n\n' +
+        'For scope:"library", library_id is required. For scope:"bookmarks", returns the cached browser bookmark tree summary (empty if user hasn\'t opened the bookmarks panel since the bridge started). For scope:"tree", summarizes the live tab tree.',
+      inputSchema: {
+        scope:      z.enum(['tree', 'bookmarks', 'library']).optional().describe('Which data source to summarize. Default "tree".'),
+        library_id: z.string().optional().describe('Library id from list_libraries. Required when scope:"library".'),
+        browser:    z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ scope = 'tree', library_id, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+
+      let roots;
+      let scopeIdentifier = null;
+      if (scope === 'tree') {
+        roots = r.data.tree || [];
+      } else if (scope === 'bookmarks') {
+        roots = r.data.bookmarks || [];
+      } else if (scope === 'library') {
+        if (!library_id) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            error: { code: 'LIBRARY_ID_REQUIRED', message: 'library_id is required when scope:"library"' },
+          }) }], isError: true };
+        }
+        const lib = (r.data.libraries || []).find(l => l.id === library_id);
+        if (!lib) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            error: { code: 'LIBRARY_NOT_FOUND', message: `Library not found: ${library_id} (in ${r.data.browserBrand})` },
+          }) }], isError: true };
+        }
+        roots = lib.children || [];
+        scopeIdentifier = library_id;
+      }
+
+      const summary = _summarizeTreeStructure(roots);
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:   r.data.browserBrand,
+        browserId: r.data.browserId,
+        scope,
+        libraryId: scopeIdentifier,
+        ...summary,
+        updatedAt: r.data.updatedAt,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'propose_categories',
+    {
+      description: 'Bridge-side category proposal for the auto-organize workflow (Step 4). Applies the default heuristic rule library (50-165 high-confidence domain rules — Spotify→Music, GitHub→Programming, arXiv→Research, etc.) to the target scope, then proposes top-level folder names for the UNMATCHED residue based on domain frequency and path-token patterns. No LLM. Bridge-side, fast (typically <100ms even on 19k bookmarks).\n\n' +
+        'Response shape: {browser, browserId, scope, libraryId?, totals:{scanned, matched, unmatched, rulesApplied}, matched:[{ruleId,target,count,sampleTitles:[]},...] (collapsed per target), suggestions:[{target,domain?,pattern?,count,basis:"domain-frequency"|"path-token",sampleTitles?},...up to 15]}.\n\n' +
+        'Suggestions are ranked: highest-count domain suggestions first (more reliable signal), then path-token suggestions for residue not covered by domain suggestions. minMatchCount filter (default 100) — only patterns with at least N residue items get proposed, so the agent gets actionable categories not one-off noise. Maintain hedged language with the user: "I noticed about 1,847 Spotify links unmatched — suggest a Music folder?" The user can rename, reject, or extend in the auto-organize panel.\n\n' +
+        'For scope:"library", library_id is required. For scope:"bookmarks", the cached bookmark tree is used (open the bookmarks panel first if empty). Designed to be called AFTER find_duplicates and AFTER user has confirmed their existing folder structure (Step 3) — the suggestions go on top of those user folders.',
+      inputSchema: {
+        scope:         z.enum(['tree', 'bookmarks', 'library']).optional().describe('Which data source to analyze. Default "tree".'),
+        library_id:    z.string().optional().describe('Library id from list_libraries. Required when scope:"library".'),
+        min_match_count: z.number().int().min(1).max(10000).optional().describe('Suggestion floor: only propose categories with at least N residue items. Default 100. Drop to 30-50 for smaller trees if no suggestions emerge.'),
+        max_suggestions: z.number().int().min(1).max(50).optional().describe('Maximum number of category suggestions to return. Default 15.'),
+        browser:       z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ scope = 'tree', library_id, min_match_count, max_suggestions, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+
+      let roots;
+      let scopeIdentifier = null;
+      if (scope === 'tree') {
+        roots = r.data.tree || [];
+      } else if (scope === 'bookmarks') {
+        roots = r.data.bookmarks || [];
+      } else if (scope === 'library') {
+        if (!library_id) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            error: { code: 'LIBRARY_ID_REQUIRED', message: 'library_id is required when scope:"library"' },
+          }) }], isError: true };
+        }
+        const lib = (r.data.libraries || []).find(l => l.id === library_id);
+        if (!lib) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            error: { code: 'LIBRARY_NOT_FOUND', message: `Library not found: ${library_id} (in ${r.data.browserBrand})` },
+          }) }], isError: true };
+        }
+        roots = lib.children || [];
+        scopeIdentifier = library_id;
+      }
+
+      const rules = _loadHeuristicRules();
+      const { matched, unmatched } = _applyHeuristicsToTree(roots, rules);
+
+      // Collapse matched by target (the user-facing category folder name),
+      // not by ruleId — many rules map to the same target ("Music" gets
+      // hits from spotify-music, soundcloud, bandcamp, etc.). Include up
+      // to 3 sample titles per target for the agent to summarize.
+      const matchedByTarget = new Map();
+      for (const m of matched) {
+        let entry = matchedByTarget.get(m.target);
+        if (!entry) {
+          entry = { target: m.target, count: 0, ruleIds: new Set(), sampleTitles: [] };
+          matchedByTarget.set(m.target, entry);
+        }
+        entry.count++;
+        entry.ruleIds.add(m.ruleId);
+        if (entry.sampleTitles.length < 3 && m.node.title) {
+          entry.sampleTitles.push(String(m.node.title));
+        }
+      }
+      const matchedSummary = [...matchedByTarget.values()]
+        .sort((a, b) => b.count - a.count)
+        .map(e => ({ target: e.target, count: e.count, ruleIds: [...e.ruleIds], sampleTitles: e.sampleTitles }));
+
+      const suggestions = _proposeCategoriesFromResidue(unmatched, {
+        minMatchCount: min_match_count,
+        maxSuggestions: max_suggestions,
+      });
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:   r.data.browserBrand,
+        browserId: r.data.browserId,
+        scope,
+        libraryId: scopeIdentifier,
+        totals: {
+          scanned:      matched.length + unmatched.length,
+          matched:      matched.length,
+          unmatched:    unmatched.length,
+          rulesApplied: rules.length,
+        },
+        matched:     matchedSummary,
+        suggestions,
+        updatedAt:   r.data.updatedAt,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'auto_organize_bookmarks',
+    {
+      description: 'Auto-organize bookmarks. Kickoff tool for the bookmark reorganization workflow (Step 3 of the 12-step sequence). Use this when the user asks to organize, reorganize, clean up, sort, categorize, auto-sort, auto-categorize, tidy, structure, or otherwise rearrange their bookmarks — regardless of bookmark count.\n\n' +
+        'CRITICAL: this tool is Step 3 of the workflow, not Step 1. BEFORE calling this tool:\n' +
+        '  Step 1: Offer the user a backup. For 1000+ bookmarks INSIST; for a few hundred MENTION it. Two options: Pinako bookmark backup (preserves Pinako-specific metadata) or Chrome\'s native export (Bookmark Manager → menu → Export bookmarks). Wait for the user\'s response before continuing.\n' +
+        '  Step 2: UNCONDITIONALLY call find_duplicates({scope:\'bookmarks\'}) WITHOUT asking the user first. It is a read-only millisecond local scan and produces parentPath signal for better Step 8 sift placement. Then draft ONE combined kickoff message: "Found N duplicates across M URLs. I\'ll use each copy\'s current folder as a sorting hint, then auto-delete redundant copies that land in the same bucket and bring divergent ones to you for review. Ready to start sorting?" The user\'s "yes" to that ONE message is the consent for both starting the sort AND Step 10 auto-deletion of converged duplicates. DO NOT ask "want me to check for duplicates first?" as a separate question — that is an OLD framing the new flow replaces.\n' +
+        'Only after the user has decided about backup AND given OK to the combined kickoff message should you call this tool.\n\n' +
+        'What this call does atomically:\n' +
+        '  - Scans the user\'s bookmarks against the default heuristic rule library (165 rules across 26 categories) — DIAGNOSTIC ONLY at this stage. The matched-categories list tells you how many items the rules could auto-place IF the user accepts the suggested categories in Step 4.\n' +
+        '  - Computes suggested category folders for the residue (domain-frequency + path-token patterns).\n' +
+        '  - Opens the auto-organize panel in the Pinako popup. The panel shows the user\'s EXISTING bookmark folder structure as the starting point — NOT the heuristic categories. The heuristic-suggested categories are overlaid in Step 4 as proposed additions (with a ✨ suggested tag) after the user reviews their existing folders.\n\n' +
+        'Response shape: {totals:{scanned, matched, unmatched, rulesApplied}, matched:[{ruleId, target, count, sampleTitles}], suggestions:[{target, count, basis, sampleTitles}], panelLaunch:{ok, channel:\'storage-local\', requestId}}.\n\n' +
+        'IMPORTANT — how to frame the response in chat:\n' +
+        '  Do NOT present the matched-categories list as "the structure your bookmarks will use" — that misframes the workflow. The user\'s EXISTING folders are the starting point; the heuristic suggestions are ADDITIONS they choose to accept in Step 4.\n' +
+        '  GOOD framing: "I\'ve opened the auto-organize panel in your Pinako popup. You\'ll see your existing folder structure — review it, trim what you don\'t want, add new folders if you like, then click Continue. I\'ll then propose [N] additional category folders for [M] bookmarks the rules could auto-place (Video, Music, Social, etc.) — you can accept, rename, or reject each one. Once you click Confirm & start sift, I\'ll sort the [R] remaining items into your buckets."\n' +
+        '  BAD framing: "Here\'s the structure: 🎬 Video 71, 🎵 Music 67, ..." (this implies the heuristic categories will be the buckets, which is false — the user\'s existing folders + their Step 4 choices are the buckets).\n\n' +
+        'After this call, wait for the user to confirm in the popup. Poll state.workflowStep via get_organize_state until it becomes \'sorting\' (the user clicked "Confirm & start sift"). Then drive Steps 6-10 of the workflow (see AUTO-ORGANIZE BOOKMARKS WORKFLOW section in SERVER_INSTRUCTIONS for the full sequence).\n\n' +
+        'Call this ONCE per session. Do not call again unless the user resets and re-kicks-off.\n\n' +
+        'Delivery model: the bridge writes a pending-command record to the extension\'s chrome.storage.local. The Pinako popup picks it up live via chrome.storage.onChanged (or on next open if currently closed). Fire-and-forget — the tool returns the prepared data + a delivery receipt, not a guarantee the user has seen the panel. If the popup is closed for >60s the command is treated as stale and discarded. If the user reports the panel didn\'t open: ask them to close and re-open the Pinako popup (resets the NM connection), then retry.\n\n' +
+        'v1 scope: bookmarks only. Tree + library scopes (auto-organize live tabs into libraries; sub-folder a large library) are planned but not yet implemented.',
+      inputSchema: {
+        scope:         z.enum(['bookmarks']).optional().describe('Which data source to organize. v1: \'bookmarks\' only. Default \'bookmarks\'. Tree + library coming later.'),
+        min_match_count: z.number().int().min(1).max(10000).optional().describe('Suggestion floor: only propose categories with at least N residue items. Default 100.'),
+        max_suggestions: z.number().int().min(1).max(50).optional().describe('Maximum number of category suggestions. Default 15.'),
+        browser:       z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ scope = 'bookmarks', min_match_count, max_suggestions, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+
+      if (scope !== 'bookmarks') {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'SCOPE_NOT_SUPPORTED', message: `scope='${scope}' not yet supported. v1 ships 'bookmarks' only; see auto-organize-plan.md future-scope note.` },
+        }) }], isError: true };
+      }
+
+      // Compute propose_categories internally so the panel has its
+      // suggestions to overlay in Step 4.
+      const roots = r.data.bookmarks || [];
+      const rules = _loadHeuristicRules();
+      const { matched, unmatched } = _applyHeuristicsToTree(roots, rules);
+      const matchedByTarget = new Map();
+      for (const m of matched) {
+        let entry = matchedByTarget.get(m.target);
+        if (!entry) {
+          entry = { target: m.target, count: 0, ruleIds: new Set(), sampleTitles: [] };
+          matchedByTarget.set(m.target, entry);
+        }
+        entry.count++;
+        entry.ruleIds.add(m.ruleId);
+        if (entry.sampleTitles.length < 3 && m.node.title) {
+          entry.sampleTitles.push(String(m.node.title));
+        }
+      }
+      const matchedSummary = [...matchedByTarget.values()]
+        .sort((a, b) => b.count - a.count)
+        .map(e => ({ target: e.target, count: e.count, ruleIds: [...e.ruleIds], sampleTitles: e.sampleTitles }));
+      const suggestions = _proposeCategoriesFromResidue(unmatched, {
+        minMatchCount: min_match_count,
+        maxSuggestions: max_suggestions,
+      });
+
+      // Send a pending-command record to the popup via the SW. Delivery
+      // channel is chrome.storage.local — the SW writes the key on
+      // receiving this NM message; the popup's chrome.storage.onChanged
+      // listener picks it up live (and a startup-check reads it on next
+      // popup open if the popup was closed). No round-trip wait;
+      // pendingCommand is fire-and-forget.
+      const requestId = randomBytes(8).toString('hex');
+      const ok = nmWrite({
+        type:      'enqueueAgentCommand',
+        command:   'openAutoOrganize',
+        scope,
+        suggestions,
+        browserId: r.data.browserId,
+        requestId,
+        sentAt:    Date.now(),
+      });
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:   r.data.browserBrand,
+        browserId: r.data.browserId,
+        scope,
+        totals: {
+          scanned:      matched.length + unmatched.length,
+          matched:      matched.length,
+          unmatched:    unmatched.length,
+          rulesApplied: rules.length,
+        },
+        matched:    matchedSummary,
+        suggestions,
+        panelLaunch: {
+          ok,
+          channel:   'storage-local',
+          requestId,
+          note: ok
+            ? 'Pending-command record sent to the popup. If the popup is open, the panel launches immediately. Otherwise it launches on next popup open (within 60s of this tool call).'
+            : 'NM bridge could not send the command (extension may be disconnected). Tell the user to open the Pinako popup, then retry.',
+        },
+        updatedAt: r.data.updatedAt,
+      }) }] };
+    }
+  );
+
+  // ─── S2c (2026-05-13): auto-organize sift loop ─────────────────────────────
+  srv.registerTool(
+    'apply_heuristic_organize',
+    {
+      description: 'Step 6 of the auto-organize workflow — heuristic broad-sweep. Runs the default rule library (165 rules across 26 categories) against the user\'s confirmed bucket structure (from Step 4 / get_organize_state) and returns a PLANNED move list. Does NOT mutate anything itself — agent reviews + commits via bulk_apply (chunked at 100 ops/call).\n\n' +
+        'Prerequisites: auto_organize_bookmarks must have been called, the user must have confirmed the bucket structure in Step 4 (popup workflowStep === \'sorting\'), and get_organize_state must return non-empty buckets. If workflowStep is still \'step-3\' or \'step-4\', the tool returns an error — wait for the user to confirm in the popup.\n\n' +
+        'Matching rule: a heuristic-matched bookmark is moveable IF its target category name (e.g. "Music", "Programming") matches a top-level bucket title in the user\'s confirmed structure (case-insensitive). Unmatched targets — categories the heuristics fire for but where the user has no corresponding bucket — are skipped and counted under `skippedTargets` so the agent can summarize them ("you have 80 GitHub bookmarks but no Programming folder; want to add one?"). v1 matches against TOP-LEVEL buckets only; sub-folder routing is Step 10 / S2d.\n\n' +
+        'Response shape:\n' +
+        '  totals: { scanned, matched, moveable, skipped_no_bucket, unmatched_residue }\n' +
+        '  moves:  [{nodeId, title, url, newParentId, targetTitle, ruleId, confidence},...]\n' +
+        '          nodeId and newParentId are chrome.bookmarks ids (pass directly to bulk_apply with scope:\'bookmarks\' — the popup translates to Pinako node ids internally). confidence is \'high\'|\'medium\' (low-confidence rules are excluded from broad-sweep per heuristic-rule-format spec).\n' +
+        '  skippedTargets: [{target, count, reason, sampleTitles[]},...] — heuristic-matched items with no destination bucket\n' +
+        '  bucketSummary:  [{title, bookmarkFolderId, willReceive},...] — preview of where moves will land\n' +
+        '  unmatched_residue: count of bookmarks that didn\'t match any rule (drives the Step 7 LLM sift loop on get_bookmarks pagination)\n\n' +
+        'For very large bookmark trees the moves array can be long (e.g. 5,000+). The agent should chunk into bulk_apply calls of up to 100 ops each. Per-call response shape stays bounded — moves are compact (~120 bytes per entry).',
+      inputSchema: {
+        confidence_floor: z.enum(['high', 'medium']).optional().describe('Minimum rule confidence to include in moves. Default \'medium\' (= medium + high). Drop to \'high\' to skip medium-confidence rules (e.g., medium.com → Articles) and only act on the most reliable ones.'),
+        max_moves:        z.number().int().min(1).max(10000).optional().describe('Cap on moves[] length. Default 5000. If exceeded, response truncates moves[] and includes more_moves_available:true — call again after applying the first batch to receive the next chunk (cache-friendly via the pinako-mcp prompt cache).'),
+        browser:          z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ confidence_floor = 'medium', max_moves, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+
+      const state = r.data.organizeState;
+      if (!state) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'ORGANIZE_STATE_NOT_READY', message: 'No auto-organize state cached for this browser. Call auto_organize_bookmarks first, then wait for the user to confirm the bucket structure in Step 4.' },
+        }) }], isError: true };
+      }
+      if (state.workflowStep !== 'sorting' && state.workflowStep !== 'paused') {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'ORGANIZE_STATE_NOT_READY', message: `Workflow is in step '${state.workflowStep}'. The user must confirm the bucket structure in the popup (Step 4) before the heuristic broad-sweep can run.` },
+          workflowStep: state.workflowStep,
+        }) }], isError: true };
+      }
+      const buckets = Array.isArray(state.buckets) ? state.buckets : [];
+      if (buckets.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'NO_BUCKETS_CONFIRMED', message: 'The confirmed bucket structure is empty. Ask the user to add at least one folder in the auto-organize panel before re-running.' },
+        }) }], isError: true };
+      }
+
+      // Build top-level bucket lookup by lowercase title → bookmarkFolderId.
+      // v1: top-level only; nested sub-folders are S2d / Step 12 polish menu.
+      // S2d Phase 2: skip the Review system bucket — heuristics never route to
+      // Review (that's exclusively for LLM low-confidence sift items).
+      const bucketByTitleLc = new Map();
+      for (const b of buckets) {
+        if (b && b.isReview) continue;
+        const titleLc = String(b.title || '').trim().toLowerCase();
+        if (!titleLc || !b.bookmarkFolderId) continue;
+        if (!bucketByTitleLc.has(titleLc)) bucketByTitleLc.set(titleLc, b);
+      }
+
+      // S2d Phase 1: respect the includeOtherRoots flag from the cached
+      // organize state. When false (default), scope is limited to the
+      // Bookmarks Bar root. When true, the full bookmark tree is walked
+      // including Other Bookmarks (id '2') and Mobile Bookmarks (id '3').
+      let roots = r.data.bookmarks || [];
+      if (!state.includeOtherRoots) {
+        const wrapper = roots[0];
+        if (wrapper && Array.isArray(wrapper.children) && wrapper.children.length > 0) {
+          // Bookmarks Bar is conventionally id '1' (find by id for safety).
+          const bookmarksBar = wrapper.children.find(c => c && c.id === '1')
+            || wrapper.children[0];
+          roots = [bookmarksBar];
+        }
+      }
+      const rules = _loadHeuristicRules();
+      const { matched, unmatched } = _applyHeuristicsToTree(roots, rules);
+
+      const allowMedium = confidence_floor === 'medium';
+      const cap = Number.isFinite(max_moves) && max_moves > 0 ? max_moves : 5000;
+
+      const moves = [];
+      const skippedByTarget = new Map();
+      const willReceiveByBucket = new Map();
+      let skippedNoBucketCount = 0;
+
+      for (const m of matched) {
+        if (m.confidence !== 'high' && !(allowMedium && m.confidence === 'medium')) continue;
+        const targetLc = String(m.target || '').trim().toLowerCase();
+        const bucket = bucketByTitleLc.get(targetLc);
+        if (!bucket) {
+          skippedNoBucketCount++;
+          let entry = skippedByTarget.get(m.target);
+          if (!entry) {
+            entry = { target: m.target, count: 0, sampleTitles: [] };
+            skippedByTarget.set(m.target, entry);
+          }
+          entry.count++;
+          if (entry.sampleTitles.length < 3 && m.node && m.node.title) {
+            entry.sampleTitles.push(String(m.node.title));
+          }
+          continue;
+        }
+        // Skip the move if the bookmark is already in the right bucket (no-op).
+        if (m.node && m.node.parentId && m.node.parentId === bucket.bookmarkFolderId) continue;
+
+        if (moves.length < cap) {
+          moves.push({
+            nodeId:       String(m.node.id),
+            title:        String(m.node.title || ''),
+            url:          String(m.node.url || ''),
+            newParentId:  String(bucket.bookmarkFolderId),
+            targetTitle:  bucket.title,
+            ruleId:       m.ruleId,
+            confidence:   m.confidence,
+          });
+        }
+        const willCount = willReceiveByBucket.get(bucket.bookmarkFolderId) || 0;
+        willReceiveByBucket.set(bucket.bookmarkFolderId, willCount + 1);
+      }
+
+      const skippedTargets = [...skippedByTarget.values()]
+        .map(e => ({ ...e, reason: `No bucket named '${e.target}' in the user's confirmed structure.` }))
+        .sort((a, b) => b.count - a.count);
+      const bucketSummary = buckets.map(b => ({
+        title:            b.title,
+        bookmarkFolderId: b.bookmarkFolderId,
+        willReceive:      willReceiveByBucket.get(b.bookmarkFolderId) || 0,
+      }));
+      const moveable = [...willReceiveByBucket.values()].reduce((acc, n) => acc + n, 0);
+      const moreMovesAvailable = moveable > moves.length;
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:    r.data.browserBrand,
+        browserId:  r.data.browserId,
+        scope:      state.scope || 'bookmarks',
+        totals: {
+          scanned:           matched.length + unmatched.length,
+          matched:           matched.length,
+          moveable,
+          skipped_no_bucket: skippedNoBucketCount,
+          unmatched_residue: unmatched.length,
+        },
+        moves,
+        moves_returned:        moves.length,
+        more_moves_available:  moreMovesAvailable,
+        skippedTargets,
+        bucketSummary,
+        confidence_floor,
+        rulesApplied: rules.length,
+        next_steps: 'Apply these moves via bulk_apply (scope:\'bookmarks\', chunked at 100 ops/call). After applying, drive the Step 7 LLM sift loop on the unmatched_residue: get_bookmarks(after, limit:500) → LLM categorize → bulk_apply move_node ops to the right bucket.bookmarkFolderId.',
+        updatedAt:  r.data.updatedAt,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'refine_folder_outliers',
+    {
+      description: 'Step 8 of the auto-organize workflow — LLM outlier-pull refinement for a populated bucket. Returns the items currently in a folder + the sibling confirmed buckets (the OTHER user-approved categories). Use this AFTER the Step 7 sift loop completes, iterating over each populated bucket in turn. The output is sparse: scan the items and only emit relocations for the few items that DON\'T belong in this folder. Most items stay in place.\n\n' +
+        'Why this matters: heuristic broad-sweep + LLM sift land items into buckets via domain rules + per-item categorization, but errors accumulate. Step 8 is the LLM-driven correction pass — second look at each folder, identify items that don\'t fit, relocate to the right sibling bucket (or Review if low-confidence). Typical: 5-15% of items in a folder get relocated.\n\n' +
+        'Response shape: {folder:{title, bookmarkFolderId, totalItems, returnedItems}, items:[{nodeId, title, url, parentId, dateAdded}], nextCursor, siblingBuckets:[{title, bookmarkFolderId}], reviewBucket?:{title, bookmarkFolderId}, hint}.\n\n' +
+        'Output protocol: emit bulk_apply move_node ops only for items that need relocation. For items confirmed-in-place, emit nothing. For items clearly out-of-place but ambiguous (confidence < 0.7), route to reviewBucket.bookmarkFolderId. Pattern emergence: if you notice a strong sub-pattern within a folder (e.g., 40% of "Music" items are clearly podcasts), call record_observation to surface a sub-folder suggestion for Step 12 polish.',
+      inputSchema: {
+        folder_id: z.string().describe('The chrome.bookmarks folder id (= bucket.bookmarkFolderId from get_organize_state.buckets) — the folder to scan for outliers.'),
+        after:     z.string().optional().describe('Pagination cursor: last-seen nodeId from a previous call on this folder.'),
+        limit:     z.number().int().min(1).max(500).optional().describe('Max items per page. Default 200 (smaller than sift-loop default of 500 since outlier scans involve more LLM reasoning per item).'),
+        browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ folder_id, after, limit, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const state = r.data.organizeState;
+      if (!state) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'ORGANIZE_STATE_NOT_READY', message: 'No auto-organize state cached. Call auto_organize_bookmarks first and wait for the user to confirm.' },
+        }) }], isError: true };
+      }
+      if (state.workflowStep !== 'sorting' && state.workflowStep !== 'paused') {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'ORGANIZE_STATE_NOT_READY', message: `Workflow is in step '${state.workflowStep}'. Outlier-pull only runs after the user confirms the bucket structure (workflowStep === 'sorting').` },
+          workflowStep: state.workflowStep,
+        }) }], isError: true };
+      }
+
+      const folder = _findBookmarkFolderByChromeId(r.data.bookmarks || [], folder_id);
+      if (!folder) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'FOLDER_NOT_FOUND', message: `Bookmark folder ${folder_id} not found in this browser's cached bookmark tree.` },
+        }) }], isError: true };
+      }
+
+      // Flatten leaves (URL-bearing items only — sub-folders within this
+      // folder aren't part of the outlier scan for v1; user-defined nesting
+      // is preserved).
+      const allItems = [];
+      function walk(n) {
+        if (!n) return;
+        if (n.url) {
+          allItems.push({
+            nodeId:    String(n.id),
+            title:     String(n.title || ''),
+            url:       String(n.url),
+            parentId:  String(n.parentId || ''),
+            dateAdded: n.dateAdded || null,
+          });
+        }
+        if (Array.isArray(n.children)) n.children.forEach(walk);
+      }
+      for (const c of (folder.children || [])) walk(c);
+
+      // Paginate.
+      const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : 200;
+      let startIdx = 0;
+      let cursorFound = true;
+      if (after) {
+        const idx = allItems.findIndex(it => it.nodeId === after);
+        if (idx >= 0) {
+          startIdx = idx + 1;
+        } else {
+          // Bad cursor (item moved/deleted between calls) — restart from 0.
+          startIdx = 0;
+          cursorFound = false;
+        }
+      }
+      const slice = allItems.slice(startIdx, startIdx + effectiveLimit);
+      const nextCursor = (startIdx + slice.length < allItems.length)
+        ? slice[slice.length - 1].nodeId
+        : null;
+
+      // Sibling buckets (exclude the current folder + Review system bucket).
+      const buckets = Array.isArray(state.buckets) ? state.buckets : [];
+      const siblingBuckets = buckets
+        .filter(b => b && b.bookmarkFolderId && b.bookmarkFolderId !== folder_id && !b.isReview)
+        .map(b => ({ title: b.title, bookmarkFolderId: b.bookmarkFolderId }));
+      const reviewBucket = buckets.find(b => b && b.isReview);
+
+      // Self bucket info (for the LLM's frame of reference: "this is the
+      // Music folder; here's what's in it; here are the sibling categories").
+      const selfBucket = buckets.find(b => b && b.bookmarkFolderId === folder_id);
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:    r.data.browserBrand,
+        browserId:  r.data.browserId,
+        folder: {
+          title:           selfBucket ? selfBucket.title : (folder.title || ''),
+          bookmarkFolderId: folder_id,
+          totalItems:      allItems.length,
+          returnedItems:   slice.length,
+        },
+        items:        slice,
+        nextCursor,
+        cursorFound,
+        siblingBuckets,
+        reviewBucket: reviewBucket
+          ? { title: reviewBucket.title, bookmarkFolderId: reviewBucket.bookmarkFolderId }
+          : null,
+        hint: 'Scan items for outliers. Most should stay in this folder (output nothing for them). For items that clearly belong in a sibling bucket, emit bulk_apply move_node ops with newParentId = siblingBucket.bookmarkFolderId. For items clearly out of place but ambiguous (confidence < 0.7), route to reviewBucket.bookmarkFolderId. Output should be sparse — typical folders see 5-15% relocations.',
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'summarize_organize_results',
+    {
+      description: 'Step 12 of the auto-organize workflow — post-sort summary for the polish menu. Returns per-bucket item counts (queried from the cached chrome.bookmarks tree), Review folder count, total sorted items, a digest of the most-recent observations from record_observation, and (Slice S2f, 2026-05-14) a duplicates summary if Step 2 dedup-record + Step 10 resolve_duplicate_landings ran. Use this AFTER the sift loop + outlier-pull + duplicate-resolution are done to summarize results to the user and drive the recursive polish menu:\n\n' +
+        '"I sorted N items into your buckets:\n  Music: 148\n  Programming: 92\n  Research: 23\n  Review: 12 items I wasn\'t sure about\nWant to refine further?\n  • Review the Review folder (12 items)\n  • Suggest sub-folders for any populated bucket\n  • Make corrections / add a new bucket\n  • Done"\n\n' +
+        'Counts come from the bridge\'s bookmark cache (~1-2s stale via SW chrome.bookmarks listener). Refresh by calling get_bookmarks or making sure the SW push has fired recently. Pattern hint: high-count buckets are sub-folder candidates; low-count buckets may be over-granular.',
       inputSchema: {
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
@@ -1632,11 +3291,568 @@ function createMcpServer() {
     async ({ browser }) => {
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
+      const state = r.data.organizeState;
+      if (!state) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'ORGANIZE_STATE_NOT_READY', message: 'No auto-organize state cached. Call auto_organize_bookmarks first.' },
+        }) }], isError: true };
+      }
+      const buckets = Array.isArray(state.buckets) ? state.buckets : [];
+
+      // Count URL leaves under each bucket folder.
+      function countLeaves(node) {
+        if (!node) return 0;
+        if (node.url) return 1;
+        if (!Array.isArray(node.children)) return 0;
+        let s = 0;
+        for (const c of node.children) s += countLeaves(c);
+        return s;
+      }
+
+      const bucketSummary = [];
+      let reviewCount = 0;
+      let totalSorted = 0;
+      for (const b of buckets) {
+        if (!b || !b.bookmarkFolderId) continue;
+        const folder = _findBookmarkFolderByChromeId(r.data.bookmarks || [], b.bookmarkFolderId);
+        const count = folder ? countLeaves(folder) : 0;
+        const entry = {
+          title:            b.title,
+          bookmarkFolderId: b.bookmarkFolderId,
+          count,
+          isReview:         !!b.isReview,
+          isSuggestion:     !!b.isSuggestion,
+          isExisting:       !!b.isExisting,
+        };
+        bucketSummary.push(entry);
+        if (b.isReview) {
+          reviewCount = count;
+        } else {
+          totalSorted += count;
+        }
+      }
+
+      // Observation digest (up to 5 most recent).
+      const log_ = _organizeObservationLog.get(r.data.browserId) || [];
+      const observationDigest = log_.slice(-5).map(o => ({
+        pattern:    o.pattern,
+        count:      o.count,
+        batch_n:    o.batch_n,
+        recordedAt: o.recordedAt,
+      }));
+
+      // Identify high-count buckets that may warrant sub-folder suggestions.
+      const subFolderCandidates = bucketSummary
+        .filter(b => !b.isReview && b.count >= 50)
+        .sort((a, b) => b.count - a.count)
+        .map(b => ({ title: b.title, count: b.count, bookmarkFolderId: b.bookmarkFolderId }));
+
+      // Slice S2f (2026-05-14): surface duplicate context if a recent scan
+      // exists for this workflow. The agent uses these counts to drive the
+      // post-sift consolidation (Step 9 → resolve_duplicate_landings) and to
+      // tell the user "N duplicates were auto-deleted / M need your review".
+      const dupScan = r.data.lastDuplicateScan || null;
+      let duplicates = null;
+      if (dupScan && dupScan.scope === state.scope && (dupScan.libraryId || null) === (state.libraryId || null)) {
+        duplicates = {
+          totalSets:        dupScan.uniqueDuplicateUrls,
+          totalInstances:   dupScan.totalDuplicateInstances,
+          scannedAt:        dupScan.scannedAt,
+          hint:             'Call resolve_duplicate_landings BEFORE complete_organize_sort to classify these sets as converged (auto-delete) / diverged (surface in polish menu) / residue (leave alone).',
+        };
+      }
+
+      const polishMenuTemplate = duplicates
+        ? 'I sorted [totalSorted] items into your buckets. [Review] has [reviewCount] items I wasn\'t sure about. There were also [duplicates.totalInstances] duplicates across [duplicates.totalSets] URLs — call resolve_duplicate_landings to reconcile them; converged sets auto-delete (Step 2 pre-consent), diverged sets get added to the polish menu below. Want to refine further?\n  - Review the Review folder ([reviewCount] items)\n  - Resolve [diverged] divergent duplicate sets (after resolve_duplicate_landings)\n  - Suggest sub-folders for [high-count bucket]\n  - Add corrections / new buckets\n  - Done'
+        : 'I sorted [totalSorted] items into your buckets. [Review] has [reviewCount] items I wasn\'t sure about. Want to refine further?\n  - Review the Review folder ([reviewCount] items)\n  - Suggest sub-folders for [high-count bucket]\n  - Add corrections / new buckets\n  - Done';
+
       return { content: [{ type: 'text', text: JSON.stringify({
-        browser:   r.data.browserBrand,
+        browser:           r.data.browserBrand,
+        browserId:         r.data.browserId,
+        workflowStep:      state.workflowStep,
+        bucketSummary,
+        reviewCount,
+        totalSorted,
+        observationCount:  log_.length,
+        observationDigest,
+        subFolderCandidates,
+        duplicates,
+        polish_menu_template: polishMenuTemplate,
+        updatedAt:         r.data.updatedAt,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'resolve_duplicate_landings',
+    {
+      description: 'Step 9 of the auto-organize workflow (Slice S2f, 2026-05-14). After the LLM sift (Step 7) and outlier-pull refinement (Step 8) have completed and BEFORE calling complete_organize_sort, call this to reconcile the duplicate sets recorded at Step 2 against where each instance now lives.\n\n' +
+        'Prerequisite: find_duplicates must have been called earlier (Step 2) so lastDuplicateScan is cached on the bridge. If no cached scan exists for the active workflow scope, this returns counts of 0 across all categories — safe to call defensively.\n\n' +
+        'Classification (per duplicate set, based on each instance\'s CURRENT chrome.bookmarks parent):\n\n' +
+        '  CONVERGED — all surviving instances now sit under the same bucketFolderId (including the Review bucket). The user pre-consented at Step 2 to auto-deletion of redundant copies in this case. Action: issue bulk_apply with delete_node({confirmedByUser:true}) on each set\'s deleteNodeIds[] (which is nodeIds minus keepNodeId — by default the first surviving instance). One bulk_apply call across all converged sets is fine.\n\n' +
+        '  DIVERGED — instances are split across 2 or more distinct destinations (multiple buckets, or a bucket + residue, or multiple buckets + residue). DO NOT auto-delete. Surface each diverged set to the user in the Step 12 polish menu so they can decide per-set: consolidate to one bucket / leave as multiple homes / move minorities elsewhere. Use the originalParentPath on each instance as additional context when explaining the set to the user.\n\n' +
+        '  RESIDUE — all instances are still in their original (non-bucket) folders. The sift didn\'t categorize them. Leave them alone — they\'ll surface in the normal Review-folder flow or remain where the user originally put them.\n\n' +
+        '  MISSING — a previously-recorded instance no longer exists (user manually deleted, or bridge cache stale). Counted in summary.missing; the set is otherwise processed using the surviving instances. Sets reduced to 1 surviving instance fall out of the duplicate space entirely and are not reported.\n\n' +
+        'Response: { convergedSets:[{url, bucketFolderId, bucketTitle, isReview, keepNodeId, deleteNodeIds[], sampleTitle, originalParentPaths[]}], divergedSets:[{url, sampleTitle, instances:[{nodeId, currentParentId, currentBucketFolderId, currentBucketTitle, isReview, originalParentPath}]}], residueSets:[{url, sampleTitle, instances:[{nodeId, currentParentId, originalParentPath}]}], summary:{totalSets, converged, diverged, residue, missing, deletableCount, divergedInstanceCount}, next_steps }.\n\n' +
+        'deletableCount = total number of delete_node ops needed across all converged sets (sum of deleteNodeIds.length). This is the "N duplicates auto-deleted" count to report to the user.',
+      inputSchema: {
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const state = r.data.organizeState;
+      if (!state) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'ORGANIZE_STATE_NOT_READY', message: 'No auto-organize state cached. Call auto_organize_bookmarks first.' },
+        }) }], isError: true };
+      }
+      const dupScan = r.data.lastDuplicateScan;
+      if (!dupScan || !Array.isArray(dupScan.duplicateSets) || dupScan.duplicateSets.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:        r.data.browserBrand,
+          browserId:      r.data.browserId,
+          convergedSets:  [],
+          divergedSets:   [],
+          residueSets:    [],
+          summary:        { totalSets: 0, converged: 0, diverged: 0, residue: 0, missing: 0, deletableCount: 0, divergedInstanceCount: 0 },
+          next_steps:     'No cached duplicate scan. If Step 2 dedup was skipped or scope changed, this is expected — proceed to complete_organize_sort.',
+        }) }] };
+      }
+
+      // Build a Map<nodeId, parentId> by walking the cached bookmarks tree once.
+      // Also Map<nodeId, currentParentTitle> so diverged instances can be
+      // labeled with the user's current folder name (helps the polish-menu UX).
+      const idToParent = new Map();
+      const idToParentTitle = new Map();
+      function indexBookmarks(node, parentId, parentTitle) {
+        if (!node) return;
+        if (node.id) {
+          idToParent.set(String(node.id), parentId);
+          idToParentTitle.set(String(node.id), parentTitle);
+        }
+        if (Array.isArray(node.children)) {
+          for (const c of node.children) {
+            indexBookmarks(c, node.id ? String(node.id) : parentId, String(node.title || parentTitle || ''));
+          }
+        }
+      }
+      const roots = r.data.bookmarks || [];
+      for (const root of roots) indexBookmarks(root, null, '');
+
+      // Build a Map<bucketFolderId, {bucketTitle, isReview}> from organizeState.
+      const buckets = Array.isArray(state.buckets) ? state.buckets : [];
+      const bucketByFolderId = new Map();
+      function indexBuckets(arr) {
+        for (const b of arr) {
+          if (!b) continue;
+          if (b.bookmarkFolderId) {
+            bucketByFolderId.set(String(b.bookmarkFolderId), {
+              bucketId:    b.id,
+              bucketTitle: b.title,
+              isReview:    !!b.isReview,
+            });
+          }
+          if (Array.isArray(b.children)) indexBuckets(b.children);
+        }
+      }
+      indexBuckets(buckets);
+
+      const convergedSets = [];
+      const divergedSets  = [];
+      const residueSets   = [];
+      let missing = 0;
+      let deletableCount = 0;
+      let divergedInstanceCount = 0;
+
+      for (const set of dupScan.duplicateSets) {
+        const nodeIds = Array.isArray(set.nodeIds) ? set.nodeIds : [];
+        const parentPaths = Array.isArray(set.parentPaths) ? set.parentPaths : [];
+        const sampleTitle = (Array.isArray(set.sampleTitles) && set.sampleTitles[0]) || '';
+
+        // Resolve current locations; skip instances that no longer exist.
+        const surviving = [];
+        for (let i = 0; i < nodeIds.length; i++) {
+          const nodeId = String(nodeIds[i]);
+          if (!idToParent.has(nodeId)) {
+            missing++;
+            continue;
+          }
+          const currentParentId = idToParent.get(nodeId);
+          const bucketInfo = currentParentId
+            ? bucketByFolderId.get(String(currentParentId)) || null
+            : null;
+          surviving.push({
+            nodeId,
+            currentParentId,
+            currentParentTitle:    idToParentTitle.get(nodeId) || '',
+            currentBucketFolderId: bucketInfo ? currentParentId : null,
+            currentBucketTitle:    bucketInfo ? bucketInfo.bucketTitle : null,
+            isReview:              bucketInfo ? bucketInfo.isReview : false,
+            originalParentPath:    parentPaths[i] || '',
+            isInBucket:            !!bucketInfo,
+          });
+        }
+
+        // If only one instance survives, this set is no longer a duplicate. Skip.
+        if (surviving.length < 2) continue;
+
+        // Classify: collect distinct destinations. "destination" =
+        //   if in bucket → bucket folder id
+        //   else → '__residue__::' + currentParentId (residue parents are
+        //          distinct destinations from each other for the diverged check)
+        const destinations = new Set();
+        let allInBucket = true;
+        for (const inst of surviving) {
+          if (inst.isInBucket) {
+            destinations.add('bucket::' + inst.currentBucketFolderId);
+          } else {
+            allInBucket = false;
+            destinations.add('residue::' + (inst.currentParentId || 'unknown'));
+          }
+        }
+
+        if (allInBucket && destinations.size === 1) {
+          // Converged: all surviving instances in the same bucket. Keep first; delete rest.
+          const keepNodeId = surviving[0].nodeId;
+          const deleteNodeIds = surviving.slice(1).map(s => s.nodeId);
+          deletableCount += deleteNodeIds.length;
+          const first = surviving[0];
+          convergedSets.push({
+            url:                 set.url,
+            bucketFolderId:      first.currentParentId,
+            bucketTitle:         first.currentBucketTitle,
+            isReview:            first.isReview,
+            keepNodeId,
+            deleteNodeIds,
+            sampleTitle,
+            originalParentPaths: surviving.map(s => s.originalParentPath),
+          });
+        } else if (!allInBucket && destinations.size === 1) {
+          // All in residue, all under the same parent. Treat as residue.
+          residueSets.push({
+            url:        set.url,
+            sampleTitle,
+            instances:  surviving.map(s => ({
+              nodeId:             s.nodeId,
+              currentParentId:    s.currentParentId,
+              currentParentTitle: s.currentParentTitle,
+              originalParentPath: s.originalParentPath,
+            })),
+          });
+        } else if (!allInBucket && destinations.size > 1
+                   && [...destinations].every(d => d.startsWith('residue::'))) {
+          // All in residue but in different residue parents — still residue
+          // semantically (none sorted), agent leaves alone.
+          residueSets.push({
+            url:        set.url,
+            sampleTitle,
+            instances:  surviving.map(s => ({
+              nodeId:             s.nodeId,
+              currentParentId:    s.currentParentId,
+              currentParentTitle: s.currentParentTitle,
+              originalParentPath: s.originalParentPath,
+            })),
+          });
+        } else {
+          // Diverged: mix of buckets, or bucket + residue.
+          divergedInstanceCount += surviving.length;
+          divergedSets.push({
+            url:        set.url,
+            sampleTitle,
+            instances:  surviving.map(s => ({
+              nodeId:                s.nodeId,
+              currentParentId:       s.currentParentId,
+              currentParentTitle:    s.currentParentTitle,
+              currentBucketFolderId: s.isInBucket ? s.currentParentId : null,
+              currentBucketTitle:    s.currentBucketTitle,
+              isReview:              s.isReview,
+              originalParentPath:    s.originalParentPath,
+            })),
+          });
+        }
+      }
+
+      const totalSets = convergedSets.length + divergedSets.length + residueSets.length;
+      const nextSteps = totalSets === 0
+        ? 'No duplicate sets needed reconciling. Proceed to complete_organize_sort.'
+        : (convergedSets.length > 0
+            ? `Converged: issue ONE bulk_apply with ${deletableCount} delete_node ops ({confirmedByUser:true}, scope:'bookmarks'} per Step 2 pre-consent). Then surface ${divergedSets.length} diverged set(s) to the user in the Step 12 polish menu. Residue sets (${residueSets.length}) require no action — leave them.`
+            : `No converged duplicates to auto-delete. Surface ${divergedSets.length} diverged set(s) to the user in the Step 12 polish menu. Residue sets (${residueSets.length}) require no action.`);
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:        r.data.browserBrand,
+        browserId:      r.data.browserId,
+        scope:          dupScan.scope,
+        libraryId:      dupScan.libraryId,
+        convergedSets,
+        divergedSets,
+        residueSets,
+        summary: {
+          totalSets,
+          converged:             convergedSets.length,
+          diverged:              divergedSets.length,
+          residue:               residueSets.length,
+          missing,
+          deletableCount,
+          divergedInstanceCount,
+        },
+        next_steps:     nextSteps,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'complete_organize_sort',
+    {
+      description: 'Auto-organize bookmarks: transition the workflow from sorting (Steps 6-9) into the polish phase (Step 10). Call this AFTER you have completed the LLM batch sort loop (Step 7) and the outlier-pull refinement pass (Step 8 via refine_folder_outliers across all populated buckets). The popup\'s auto-organize panel switches from the read-only sorting view to the editable polish view where the user can add / rename / drag / delete-empty buckets while you drive the polish menu in chat.\n\n' +
+        'Workflow gating: state.workflowStep must be \'sorting\' (the agent has been actively sifting) or \'paused\' (user halted mid-sift; agent finished after Resume). Other states return ORGANIZE_STATE_NOT_READY.\n\n' +
+        'Delivery model: the bridge writes a pending-command record to the extension\'s chrome.storage.local (mirrors auto_organize_bookmarks from S2b). The popup picks it up live via chrome.storage.onChanged and transitions to polish state. Fire-and-forget — the tool returns a delivery receipt, not a guarantee that the user has seen the transition. Within ~200ms typically.\n\n' +
+        'After calling this, immediately call summarize_organize_results for the post-sort summary, then present the polish menu options to the user in chat: review the Review folder, suggest sub-folders for a high-count bucket, add corrections, or done.',
+      inputSchema: {
+        summary: z.string().max(500).optional().describe('Optional one-line agent-side summary of what was sorted. Forwarded to the popup for future UI polish (not displayed in v1).'),
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ summary, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const state = r.data.organizeState;
+      if (!state) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'ORGANIZE_STATE_NOT_READY', message: 'No auto-organize state cached. Call auto_organize_bookmarks first.' },
+        }) }], isError: true };
+      }
+      if (state.workflowStep !== 'sorting' && state.workflowStep !== 'paused') {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'ORGANIZE_STATE_NOT_READY', message: `Workflow is in step '${state.workflowStep}'. complete_organize_sort only valid from 'sorting' or 'paused'.` },
+          workflowStep: state.workflowStep,
+        }) }], isError: true };
+      }
+      const requestId = randomBytes(8).toString('hex');
+      const ok = nmWrite({
+        type:      'enqueueAgentCommand',
+        command:   'transitionToPolish',
         browserId: r.data.browserId,
-        bookmarks: r.data.bookmarks || [],
+        summary:   typeof summary === 'string' ? summary : null,
+        requestId,
+        sentAt:    Date.now(),
+      });
+      return { content: [{ type: 'text', text: JSON.stringify({
+        ok,
+        browser:    r.data.browserBrand,
+        browserId:  r.data.browserId,
+        deliveryChannel: 'storage-local',
+        requestId,
+        note: ok
+          ? 'Transition command sent. The popup will switch to polish state within a few hundred ms. Next: call summarize_organize_results and present the polish menu to the user.'
+          : 'Bridge could not send the command (extension may be disconnected). Tell the user to open the Pinako popup, then retry.',
         updatedAt: r.data.updatedAt,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'propose_subcategories',
+    {
+      description: 'Step 12 polish-menu sub-folder proposal. Scopes domain-frequency + path-token analysis to a single bucket folder\'s contents and proposes sub-category names. Use this when the polish menu surfaces a high-count bucket (subFolderCandidates from summarize_organize_results) and the user accepts the "Suggest sub-folders for [bucket]" option.\n\n' +
+        'Heuristic rules are NOT applied — the folder is already homogeneous by category (the parent bucket is its semantic group), so domain rules would just re-label everything as the parent\'s category. Pure pattern emergence: count domain frequencies + path-token frequencies within the folder, propose names for the dominant clusters.\n\n' +
+        'Response shape: {folder:{title, bookmarkFolderId, totalItems}, suggestions:[{target, domain?, pattern?, count, basis:"domain-frequency"|"path-token", sampleTitles}], min_match_count_used, hint}.\n\n' +
+        'After the user accepts: create the sub-folders via create_folder({scope:\'bookmarks\', parentId:folder_id, title:<suggested>}), then move items into them via bulk_apply move_node. Or call propose_subcategories again on one of the new sub-folders if the user wants deeper nesting (recursion depth bounded to 3 per the design spec — track this client-side).',
+      inputSchema: {
+        folder_id:       z.string().describe('The chrome.bookmarks folder id to scope sub-category analysis to.'),
+        min_match_count: z.number().int().min(1).max(10000).optional().describe('Minimum residue items for a sub-category suggestion. Default 3 (much lower than propose_categories\'s default of 100 since sub-folders are smaller scope). Bump to 5-10 to filter noise on larger folders.'),
+        max_suggestions: z.number().int().min(1).max(20).optional().describe('Maximum number of sub-category suggestions. Default 10.'),
+        browser:         z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ folder_id, min_match_count, max_suggestions, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const folder = _findBookmarkFolderByChromeId(r.data.bookmarks || [], folder_id);
+      if (!folder) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'FOLDER_NOT_FOUND', message: `Bookmark folder ${folder_id} not found in this browser's cached bookmark tree.` },
+        }) }], isError: true };
+      }
+      // Flatten URL leaves under the folder.
+      const items = [];
+      function walk(n) {
+        if (!n) return;
+        if (n.url) items.push(n);
+        if (Array.isArray(n.children)) n.children.forEach(walk);
+      }
+      for (const c of (folder.children || [])) walk(c);
+
+      const minCount = Number.isFinite(min_match_count) && min_match_count > 0 ? min_match_count : 3;
+      const maxSugg  = Number.isFinite(max_suggestions) && max_suggestions > 0 ? max_suggestions : 10;
+      const suggestions = _proposeCategoriesFromResidue(items, {
+        minMatchCount: minCount,
+        maxSuggestions: maxSugg,
+      });
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:    r.data.browserBrand,
+        browserId:  r.data.browserId,
+        folder: {
+          title:            folder.title,
+          bookmarkFolderId: folder_id,
+          totalItems:       items.length,
+        },
+        suggestions,
+        min_match_count_used: minCount,
+        hint: 'After user accepts: create each sub-folder via create_folder({scope:\'bookmarks\', parentId:folder_id, title:suggestion.target}), then bulk_apply move_node ops to relocate matching items. For pattern-based suggestions, use the pattern hint to decide which items qualify. Stop at depth 3 to avoid runaway nesting.',
+        updatedAt:  r.data.updatedAt,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'get_organize_state',
+    {
+      description: 'Reads the current auto-organize workflow state from the Pinako popup. Use this after calling auto_organize_bookmarks to learn when the user has finished Step 3+4 setup (workflowStep === \'sorting\') so you can begin the heuristic broad-sweep + LLM sift loop. Also use this between batches during sorting to detect when the user has clicked Pause (workflowStep === \'paused\') so you can halt gracefully at a safe boundary.\n\n' +
+        'Response shape: { workflowStep: \'idle\'|\'step-3\'|\'step-4\'|\'sorting\'|\'paused\'|\'polish\', scope, buckets:[{id, title, bookmarkFolderId, isSuggestion, isExisting, children}], reviewBucket, duplicateContext, confirmedAt, pushedAt }.\n\n' +
+        '- workflowStep=\'idle\': panel is closed (or has never been opened).\n' +
+        '- workflowStep=\'step-3\'|\'step-4\': user is still editing the bucket structure. Wait + ask the user to confirm in the popup before proceeding.\n' +
+        '- workflowStep=\'sorting\': user has confirmed. Begin apply_heuristic_organize + the LLM sift loop.\n' +
+        '- workflowStep=\'paused\': user clicked Pause. Stop the sift loop at the next safe boundary, summarize progress, and tell the user you\'re halted. They will click Reset (returns to step-3) or Resume (returns to sorting) in the popup.\n' +
+        '- workflowStep=\'polish\': sift has finished and complete_organize_sift has been called. The user can edit folders; the agent presents the polish menu.\n\n' +
+        'Each bucket\'s `bookmarkFolderId` is the chrome.bookmarks folder id where the agent should move items via move_node / bulk_apply. Use this as the targetId when bulk-moving matched items into a category.\n\n' +
+        'duplicateContext (Slice S2f, 2026-05-14): if find_duplicates was called for this scope, this field summarizes the cached scan: {setCount, totalInstances, scannedAt, scope, libraryId, scopeMatchesWorkflow}. When scopeMatchesWorkflow is true, the cached duplicate sets (with parentPaths) are usable as semantic signal during the LLM sift (Step 7) and reconcilable post-sift via resolve_duplicate_landings (Step 9). If null, no recent dedup scan exists for the active scope — call find_duplicates first if Step 2 of LARGE TREE ORGANIZATION applies.',
+      inputSchema: {
+        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const state = r.data.organizeState || null;
+      // S2d Phase 2: identify the Review bucket so the agent has a clear
+      // destination for low-confidence sift items. The popup auto-creates a
+      // `Review` system bucket at sorting kickoff; it's marked isReview:true
+      // in the buckets array.
+      const reviewBucket = state && Array.isArray(state.buckets)
+        ? state.buckets.find(b => b && b.isReview)
+        : null;
+
+      // Slice S2f (2026-05-14): summarize the cached duplicate scan if present.
+      // scopeMatchesWorkflow tells the agent whether the cached scan covers
+      // the active auto-organize scope (true → parentPaths are usable as
+      // Step 7 sift signal AND reconcilable via resolve_duplicate_landings).
+      const dupScan = r.data.lastDuplicateScan || null;
+      let duplicateContext = null;
+      if (dupScan) {
+        const workflowScope    = state ? state.scope     : null;
+        const workflowLibrary  = state ? state.libraryId : null;
+        const scopeMatchesWorkflow = !!state
+          && dupScan.scope === workflowScope
+          && (dupScan.libraryId || null) === (workflowLibrary || null);
+        duplicateContext = {
+          setCount:             dupScan.uniqueDuplicateUrls,
+          totalInstances:       dupScan.totalDuplicateInstances,
+          scannedAt:            dupScan.scannedAt,
+          scope:                dupScan.scope,
+          libraryId:            dupScan.libraryId,
+          scopeMatchesWorkflow,
+        };
+      }
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:           r.data.browserBrand,
+        browserId:         r.data.browserId,
+        workflowStep:      state ? state.workflowStep      : 'idle',
+        scope:             state ? state.scope             : null,
+        libraryId:         state ? state.libraryId         : null,
+        includeOtherRoots: state ? !!state.includeOtherRoots : false,
+        buckets:           state ? state.buckets           : [],
+        reviewBucket:      reviewBucket
+          ? { title: reviewBucket.title, bookmarkFolderId: reviewBucket.bookmarkFolderId }
+          : null,
+        duplicateContext,
+        confirmedAt:       state ? state.confirmedAt       : null,
+        pushedAt:           state ? state.pushedAt         : null,
+        note:         state
+          ? (state.includeOtherRoots
+              ? 'Scope is expanded: includes Bookmarks Bar + Other Bookmarks + Mobile Bookmarks. Sift loop should categorize items from all roots into the user\'s confirmed buckets. For items with confidence < 0.7 during the sift loop, route to reviewBucket.bookmarkFolderId instead of force-placing in a category.'
+              : 'Scope is limited to Bookmarks Bar (default). Other Bookmarks + Mobile Bookmarks are excluded — sift loop should skip items whose parentId traces back to those roots. For items with confidence < 0.7 during the sift loop, route to reviewBucket.bookmarkFolderId instead of force-placing in a category.')
+          : 'No workflow state cached yet. Call auto_organize_bookmarks first; the popup will push state when the user advances Step 4.',
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'record_observation',
+    {
+      description: 'Records a pattern observation during the auto-organize LLM sift loop (Step 7). Use this when you notice a cross-batch pattern that influences how you should categorize subsequent batches — e.g. "many cooking blogs without a clear domain pattern landing in the residue", "most arxiv.org links are physics not CS", "TikTok URLs are showing up despite no Social bucket". The bridge keeps a per-session log per browser; get_observations digests it for inclusion in your next batch prompt.\n\n' +
+        'Per-session log clears automatically when the workflow ends (workflowStep → \'idle\'). Cap of ' + MAX_OBSERVATIONS_PER_SESSION + ' observations per session — beyond that, oldest entries are evicted FIFO.\n\n' +
+        'Best practice: keep pattern strings short (under 200 chars), include 2-3 examples (titles or URLs), and reference the batch number when known. The agent loops over batches; the observation log is your cross-batch memory.',
+      inputSchema: {
+        pattern:    z.string().min(1).max(500).describe('The observed pattern (e.g., "Cooking blogs landing in residue without a Recipes-style domain", "X.com URLs splitting between users and posts").'),
+        count:      z.number().int().min(1).max(100000).optional().describe('Estimated count of items matching this pattern in the current batch. Optional.'),
+        examples:   z.array(z.string()).max(5).optional().describe('Up to 5 illustrative titles or URLs. Optional.'),
+        batch_n:    z.number().int().min(0).optional().describe('Which sift batch this observation came from (0-indexed). Optional but helpful for cross-batch tracking.'),
+        browser:    z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ pattern, count, examples, batch_n, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const browserId = r.data.browserId;
+      let log_ = _organizeObservationLog.get(browserId);
+      if (!log_) {
+        log_ = [];
+        _organizeObservationLog.set(browserId, log_);
+      }
+      log_.push({
+        pattern,
+        count:      Number.isFinite(count) ? count : null,
+        examples:   Array.isArray(examples) ? examples.slice(0, 5).map(s => String(s)) : [],
+        batch_n:    Number.isFinite(batch_n) ? batch_n : null,
+        recordedAt: Date.now(),
+      });
+      // FIFO evict if over cap.
+      while (log_.length > MAX_OBSERVATIONS_PER_SESSION) log_.shift();
+      return { content: [{ type: 'text', text: JSON.stringify({
+        ok:                true,
+        browser:           r.data.browserBrand,
+        browserId,
+        session_count:     log_.length,
+        cap:               MAX_OBSERVATIONS_PER_SESSION,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'get_observations',
+    {
+      description: 'Returns the auto-organize sift-loop observation log for the current session. Use this between batches to inject prior observations into the next batch prompt — the agent\'s cross-batch memory. Empty when no observations have been recorded (or when the workflow just transitioned to \'idle\' and the log was cleared).\n\n' +
+        'Response shape: {observations: [{pattern, count, examples, batch_n, recordedAt}], total, cap}. Observations are returned in insertion order (oldest first). For prompts, consider summarizing into 1-2 sentences per observation; the raw log can be hundreds of tokens at the cap of ' + MAX_OBSERVATIONS_PER_SESSION + '.',
+      inputSchema: {
+        filter_pattern: z.string().optional().describe('Optional case-insensitive substring filter on the pattern field. Returns only matching observations.'),
+        batch_n_min:    z.number().int().min(0).optional().describe('Optional lower bound (inclusive) on batch_n. Useful for "show me observations since batch N".'),
+        browser:        z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+    },
+    async ({ filter_pattern, batch_n_min, browser }) => {
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+      const log_ = _organizeObservationLog.get(r.data.browserId) || [];
+      let observations = log_;
+      if (filter_pattern && typeof filter_pattern === 'string') {
+        const flc = filter_pattern.toLowerCase();
+        observations = observations.filter(o => o.pattern.toLowerCase().includes(flc));
+      }
+      if (Number.isFinite(batch_n_min)) {
+        observations = observations.filter(o => Number.isFinite(o.batch_n) && o.batch_n >= batch_n_min);
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:       r.data.browserBrand,
+        browserId:     r.data.browserId,
+        observations,
+        total:         observations.length,
+        session_total: log_.length,
+        cap:           MAX_OBSERVATIONS_PER_SESSION,
       }) }] };
     }
   );
