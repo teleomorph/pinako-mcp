@@ -818,19 +818,43 @@ function _dispatchAgentCommandViaSse(payload, browserId) {
 //  - bridge hasn't seen its local extension yet → nmWrite anyway (best
 //    effort during the SW handshake window)
 //  - target cached but no forwarder bound → fail clean
+//
+// Observability (2026-05-14): every routing decision logs to the bridge log.
+// Triage table for the disk log line:
+//   route=NM-leader-local ok=true   → message reached leader's SW. Downstream
+//                                     bug is on SW or popup side.
+//   route=NM-leader-local ok=false  → leader's nmWrite failed (stdout broken,
+//                                     bridge about to exit / has exited).
+//   route=SSE-forwarder ok=true     → SSE write succeeded; forwarder should
+//                                     relay to its SW. Downstream bug if
+//                                     panel still doesn't open.
+//   route=SSE-forwarder ok=false    → SSE write failed (forwarder dropped
+//                                     mid-flight, etc.); reason field tells
+//                                     why.
+//   route=NM-leader-bootstrap       → localBrowserId not set yet (SW
+//                                     handshake in flight); best-effort
+//                                     nmWrite anyway.
+//   route=NONE FORWARDER_NOT_CONNECTED → target is cached but neither leader
+//                                     nor forwarder; popup likely closed.
 function _routeAgentCommand(payload, browserId) {
+  const idShort = (browserId || '').slice(0, 16);
+  const cmd = payload && payload.command ? payload.command : '?';
   if (localBrowserId && browserId === localBrowserId) {
     const ok = nmWrite(payload);
+    log(`agentCommand route=NM-leader-local cmd=${cmd} browserId=${idShort}… ok=${ok}`);
     return { ok, channel: 'nm-leader-local' };
   }
   if (forwarders.has(browserId)) {
     const r = _dispatchAgentCommandViaSse(payload, browserId);
+    log(`agentCommand route=SSE-forwarder cmd=${cmd} browserId=${idShort}… ok=${r.ok}${r.reason ? ' reason=' + r.reason : ''}`);
     return { ok: r.ok, channel: 'sse-forwarder', reason: r.reason };
   }
   if (!localBrowserId) {
     const ok = nmWrite(payload);
+    log(`agentCommand route=NM-leader-bootstrap cmd=${cmd} ok=${ok} (localBrowserId not set yet — SW handshake in flight)`);
     return { ok, channel: 'nm-leader-bootstrap' };
   }
+  log(`agentCommand route=NONE cmd=${cmd} browserId=${idShort}… reason=FORWARDER_NOT_CONNECTED (target ≠ leader and no forwarder bound — popup likely closed in target browser)`);
   return { ok: false, channel: 'none', reason: 'FORWARDER_NOT_CONNECTED' };
 }
 
