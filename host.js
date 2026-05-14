@@ -775,6 +775,65 @@ function _dropForwarder(browserId, reason) {
   }
 }
 
+// ─── S2g #2 (2026-05-14): agent-command routing for forwarder targets ────────
+// Panel-launch tools (auto_organize_bookmarks, complete_organize_sort) deliver
+// their popup-launch / state-transition signals via the bridge → SW NM channel
+// using a {type:'enqueueAgentCommand', ...} message. The SW writes the payload
+// to chrome.storage.local._pinako_pending_agent_command, the popup picks it up
+// via chrome.storage.onChanged.
+//
+// On the leader, nmWrite reaches the leader's SW directly. On a forwarder
+// target (target browserId !== localBrowserId), nmWrite still reaches the
+// LEADER's SW — wrong browser; the targeted forwarder's SW never sees the
+// command. Bug documented as auto-organize-plan.md Sub-slice S2g #2.
+//
+// Mirror Slice 2B's dispatchEditViaSse pattern: route via the existing /edits
+// SSE channel when target ≠ local browser. The forwarder-side _handleSseEvent
+// (below) relays the inbound SSE event to its own SW via nmWrite (same shape
+// the leader uses). The SW's enqueueAgentCommand handler is identical
+// regardless of whether the bridge is leader or forwarder.
+//
+// Fire-and-forget, unlike applyEdit. Agent commands have no response-required
+// semantic — the popup either renders the panel or doesn't; there's no
+// editApplied / editFailed reply path to wait on. So no requestId tracking on
+// the leader side beyond what's already in the payload for observability.
+function _dispatchAgentCommandViaSse(payload, browserId) {
+  const forwarder = forwarders.get(browserId);
+  if (!forwarder) {
+    return { ok: false, reason: 'FORWARDER_NOT_CONNECTED' };
+  }
+  try {
+    forwarder.sseRes.write(`event: agentCommand\ndata: ${JSON.stringify(payload)}\n\n`);
+    return { ok: true };
+  } catch (err) {
+    log(`dispatchAgentCommandViaSse SSE write failed: ${err.message}`);
+    return { ok: false, reason: 'SSE_WRITE_FAILED', message: err.message };
+  }
+}
+
+// Route an enqueueAgentCommand payload to the SW that hosts the targeted
+// browser:
+//  - target === local browser  → nmWrite (current path; reaches local SW)
+//  - target is a connected forwarder → SSE event to that forwarder bridge
+//  - bridge hasn't seen its local extension yet → nmWrite anyway (best
+//    effort during the SW handshake window)
+//  - target cached but no forwarder bound → fail clean
+function _routeAgentCommand(payload, browserId) {
+  if (localBrowserId && browserId === localBrowserId) {
+    const ok = nmWrite(payload);
+    return { ok, channel: 'nm-leader-local' };
+  }
+  if (forwarders.has(browserId)) {
+    const r = _dispatchAgentCommandViaSse(payload, browserId);
+    return { ok: r.ok, channel: 'sse-forwarder', reason: r.reason };
+  }
+  if (!localBrowserId) {
+    const ok = nmWrite(payload);
+    return { ok, channel: 'nm-leader-bootstrap' };
+  }
+  return { ok: false, channel: 'none', reason: 'FORWARDER_NOT_CONNECTED' };
+}
+
 // ─── Phase 2 Slice B: SSE client (forwarder-side) ─────────────────────────────
 // When this process is in forwarder mode (EADDRINUSE → forwardToExisting set),
 // it opens a long-running GET /edits?browserId=X to the leader. The leader
@@ -859,6 +918,22 @@ function _handleSseEvent(eventText) {
     else if (line.startsWith('data: ')) dataParts.push(line.slice(6));
   }
   if (eventName === 'ready') return;
+  // S2g #2 (2026-05-14): agent-command relay. Leader bridge SSE-writes
+  // {type:'enqueueAgentCommand', ...} payloads when the targeted browser is
+  // not the leader's local browser. Forwarder relays the same shape to its
+  // own SW via nmWrite — identical to what the leader does for its own SW.
+  // Fire-and-forget; no reply path to /edit-result.
+  if (eventName === 'agentCommand') {
+    let data;
+    try { data = JSON.parse(dataParts.join('\n')); }
+    catch (e) { log(`SSE: bad agentCommand data: ${e.message}`); return; }
+    const { command, browserId } = data || {};
+    if (!command) { log('SSE: agentCommand missing command field'); return; }
+    log(`SSE agentCommand command=${command} for browserId=${(browserId||'').slice(0,16)}…`);
+    const ok = nmWrite(data);
+    if (!ok) log(`SSE agentCommand nmWrite to forwarder SW failed for command=${command}`);
+    return;
+  }
   if (eventName !== 'applyEdit') {
     if (eventName) log(`SSE: ignoring unknown event ${eventName}`);
     return;
@@ -2926,7 +3001,7 @@ function createMcpServer() {
         '  - Scans the user\'s bookmarks against the default heuristic rule library (165 rules across 26 categories) — DIAGNOSTIC ONLY at this stage. The matched-categories list tells you how many items the rules could auto-place IF the user accepts the suggested categories in Step 4.\n' +
         '  - Computes suggested category folders for the residue (domain-frequency + path-token patterns).\n' +
         '  - Opens the auto-organize panel in the Pinako popup. The panel shows the user\'s EXISTING bookmark folder structure as the starting point — NOT the heuristic categories. The heuristic-suggested categories are overlaid in Step 4 as proposed additions (with a ✨ suggested tag) after the user reviews their existing folders.\n\n' +
-        'Response shape: {totals:{scanned, matched, unmatched, rulesApplied}, matched:[{ruleId, target, count, sampleTitles}], suggestions:[{target, count, basis, sampleTitles}], panelLaunch:{ok, channel:\'storage-local\', requestId}}.\n\n' +
+        'Response shape: {totals:{scanned, matched, unmatched, rulesApplied}, matched:[{ruleId, target, count, sampleTitles}], suggestions:[{target, count, basis, sampleTitles}], panelLaunch:{ok, channel:\'storage-local\', routedVia:\'nm-leader-local\'|\'sse-forwarder\'|\'nm-leader-bootstrap\'|\'none\', requestId, note}}. panelLaunch.ok:false means the panel-launch signal didn\'t reach the targeted browser\'s SW — surface panelLaunch.note to the user (it explains the most likely cause: forwarder popup not open, etc.) and do NOT proceed to Step 6 polling until the user has reopened the popup and the call succeeds on retry.\n\n' +
         'IMPORTANT — how to frame the response in chat:\n' +
         '  Do NOT present the matched-categories list as "the structure your bookmarks will use" — that misframes the workflow. The user\'s EXISTING folders are the starting point; the heuristic suggestions are ADDITIONS they choose to accept in Step 4.\n' +
         '  GOOD framing: "I\'ve opened the auto-organize panel in your Pinako popup. You\'ll see your existing folder structure — review it, trim what you don\'t want, add new folders if you like, then click Continue. I\'ll then propose [N] additional category folders for [M] bookmarks the rules could auto-place (Video, Music, Social, etc.) — you can accept, rename, or reject each one. Once you click Confirm & start sift, I\'ll sort the [R] remaining items into your buckets."\n' +
@@ -2984,8 +3059,12 @@ function createMcpServer() {
       // listener picks it up live (and a startup-check reads it on next
       // popup open if the popup was closed). No round-trip wait;
       // pendingCommand is fire-and-forget.
+      //
+      // S2g #2 (2026-05-14): _routeAgentCommand picks NM (target=leader) vs
+      // SSE (target=forwarder) so the message reaches the SW that owns the
+      // targeted browser, not just the leader's local SW.
       const requestId = randomBytes(8).toString('hex');
-      const ok = nmWrite({
+      const command = {
         type:      'enqueueAgentCommand',
         command:   'openAutoOrganize',
         scope,
@@ -2993,7 +3072,8 @@ function createMcpServer() {
         browserId: r.data.browserId,
         requestId,
         sentAt:    Date.now(),
-      });
+      };
+      const route = _routeAgentCommand(command, r.data.browserId);
 
       return { content: [{ type: 'text', text: JSON.stringify({
         browser:   r.data.browserBrand,
@@ -3008,12 +3088,19 @@ function createMcpServer() {
         matched:    matchedSummary,
         suggestions,
         panelLaunch: {
-          ok,
+          ok:        route.ok,
           channel:   'storage-local',
+          routedVia: route.channel,
           requestId,
-          note: ok
-            ? 'Pending-command record sent to the popup. If the popup is open, the panel launches immediately. Otherwise it launches on next popup open (within 60s of this tool call).'
-            : 'NM bridge could not send the command (extension may be disconnected). Tell the user to open the Pinako popup, then retry.',
+          note: route.ok
+            ? (route.channel === 'sse-forwarder'
+                ? `Pending-command record SSE-routed to the forwarder bridge for ${r.data.browserBrand}; the forwarder relayed it to its SW. If the popup is open, the panel launches immediately. Otherwise it launches on next popup open (within 60s of this tool call).`
+                : 'Pending-command record sent to the popup. If the popup is open, the panel launches immediately. Otherwise it launches on next popup open (within 60s of this tool call).')
+            : (route.reason === 'FORWARDER_NOT_CONNECTED'
+                ? `Targeted browser ${r.data.browserBrand} has a cache entry but no active forwarder bridge — its Pinako popup may not be open. Tell the user to open the popup in ${r.data.browserBrand}, then retry.`
+                : (route.reason === 'SSE_WRITE_FAILED'
+                    ? `SSE write to the ${r.data.browserBrand} forwarder bridge failed mid-flight. The forwarder may have just disconnected. Tell the user to open the popup in ${r.data.browserBrand} and retry.`
+                    : 'Bridge could not deliver the command (extension may be disconnected). Tell the user to open the Pinako popup, then retry.')),
         },
         updatedAt: r.data.updatedAt,
       }) }] };
@@ -3609,6 +3696,7 @@ function createMcpServer() {
       description: 'Auto-organize bookmarks: transition the workflow from sorting (Steps 6-9) into the polish phase (Step 10). Call this AFTER you have completed the LLM batch sort loop (Step 7) and the outlier-pull refinement pass (Step 8 via refine_folder_outliers across all populated buckets). The popup\'s auto-organize panel switches from the read-only sorting view to the editable polish view where the user can add / rename / drag / delete-empty buckets while you drive the polish menu in chat.\n\n' +
         'Workflow gating: state.workflowStep must be \'sorting\' (the agent has been actively sifting) or \'paused\' (user halted mid-sift; agent finished after Resume). Other states return ORGANIZE_STATE_NOT_READY.\n\n' +
         'Delivery model: the bridge writes a pending-command record to the extension\'s chrome.storage.local (mirrors auto_organize_bookmarks from S2b). The popup picks it up live via chrome.storage.onChanged and transitions to polish state. Fire-and-forget — the tool returns a delivery receipt, not a guarantee that the user has seen the transition. Within ~200ms typically.\n\n' +
+        'Response shape: {ok, browser, browserId, deliveryChannel:\'storage-local\', routedVia:\'nm-leader-local\'|\'sse-forwarder\'|\'nm-leader-bootstrap\'|\'none\', requestId, note}. ok:false means the transition signal didn\'t reach the targeted browser\'s SW — surface note to the user (it explains the most likely cause: target browser\'s popup not open, etc.). Do NOT call summarize_organize_results until ok:true on retry.\n\n' +
         'After calling this, immediately call summarize_organize_results for the post-sort summary, then present the polish menu options to the user in chat: review the Review folder, suggest sub-folders for a high-count bucket, add corrections, or done.',
       inputSchema: {
         summary: z.string().max(500).optional().describe('Optional one-line agent-side summary of what was sorted. Forwarded to the popup for future UI polish (not displayed in v1).'),
@@ -3630,24 +3718,35 @@ function createMcpServer() {
           workflowStep: state.workflowStep,
         }) }], isError: true };
       }
+      // S2g #2 (2026-05-14): _routeAgentCommand picks NM (target=leader) vs
+      // SSE (target=forwarder) so the transition signal reaches the SW that
+      // owns the targeted browser, not just the leader's local SW.
       const requestId = randomBytes(8).toString('hex');
-      const ok = nmWrite({
+      const command = {
         type:      'enqueueAgentCommand',
         command:   'transitionToPolish',
         browserId: r.data.browserId,
         summary:   typeof summary === 'string' ? summary : null,
         requestId,
         sentAt:    Date.now(),
-      });
+      };
+      const route = _routeAgentCommand(command, r.data.browserId);
       return { content: [{ type: 'text', text: JSON.stringify({
-        ok,
-        browser:    r.data.browserBrand,
-        browserId:  r.data.browserId,
+        ok:              route.ok,
+        browser:         r.data.browserBrand,
+        browserId:       r.data.browserId,
         deliveryChannel: 'storage-local',
+        routedVia:       route.channel,
         requestId,
-        note: ok
-          ? 'Transition command sent. The popup will switch to polish state within a few hundred ms. Next: call summarize_organize_results and present the polish menu to the user.'
-          : 'Bridge could not send the command (extension may be disconnected). Tell the user to open the Pinako popup, then retry.',
+        note: route.ok
+          ? (route.channel === 'sse-forwarder'
+              ? `Transition command SSE-routed to the ${r.data.browserBrand} forwarder bridge; popup will switch to polish state within a few hundred ms. Next: call summarize_organize_results and present the polish menu to the user.`
+              : 'Transition command sent. The popup will switch to polish state within a few hundred ms. Next: call summarize_organize_results and present the polish menu to the user.')
+          : (route.reason === 'FORWARDER_NOT_CONNECTED'
+              ? `Targeted browser ${r.data.browserBrand} has a cache entry but no active forwarder bridge — its Pinako popup may not be open. Tell the user to open the popup in ${r.data.browserBrand}, then retry.`
+              : (route.reason === 'SSE_WRITE_FAILED'
+                  ? `SSE write to the ${r.data.browserBrand} forwarder bridge failed mid-flight. The forwarder may have just disconnected. Tell the user to open the popup in ${r.data.browserBrand} and retry.`
+                  : 'Bridge could not send the command (extension may be disconnected). Tell the user to open the Pinako popup, then retry.')),
         updatedAt: r.data.updatedAt,
       }) }] };
     }
