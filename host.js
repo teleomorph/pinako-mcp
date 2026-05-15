@@ -150,14 +150,20 @@ const MAX_OBSERVATIONS_PER_SESSION = 100;
 
 // 2026-05-15: long-poll waiters for get_organize_state(wait_for_step:...).
 // The agent registers a waiter when it needs to block until the user clicks
-// Confirm / Pause / Resume / Reset in the auto-organize panel. Server-side
-// wait beats client-side polling for three reasons: no token cost from
-// chained tool calls, no need for the model to "remember" to poll, and a
+// Confirm / Pause / Resume / Reset / Done in the auto-organize panel.
+// Server-side wait beats client-side polling for three reasons: no token cost
+// from chained tool calls, no need for the model to "remember" to poll, and a
 // state change wakes the agent within milliseconds instead of polling
 // cadence. Fired from both organize-state mutation paths (NM handler +
 // HTTP /organize-state-update relay).
 //
-// Map<browserId, Set<{ resolve, timer, targetStep }>>
+// S2i (2026-05-15): waiters now hold targetSteps as an ARRAY (one waiter can
+// wake on any of several states). Generalizes the Confirm-gate wake-up to
+// also cover Pause -> Resume / Reset, Reset -> re-Confirm, and Polish ->
+// Done transitions in a single long-poll per gate. Single-step callers pass
+// a string, which the handler normalizes to a one-element array.
+//
+// Map<browserId, Set<{ resolve, timer, targetSteps }>>
 const _organizeStateWaiters = new Map();
 const ORGANIZE_WAIT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -166,10 +172,10 @@ function _fireOrganizeStateWaiters(browserId, currentStep) {
   if (!waiters) return;
   let fired = 0;
   for (const w of [...waiters]) {
-    if (w.targetStep === currentStep || w.targetStep === 'any') {
+    if (Array.isArray(w.targetSteps) && w.targetSteps.includes(currentStep)) {
       clearTimeout(w.timer);
       waiters.delete(w);
-      w.resolve({ matched: true, workflowStep: currentStep });
+      w.resolve({ matched: true, workflowStep: currentStep, targetSteps: w.targetSteps });
       fired++;
     }
   }
@@ -2379,7 +2385,10 @@ WORKFLOW STEPS (12-step, condensed)
     send bulk_apply with move_node ops for the categorized items (chunked at 100), scope:'bookmarks'
     cursor = batch.nextCursor
 
-  BETWEEN BATCHES: call get_organize_state to check workflowStep. If it's 'paused', stop the loop, tell the user in chat ("Paused. Click Resume in the popup when you want me to continue, or Reset to return to setup."), and wait.
+  BETWEEN BATCHES: call get_organize_state to check workflowStep. If it's 'paused', stop the loop, tell the user in chat ("Paused. Click Resume in the popup when you want me to continue, or Reset to return to setup."), then IMMEDIATELY call get_organize_state({wait_for_step:['sorting','step-3'], browser}). This is a multi-target long-poll (S2i, 2026-05-15): the bridge holds the call open until the user picks Resume (workflowStep -> 'sorting') OR Reset (workflowStep -> 'step-3'), whichever comes first.
+    • If the wake returns workflowStep === 'sorting': resume the sift loop from the current cursor (no work redo).
+    • If the wake returns workflowStep === 'step-3': the user is re-editing their bucket structure. state.buckets is invalidated. Wait for them to re-Confirm by calling get_organize_state({wait_for_step:'sorting', browser}) again. After that wake, restart the sift loop from cursor:null — the rule set and buckets may have changed, so already-categorized items need a fresh pass.
+  Do NOT chat-prompt the user to "tell me when you're ready" — the wait is server-side, the user clicks the button, the bridge wakes you.
 
   USE THE OBSERVATION LOG. As you notice cross-batch patterns ("many cooking blogs without a clear domain", "tiktok.com URLs splitting between users and posts"), call record_observation({pattern, count, examples, batch_n}) to persist it. Before each next batch, call get_observations and include the digest in your categorization reasoning — cross-batch memory.
 
@@ -2421,6 +2430,8 @@ WORKFLOW STEPS (12-step, condensed)
       - Resolve divergent duplicate sets → use divergedSets[] from the resolve_duplicate_landings response. Walk the user through each set: show the URL, the sample title, and each instance's currentBucketTitle + originalParentPath. Ask: "[URL Title]: copies landed in [Music, Programming]; original folders were [Gift ideas for mom, March 2022]. Keep all, consolidate to Music (delete Programming copy), or consolidate to Programming?" Apply the user's choice via bulk_apply (delete_node for consolidations, no-op for keep-all). Loop through each diverged set.
       - Suggest sub-folders → call propose_subcategories({folder_id: bucket.bookmarkFolderId}) for the bucket the user named. Returns sub-category proposals (domain-frequency + path-token, scoped to that folder's contents). Present to user. On accept: create each sub-folder via create_folder({scope:'bookmarks', parentId:folder_id, title:suggestion.target}), then bulk_apply move_node ops to relocate matching items. Recursion depth bounded to 3 — track depth client-side; don't sub-categorize a sub-folder of a sub-folder.
       - Make corrections → if the user names a specific misplacement, use bulk_apply move_node directly; if they want new buckets, Pause → Reset → re-Confirm
+
+    POLISH EXIT DETECTION (S2i, 2026-05-15): the user may click Done in the panel without sending a chat message. Workflow transitions to 'idle'. To wake on this without polling, optionally end each polish-menu turn with get_organize_state({wait_for_step:'idle', browser}). The wait resolves when the user clicks Done (or chats — but then your next tool call would re-check anyway). On wake with workflowStep === 'idle', wrap up with a closing message and stop the menu loop. If you prefer to keep the conversation chat-driven, skip the wait and let the user signal Done in chat; the explicit wait is a polish optimization, not a requirement.
       - Done → tell the user the workflow is complete. They click Done in the popup panel to close it (which pushes workflowStep:'idle' to clear bridge state).
 
 SCOPE
@@ -4036,13 +4047,23 @@ function createMcpServer() {
         '- workflowStep=\'sorting\': user has confirmed. Begin apply_heuristic_organize + the LLM sift loop.\n' +
         '- workflowStep=\'paused\': user clicked Pause. Stop the sift loop at the next safe boundary, summarize progress, and tell the user you\'re halted. They will click Reset (returns to step-3) or Resume (returns to sorting) in the popup.\n' +
         '- workflowStep=\'polish\': sift has finished and complete_organize_sort has been called. The user can edit folders; the agent presents the polish menu.\n\n' +
-        'wait_for_step (2026-05-15): server-side long-poll. Pass the target step (e.g. \'sorting\') and the bridge will block this tool call until the user transitions the workflow to that step in the popup, then return immediately with the fresh state. The wait times out after 5 minutes — on timeout the tool returns the current state with waitResult.timedOut:true so you can ask the user what to do. ALWAYS prefer this over chained polling: it costs one tool call instead of dozens, wakes within milliseconds of the state change, and removes the need to remember to keep checking. Specifically: right after auto_organize_bookmarks, call get_organize_state({wait_for_step:\'sorting\', browser}); the call returns the moment the user clicks Confirm in the popup. Between sift batches, call with wait_for_step:\'paused\' to wake on user Pause — but if the agent is mid-batch and needs to drive the loop forward, call without wait_for_step for a non-blocking check.\n\n' +
+        'wait_for_step (2026-05-15): server-side long-poll. Pass the target step (or an array of acceptable steps) and the bridge will block this tool call until the user transitions the workflow to one of those steps in the popup, then return immediately with the fresh state. The wait times out after 5 minutes — on timeout the tool returns the current state with waitResult.timedOut:true so you can ask the user what to do. ALWAYS prefer this over chained polling: it costs one tool call instead of dozens, wakes within milliseconds of the state change, and removes the need to remember to keep checking.\n\n' +
+        '  Single-target patterns:\n' +
+        '    • Right after auto_organize_bookmarks: wait_for_step:\'sorting\' — wakes when user clicks Confirm.\n' +
+        '    • After complete_organize_sort: wait_for_step:\'idle\' (optional) — wakes if user closes the panel.\n\n' +
+        '  Multi-target patterns (S2i, 2026-05-15) — pass an array. Useful when the user has more than one valid next move:\n' +
+        '    • Mid-sift Pause → user picks Reset (state-3) or Resume (sorting): wait_for_step:[\'sorting\',\'step-3\']. Whichever button they click wakes the agent.\n' +
+        '    • Reset → re-Confirm cycle: after waking on \'step-3\', call again with wait_for_step:\'sorting\' to wake when the user re-confirms with their edited structure.\n\n' +
+        '  Non-blocking variant: call without wait_for_step for a snapshot read (e.g. mid-batch check while the agent is actively driving the sift loop).\n\n' +
         'Each bucket\'s `bookmarkFolderId` is the chrome.bookmarks folder id where the agent should move items via move_node / bulk_apply. Use this as the targetId when bulk-moving matched items into a category.\n\n' +
         'duplicateContext (Slice S2f, 2026-05-14): if find_duplicates was called for this scope, this field summarizes the cached scan: {setCount, totalInstances, scannedAt, scope, libraryId, scopeMatchesWorkflow}. When scopeMatchesWorkflow is true, the cached duplicate sets (with parentPaths) are usable as semantic signal during the LLM sift (Step 8) and reconcilable post-sift via resolve_duplicate_landings (Step 10). If null, no recent dedup scan exists for the active scope — call find_duplicates first if Step 2 of LARGE TREE ORGANIZATION applies.',
       inputSchema: {
         browser:       z.string().optional().describe(BROWSER_ARG_DESC),
-        wait_for_step: z.enum(['step-3','step-4','sorting','paused','polish','idle']).optional()
-          .describe('Long-poll: block this call until workflowStep matches the given value, then return. Returns immediately if already at the target step. Times out after 5 minutes with waitResult.timedOut:true. Use \'sorting\' right after auto_organize_bookmarks to wake on user Confirm without polling.'),
+        wait_for_step: z.union([
+          z.enum(['step-3','step-4','sorting','paused','polish','idle']),
+          z.array(z.enum(['step-3','step-4','sorting','paused','polish','idle'])).min(1).max(6),
+        ]).optional()
+          .describe('Long-poll: block this call until workflowStep matches the given value (string) or ANY of the values in the array. Returns immediately if already at a target step. Times out after 5 minutes with waitResult.timedOut:true. Use \'sorting\' right after auto_organize_bookmarks to wake on user Confirm; use [\'sorting\',\'step-3\'] mid-sift to wake on Pause -> Resume OR Pause -> Reset without two separate calls.'),
       },
       annotations: TOOL_ANNOTATIONS.get_organize_state,
     },
@@ -4052,14 +4073,22 @@ function createMcpServer() {
       let state = r.data.organizeState || null;
       let waitResult = null;
 
-      // 2026-05-15: server-side long-poll. If the agent asked to block on a
-      // specific workflowStep and we're not already there, register a waiter
+      // 2026-05-15 (S2h): server-side long-poll. If the agent asked to block on
+      // a specific workflowStep and we're not already there, register a waiter
       // and await the next organize-state mutation that matches. Fired by
       // _fireOrganizeStateWaiters from both the NM and HTTP /update relay
       // paths, so the wake-up arrives regardless of leader/forwarder topology.
-      if (wait_for_step && (!state || state.workflowStep !== wait_for_step)) {
-        const targetStep = wait_for_step;
+      //
+      // S2i (2026-05-15): wait_for_step accepts an array of acceptable steps.
+      // Normalize to array so the rest of the logic is uniform.
+      const targetSteps = wait_for_step
+        ? (Array.isArray(wait_for_step) ? wait_for_step : [wait_for_step])
+        : null;
+      const currentStep = state ? state.workflowStep : null;
+      const needsWait = targetSteps && (!currentStep || !targetSteps.includes(currentStep));
+      if (needsWait) {
         const browserId = r.data.browserId;
+        const targetLabel = targetSteps.join(',');
         waitResult = await new Promise((resolve) => {
           let thisWaiter;
           const timer = setTimeout(() => {
@@ -4068,14 +4097,14 @@ function createMcpServer() {
               set.delete(thisWaiter);
               if (set.size === 0) _organizeStateWaiters.delete(browserId);
             }
-            log(`organizeStateWaiter TIMEOUT browserId=${(browserId||'').slice(0,16)}… target=${targetStep}`);
-            resolve({ matched: false, timedOut: true, targetStep });
+            log(`organizeStateWaiter TIMEOUT browserId=${(browserId||'').slice(0,16)}… target=${targetLabel}`);
+            resolve({ matched: false, timedOut: true, targetSteps });
           }, ORGANIZE_WAIT_TIMEOUT_MS);
-          thisWaiter = { resolve, timer, targetStep };
+          thisWaiter = { resolve, timer, targetSteps };
           const set = _organizeStateWaiters.get(browserId) || new Set();
           set.add(thisWaiter);
           _organizeStateWaiters.set(browserId, set);
-          log(`organizeStateWaiter REGISTERED browserId=${(browserId||'').slice(0,16)}… target=${targetStep} pending=${set.size}`);
+          log(`organizeStateWaiter REGISTERED browserId=${(browserId||'').slice(0,16)}… target=${targetLabel} pending=${set.size}`);
         });
         // Re-read state — the wake-up means the mutation handler ran, so
         // cachedData[browserId].organizeState is fresh.
