@@ -148,6 +148,35 @@ const cachedData = new Map();
 const _organizeObservationLog = new Map();
 const MAX_OBSERVATIONS_PER_SESSION = 100;
 
+// 2026-05-15: long-poll waiters for get_organize_state(wait_for_step:...).
+// The agent registers a waiter when it needs to block until the user clicks
+// Confirm / Pause / Resume / Reset in the auto-organize panel. Server-side
+// wait beats client-side polling for three reasons: no token cost from
+// chained tool calls, no need for the model to "remember" to poll, and a
+// state change wakes the agent within milliseconds instead of polling
+// cadence. Fired from both organize-state mutation paths (NM handler +
+// HTTP /organize-state-update relay).
+//
+// Map<browserId, Set<{ resolve, timer, targetStep }>>
+const _organizeStateWaiters = new Map();
+const ORGANIZE_WAIT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+function _fireOrganizeStateWaiters(browserId, currentStep) {
+  const waiters = _organizeStateWaiters.get(browserId);
+  if (!waiters) return;
+  let fired = 0;
+  for (const w of [...waiters]) {
+    if (w.targetStep === currentStep || w.targetStep === 'any') {
+      clearTimeout(w.timer);
+      waiters.delete(w);
+      w.resolve({ matched: true, workflowStep: currentStep });
+      fired++;
+    }
+  }
+  if (waiters.size === 0) _organizeStateWaiters.delete(browserId);
+  if (fired > 0) log(`organizeStateWaiters fired ${fired} for browserId=${(browserId||'').slice(0,16)}… step=${currentStep}`);
+}
+
 let extensionConnected = false;
 let shutdownTimer = null;
 let forwardToExisting = null; // set on EADDRINUSE — forward data to old instance then exit
@@ -562,6 +591,18 @@ function handleNmMessage(msg) {
     //      between batches and halts gracefully.
     const browserId = msg.browserId;
     if (!browserId) return;
+    // 2026-05-15 multi-browser fix: in forwarder mode, the cache MCP tools
+    // serve from is the LEADER's, not ours. Relay this push so the leader's
+    // cachedData reflects the panel state. Without it, get_organize_state on
+    // the leader returns 'idle' indefinitely for forwarder-side browsers and
+    // the agent's Step 6 poll stalls forever (Confirm in the popup never
+    // surfaces to the agent). Symmetric to the treeUpdate forwarder branch
+    // above. The forwarder's own cachedData is unused for MCP serving, so
+    // we don't populate it here.
+    if (forwardToExisting) {
+      _postOrganizeStateToLeader(msg);
+      return;
+    }
     const prior = cachedData.get(browserId) || {};
     const payload = msg.payload && typeof msg.payload === 'object' ? msg.payload : {};
     prior.organizeState = {
@@ -583,6 +624,9 @@ function handleNmMessage(msg) {
     }
     cachedData.set(browserId, prior);
     log(`organizeStateUpdate from ${msg.browserBrand || 'unknown'}: workflowStep=${prior.organizeState.workflowStep} buckets=${prior.organizeState.buckets.length}`);
+    // 2026-05-15: wake any get_organize_state(wait_for_step:...) calls
+    // blocked on this browser's state transitioning to the new step.
+    _fireOrganizeStateWaiters(browserId, prior.organizeState.workflowStep);
   }
 }
 
@@ -995,6 +1039,30 @@ function _postEditResultToLeader(msg) {
     (res) => { res.resume(); }
   );
   req.on('error', (err) => { log(`/edit-result post error: ${err.message}`); });
+  req.write(body);
+  req.end();
+}
+
+// 2026-05-15 multi-browser fix: forwarder → leader relay for auto-organize
+// workflow state. Mirrors _postEditResultToLeader but for organizeStateUpdate
+// NM messages. The leader serves MCP requests and reads organizeState from
+// its own cachedData — a forwarder caching locally is invisible to MCP
+// callers. Token-bound the same way /edit-result is.
+function _postOrganizeStateToLeader(msg) {
+  const body = JSON.stringify({
+    browserId:      msg.browserId,
+    browserBrand:   msg.browserBrand,
+    userTier:       msg.userTier,
+    userId:         msg.userId,
+    payload:        msg.payload,
+    forwarderToken: _myForwarderToken,
+  });
+  const req = http.request(
+    { hostname: '127.0.0.1', port: MCP_PORT, path: '/organize-state-update', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+    (res) => { res.resume(); }
+  );
+  req.on('error', (err) => { log(`/organize-state-update post error: ${err.message}`); });
   req.write(body);
   req.end();
 }
@@ -2272,9 +2340,21 @@ WORKFLOW STEPS (12-step, condensed)
 
   After the call, tell the user the auto-organize panel is opening in the Pinako popup. Tell them to review their existing folder structure, trim or add as needed, click "Continue" to see the heuristic suggestion overlay, and click "Confirm & start sift" when ready. Do NOT call this tool more than once per session.
 
-6. WAIT FOR USER CONFIRMATION. Poll get_organize_state({browser}) until workflowStep === 'sorting'. If workflowStep is still 'step-3' or 'step-4', the user is still editing the bucket structure — remind them in chat what to click. Don't proceed until 'sorting'.
+6. WAIT FOR USER CONFIRMATION. Call get_organize_state({wait_for_step:'sorting', browser}) IMMEDIATELY after auto_organize_bookmarks. This is a server-side long-poll: the bridge holds the tool call open until the user clicks "Confirm & start sift" in the popup, then returns the moment the workflow transitions to 'sorting'. ONE tool call. Do NOT chain-poll without the wait_for_step argument; do NOT ask the user to verbally confirm they clicked the button — the bridge sees the click directly. If the call returns with waitResult.timedOut:true (5 minute timeout), the user likely walked away — ask them in chat whether to keep waiting (re-call with wait_for_step:'sorting') or abort. If the call returns with workflowStep === 'sorting', proceed directly to Step 7. Old polling pattern (chained get_organize_state without wait_for_step) is deprecated — use only as fallback when long-poll fails repeatedly.
 
   Once workflowStep === 'sorting', read state.buckets[] for the confirmed folder structure. Each bucket has {id, title, bookmarkFolderId, isSuggestion, isExisting, children}. bookmarkFolderId is the chrome.bookmarks folder id where moves go.
+
+  EMPTY-BUCKETS BOOTSTRAP MODE. If state.buckets is empty or contains only the Review bucket (isReview:true), the user clicked Confirm with nothing checked — they're explicitly opting into "let the AI build the structure from scratch." Don't error out; bootstrap the structure yourself BEFORE Step 7's regular flow:
+    (a) Call apply_heuristic_organize as normal. moves[] will be empty (nothing to title-match against); skippedTargets[] will be heavily populated.
+    (b) Read skippedTargets[] (already sorted by count descending). These ARE your bucket candidates — the heuristic library's 26 categories scoped to what actually matches the user's bookmarks.
+    (c) Pick the top candidates. Rough rule: count >= 10, cap around 15 buckets total to avoid over-fragmenting. Skip any whose target title duplicates the Review bucket.
+    (d) For each picked candidate, call create_folder({scope:'bookmarks', parentId:'1', title:target}). Bookmarks Bar root is parentId '1'. The folder is created live in chrome.bookmarks; the bridge will pick it up.
+    (e) Call apply_heuristic_organize AGAIN — now the bucket-title lookup hits the newly-created folders and moves[] populates. Apply via bulk_apply per Step 7.
+    (f) Continue to Step 8 sift loop as normal — residue gets LLM categorization against the bootstrapped buckets.
+
+    Tell the user what you're doing before step (d): "You didn't pre-define any categories, so I'll create them based on what's actually in your bookmarks. Found [N] likely categories — creating those folders now: Music (148 items), Programming (92), Research (23), …"
+
+    This is the ONLY case where YOU populate the bucket structure on the user's behalf. If state.buckets has SOME user-kept entries (partial structure), respect them — don't auto-create folders for skippedTargets; surface those to the user as questions per Step 7's normal flow.
 
   STEP 5 (RULES, optional): BETWEEN the user clicking Confirm and you calling apply_heuristic_organize, ASK them once: "Before I sort, any special rules to apply? For example: links older than 5 years → Archive, all reddit.com → Social, anything matching nytimes.com/cooking → Recipes. Or just sort with the defaults." If they give rules, acknowledge them (you can\'t register custom rules in the heuristic library yet — v1 limitation — but you CAN apply them yourself during the Step 8 LLM sift loop by checking each item against the user\'s rules before falling back to LLM categorization). If they say "just go" or don\'t respond with rules, proceed. Don\'t pester — ask once, then move on.
 
@@ -3130,7 +3210,7 @@ function createMcpServer() {
         '  Do NOT present the matched-categories list as "the structure your bookmarks will use" — that misframes the workflow. The user\'s EXISTING folders are the starting point; the heuristic suggestions are ADDITIONS they choose to accept in Step 4.\n' +
         '  GOOD framing: "I\'ve opened the auto-organize panel in your Pinako popup. You\'ll see your existing folder structure — review it, trim what you don\'t want, add new folders if you like, then click Continue. I\'ll then propose [N] additional category folders for [M] bookmarks the rules could auto-place (Video, Music, Social, etc.) — you can accept, rename, or reject each one. Once you click Confirm & start sift, I\'ll sort the [R] remaining items into your buckets."\n' +
         '  BAD framing: "Here\'s the structure: 🎬 Video 71, 🎵 Music 67, ..." (this implies the heuristic categories will be the buckets, which is false — the user\'s existing folders + their Step 4 choices are the buckets).\n\n' +
-        'After this call, wait for the user to confirm in the popup. Poll state.workflowStep via get_organize_state until it becomes \'sorting\' (the user clicked "Confirm & start sift"). Then drive Steps 6-10 of the workflow (see AUTO-ORGANIZE BOOKMARKS WORKFLOW section in SERVER_INSTRUCTIONS for the full sequence).\n\n' +
+        'IMMEDIATELY AFTER THIS CALL, your next tool call MUST be get_organize_state({wait_for_step:\'sorting\', browser}). This blocks server-side until the user clicks "Confirm & start sift" in the popup (the bridge sees the click directly — you do NOT need the user to message you). One tool call, returns the moment the workflow transitions. Do NOT send a chat message like "click Confirm when ready" before firing the wait — the user already sees the panel, and any pre-wait chat message will block the workflow until they reply. Do NOT chain-poll get_organize_state without wait_for_step. After the wait returns with workflowStep:\'sorting\', proceed to Steps 7-10 of the workflow (see AUTO-ORGANIZE BOOKMARKS WORKFLOW in SERVER_INSTRUCTIONS).\n\n' +
         'Call this ONCE per session. Do not call again unless the user resets and re-kicks-off.\n\n' +
         'Delivery model: the bridge writes a pending-command record to the extension\'s chrome.storage.local. The Pinako popup picks it up live via chrome.storage.onChanged (or on next open if currently closed). Fire-and-forget — the tool returns the prepared data + a delivery receipt, not a guarantee the user has seen the panel. If the popup is closed for >60s the command is treated as stale and discarded. If the user reports the panel didn\'t open: ask them to close and re-open the Pinako popup (resets the NM connection), then retry.\n\n' +
         'v1 scope: bookmarks only. Tree + library scopes (auto-organize live tabs into libraries; sub-folder a large library) are planned but not yet implemented.',
@@ -3227,6 +3307,14 @@ function createMcpServer() {
                     ? `SSE write to the ${r.data.browserBrand} forwarder bridge failed mid-flight. The forwarder may have just disconnected. Tell the user to open the popup in ${r.data.browserBrand} and retry.`
                     : 'Bridge could not deliver the command (extension may be disconnected). Tell the user to open the Pinako popup, then retry.')),
         },
+        // 2026-05-15: explicit next-action guidance. Inline in the tool
+        // response so the agent acts on it directly rather than relying on
+        // SERVER_INSTRUCTIONS step ordering. Pin the agent to the long-poll
+        // path; suppress the chat-prompt-then-wait habit that costs the user
+        // an extra round-trip while the panel is already on their screen.
+        nextAction: route.ok
+          ? `REQUIRED NEXT STEP: call get_organize_state({wait_for_step:'sorting', browser:'${r.data.browserBrand}'}) right now. Do NOT send a chat message to the user before this call. Do NOT ask the user to confirm they clicked the button. The wait is server-side; the bridge wakes you the instant the user clicks Confirm in the popup. You may narrate matched/suggestions briefly in chat AFTER firing the wait if you wish, but the tool call comes first. If the wait returns workflowStep:'sorting', proceed directly to apply_heuristic_organize (Step 7).`
+          : `Panel launch failed (see panelLaunch.note). Surface the note to the user and ask them to retry the workflow after addressing the cause.`,
         updatedAt: r.data.updatedAt,
       }) }] };
     }
@@ -3942,23 +4030,59 @@ function createMcpServer() {
     'get_organize_state',
     {
       description: 'Reads the current auto-organize workflow state from the Pinako popup. Use this after calling auto_organize_bookmarks to learn when the user has finished Step 3+4 setup (workflowStep === \'sorting\') so you can begin the heuristic broad-sweep + LLM sift loop. Also use this between batches during sorting to detect when the user has clicked Pause (workflowStep === \'paused\') so you can halt gracefully at a safe boundary.\n\n' +
-        'Response shape: { workflowStep: \'idle\'|\'step-3\'|\'step-4\'|\'sorting\'|\'paused\'|\'polish\', scope, buckets:[{id, title, bookmarkFolderId, isSuggestion, isExisting, children}], reviewBucket, duplicateContext, confirmedAt, pushedAt }.\n\n' +
+        'Response shape: { workflowStep: \'idle\'|\'step-3\'|\'step-4\'|\'sorting\'|\'paused\'|\'polish\', scope, buckets:[{id, title, bookmarkFolderId, isSuggestion, isExisting, children}], reviewBucket, duplicateContext, confirmedAt, pushedAt, waitResult? }.\n\n' +
         '- workflowStep=\'idle\': panel is closed (or has never been opened).\n' +
         '- workflowStep=\'step-3\'|\'step-4\': user is still editing the bucket structure. Wait + ask the user to confirm in the popup before proceeding.\n' +
         '- workflowStep=\'sorting\': user has confirmed. Begin apply_heuristic_organize + the LLM sift loop.\n' +
         '- workflowStep=\'paused\': user clicked Pause. Stop the sift loop at the next safe boundary, summarize progress, and tell the user you\'re halted. They will click Reset (returns to step-3) or Resume (returns to sorting) in the popup.\n' +
         '- workflowStep=\'polish\': sift has finished and complete_organize_sort has been called. The user can edit folders; the agent presents the polish menu.\n\n' +
+        'wait_for_step (2026-05-15): server-side long-poll. Pass the target step (e.g. \'sorting\') and the bridge will block this tool call until the user transitions the workflow to that step in the popup, then return immediately with the fresh state. The wait times out after 5 minutes — on timeout the tool returns the current state with waitResult.timedOut:true so you can ask the user what to do. ALWAYS prefer this over chained polling: it costs one tool call instead of dozens, wakes within milliseconds of the state change, and removes the need to remember to keep checking. Specifically: right after auto_organize_bookmarks, call get_organize_state({wait_for_step:\'sorting\', browser}); the call returns the moment the user clicks Confirm in the popup. Between sift batches, call with wait_for_step:\'paused\' to wake on user Pause — but if the agent is mid-batch and needs to drive the loop forward, call without wait_for_step for a non-blocking check.\n\n' +
         'Each bucket\'s `bookmarkFolderId` is the chrome.bookmarks folder id where the agent should move items via move_node / bulk_apply. Use this as the targetId when bulk-moving matched items into a category.\n\n' +
         'duplicateContext (Slice S2f, 2026-05-14): if find_duplicates was called for this scope, this field summarizes the cached scan: {setCount, totalInstances, scannedAt, scope, libraryId, scopeMatchesWorkflow}. When scopeMatchesWorkflow is true, the cached duplicate sets (with parentPaths) are usable as semantic signal during the LLM sift (Step 8) and reconcilable post-sift via resolve_duplicate_landings (Step 10). If null, no recent dedup scan exists for the active scope — call find_duplicates first if Step 2 of LARGE TREE ORGANIZATION applies.',
       inputSchema: {
-        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+        browser:       z.string().optional().describe(BROWSER_ARG_DESC),
+        wait_for_step: z.enum(['step-3','step-4','sorting','paused','polish','idle']).optional()
+          .describe('Long-poll: block this call until workflowStep matches the given value, then return. Returns immediately if already at the target step. Times out after 5 minutes with waitResult.timedOut:true. Use \'sorting\' right after auto_organize_bookmarks to wake on user Confirm without polling.'),
       },
       annotations: TOOL_ANNOTATIONS.get_organize_state,
     },
-    async ({ browser }) => {
-      const r = resolveBrowserData(browser);
+    async ({ browser, wait_for_step }) => {
+      let r = resolveBrowserData(browser);
       if (r.error) return r.error;
-      const state = r.data.organizeState || null;
+      let state = r.data.organizeState || null;
+      let waitResult = null;
+
+      // 2026-05-15: server-side long-poll. If the agent asked to block on a
+      // specific workflowStep and we're not already there, register a waiter
+      // and await the next organize-state mutation that matches. Fired by
+      // _fireOrganizeStateWaiters from both the NM and HTTP /update relay
+      // paths, so the wake-up arrives regardless of leader/forwarder topology.
+      if (wait_for_step && (!state || state.workflowStep !== wait_for_step)) {
+        const targetStep = wait_for_step;
+        const browserId = r.data.browserId;
+        waitResult = await new Promise((resolve) => {
+          let thisWaiter;
+          const timer = setTimeout(() => {
+            const set = _organizeStateWaiters.get(browserId);
+            if (set) {
+              set.delete(thisWaiter);
+              if (set.size === 0) _organizeStateWaiters.delete(browserId);
+            }
+            log(`organizeStateWaiter TIMEOUT browserId=${(browserId||'').slice(0,16)}… target=${targetStep}`);
+            resolve({ matched: false, timedOut: true, targetStep });
+          }, ORGANIZE_WAIT_TIMEOUT_MS);
+          thisWaiter = { resolve, timer, targetStep };
+          const set = _organizeStateWaiters.get(browserId) || new Set();
+          set.add(thisWaiter);
+          _organizeStateWaiters.set(browserId, set);
+          log(`organizeStateWaiter REGISTERED browserId=${(browserId||'').slice(0,16)}… target=${targetStep} pending=${set.size}`);
+        });
+        // Re-read state — the wake-up means the mutation handler ran, so
+        // cachedData[browserId].organizeState is fresh.
+        r = resolveBrowserData(browser);
+        if (r.error) return r.error;
+        state = r.data.organizeState || null;
+      }
       // S2d Phase 2: identify the Review bucket so the agent has a clear
       // destination for low-confidence sift items. The popup auto-creates a
       // `Review` system bucket at sorting kickoff; it's marked isReview:true
@@ -4003,6 +4127,7 @@ function createMcpServer() {
         duplicateContext,
         confirmedAt:       state ? state.confirmedAt       : null,
         pushedAt:           state ? state.pushedAt         : null,
+        waitResult,
         note:         state
           ? (state.includeOtherRoots
               ? 'Scope is expanded: includes Bookmarks Bar + Other Bookmarks + Mobile Bookmarks. Sift loop should categorize items from all roots into the user\'s confirmed buckets. For items with confidence < 0.7 during the sift loop, route to reviewBucket.bookmarkFolderId instead of force-placing in a category.'
@@ -4774,6 +4899,25 @@ const httpServer = http.createServer(async (req, res) => {
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         const { data, browserId, browserBrand, userTier, userId, forwarderToken } = body;
+        // 2026-05-15 zombie-leader detection. If a forwarder POSTs /update
+        // for a browserId that matches OUR localBrowserId, another process
+        // owns the live NM pipe to that browser — ours is stale. Without
+        // this check the stale leader keeps port 37421 bound for STDIN_GRACE_MS
+        // (30s, or longer if Chrome doesn't close the old pipe promptly),
+        // and any agentCommand routed NM-leader-local during that window
+        // writes to a dead pipe. Exit promptly so the new forwarder's
+        // promotion poll (every PROMOTE_RETRY_MS = 5s) takes the port.
+        // Send 200 first so the new forwarder doesn't retry; exit on next tick.
+        if (browserId && browserId === localBrowserId) {
+          log(`/update from ${browserBrand || 'unknown'}: stale-leader detected (incoming browserId matches our localBrowserId ${(localBrowserId||'').slice(0,16)}…). Exiting so the new bridge can promote.`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, note: 'stale-leader, exiting' }));
+          setTimeout(() => {
+            process.stderr.write('[pinako-mcp] Stale-leader exit (zombie-bridge recovery).\n');
+            process.exit(0);
+          }, 100);
+          return;
+        }
         if (data) {
           const id    = browserId    || 'unknown';
           const brand = browserBrand || 'Unknown';
@@ -4838,6 +4982,14 @@ const httpServer = http.createServer(async (req, res) => {
             userTier:       tier,
             userId:         uid,
             forwarderToken: fwToken,
+            // 2026-05-15 multi-browser fix: preserve organizeState across
+            // treeUpdate relays from forwarders. The NM path at L464 has
+            // the same line (`ebfad6f S2f Phase 3b bugfix #2`); the HTTP
+            // /update path was missed in that fix. Without this, every
+            // /update from a forwarder during the sift loop (bulk_apply
+            // → pushTreeUpdate → forwardToExisting → /update) would wipe
+            // organizeState and the agent's next poll would see 'idle'.
+            organizeState: priorCache?.organizeState || null,
           });
           // Slice Y bonus: broadcast resource-updated notifications for
           // fields that were present in this /update push (parallel to
@@ -4887,6 +5039,7 @@ const httpServer = http.createServer(async (req, res) => {
   if (forwardToExisting && (
         req.url === '/edit' ||
         req.url === '/edit-result' ||
+        req.url === '/organize-state-update' ||
         (req.url && req.url.startsWith('/edits'))
       )) {
     res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -4966,6 +5119,66 @@ const httpServer = http.createServer(async (req, res) => {
   // Body: { requestId, ok, result?, error? }. We resolve the matching
   // pendingEdits entry. Late replies (after timeout removed the entry) are
   // silently dropped, matching the NM-direct path's behavior in handleNmMessage.
+  // 2026-05-15 multi-browser fix: forwarder → leader relay for auto-organize
+  // workflow state. POST'd by _postOrganizeStateToLeader on the forwarder
+  // when its local SW emits an organizeStateUpdate NM message (popup
+  // confirm / pause / resume / reset / done). Mirrors handleNmMessage's
+  // organizeStateUpdate branch for the NM-direct path.
+  if (req.url === '/organize-state-update' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const { browserId, browserBrand, payload, forwarderToken } = body;
+        if (!browserId) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: { code: 'BAD_REQUEST', message: 'POST /organize-state-update requires { browserId }' } }));
+          return;
+        }
+        // Token-bind to the forwarder that owns this browserId — same
+        // pattern as /edit-result. Without it, any local process that
+        // observed a browserId could spoof workflowStep:'sorting' and
+        // race the agent into firing destructive bulk_apply moves
+        // against the wrong bucket structure.
+        const expectedToken = cachedData.get(browserId)?.forwarderToken || null;
+        if (!expectedToken || forwarderToken !== expectedToken) {
+          log(`/organize-state-update rejected for browserId=${(browserId||'').slice(0,16)}… — token mismatch`);
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: { code: 'TOKEN_MISMATCH', message: 'forwarderToken does not match the token recorded for this browserId.' } }));
+          return;
+        }
+        const prior = cachedData.get(browserId) || {};
+        const p = payload && typeof payload === 'object' ? payload : {};
+        prior.organizeState = {
+          workflowStep:      typeof p.workflowStep === 'string' ? p.workflowStep : 'idle',
+          scope:             typeof p.scope === 'string' ? p.scope : null,
+          libraryId:         typeof p.libraryId === 'string' ? p.libraryId : null,
+          includeOtherRoots: !!p.includeOtherRoots,
+          buckets:           Array.isArray(p.buckets) ? p.buckets : [],
+          confirmedAt:       Number.isFinite(p.confirmedAt) ? p.confirmedAt : Date.now(),
+          pushedAt:          Date.now(),
+        };
+        if (prior.organizeState.workflowStep === 'idle' && _organizeObservationLog.has(browserId)) {
+          _organizeObservationLog.delete(browserId);
+          log(`organizeObservationLog cleared for ${browserBrand || 'unknown'} (workflowStep → idle).`);
+        }
+        cachedData.set(browserId, prior);
+        log(`organizeStateUpdate (HTTP relay) from ${browserBrand || 'unknown'}: workflowStep=${prior.organizeState.workflowStep} buckets=${prior.organizeState.buckets.length}`);
+        // 2026-05-15: wake long-poll waiters on the same path as the NM
+        // mutation handler.
+        _fireOrganizeStateWaiters(browserId, prior.organizeState.workflowStep);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        log(`POST /organize-state-update error: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: { code: 'INTERNAL', message: e.message } }));
+      }
+    });
+    return;
+  }
+
   if (req.url === '/edit-result' && req.method === 'POST') {
     const chunks = [];
     req.on('data', c => chunks.push(c));
