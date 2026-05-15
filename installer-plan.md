@@ -109,12 +109,21 @@ Merge strategy: same.
     "pinako": {
       "url": "http://localhost:37421/mcp",
       "disabled": false,
-      "autoApprove": []
+      "autoApprove": [
+        "get_tree", "search_tabs", "list_libraries", "get_library",
+        "get_main_tree_notes", "get_bookmarks", "list_browsers",
+        "find_duplicates", "get_tree_summary", "propose_categories",
+        "propose_subcategories", "apply_heuristic_organize",
+        "refine_folder_outliers", "summarize_organize_results",
+        "resolve_duplicate_landings", "get_organize_state",
+        "get_observations", "record_observation",
+        "auto_organize_bookmarks", "complete_organize_sort", "search_docs"
+      ]
     }
   }
 }
 ```
-Merge strategy: same. These files may not exist yet if user hasn't opened MCP settings in Cline — create them if absent (Cline will pick them up on next launch).
+Merge strategy: same. These files may not exist yet if user hasn't opened MCP settings in Cline — create them if absent (Cline will pick them up on next launch). The `autoApprove` array is pre-populated with all 21 read-only Pinako tools (matches `READ_ONLY_TOOLS` in `setup/configure.js` and `installer/src-tauri/src/main.rs`, and the `readOnlyHint=true` annotations in `host.js`). Write-side tools intentionally absent so users keep per-call confirmation on mutations.
 
 ### Continue.dev (`~/.continue/config.json`)
 ```json

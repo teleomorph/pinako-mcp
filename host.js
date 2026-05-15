@@ -2372,6 +2372,97 @@ function createMcpServer() {
   // Common helper: normalize a caller's `mode` arg.
   const _normalizeMode = (m) => MODES.has(m) ? m : 'lite';
 
+  // ─── MCP-spec tool annotations (2026-05-14) ─────────────────────────────────
+  // Per the 2025-11-25 MCP spec ToolAnnotationsSchema, every tool registration
+  // can carry `readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  // `openWorldHint`. Spec-aware MCP clients use these hints to differentiate
+  // auto-approval policy: read-only tools can be auto-approved without a per-
+  // call user prompt, destructive tools always prompt, etc.
+  //
+  // Bucketing rule (data-mutation perspective):
+  //   READ_ONLY        — does not modify user data. Includes pure data reads
+  //                      AND tools that have UI-only side effects but don't
+  //                      touch the tree/library/bookmark/note state
+  //                      (auto_organize_bookmarks opens a panel,
+  //                      complete_organize_sort transitions panel state,
+  //                      record_observation writes to bridge-side ephemeral
+  //                      log only). 21 tools.
+  //   EDIT             — modifies user data but additively / reversibly.
+  //                      set_*, add_*, create_*, move_*, indent_*, outdent_*,
+  //                      reorder_*, ghost_node, add_to_library, etc. 24 tools.
+  //   DESTRUCTIVE      — permanent data loss without explicit recovery path.
+  //                      delete_node, delete_live_node, delete_library_group,
+  //                      remove_*_from_group. bulk_apply marked destructive
+  //                      because it can carry delete sub-ops. 4+1 tools.
+  //
+  // openWorldHint=false on every Pinako tool — the surface is closed: local
+  // browser data only, no external network calls.
+  const READ_ONLY = { readOnlyHint: true,  openWorldHint: false };
+  const EDIT      = { readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: false };
+  const EDIT_NID  = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }; // create_*, add_to_library
+  const DESTRUCT  = { readOnlyHint: false, destructiveHint: true,  idempotentHint: true,  openWorldHint: false };
+  const COMPOSITE = { readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: false }; // bulk_apply: variable
+  const TOOL_ANNOTATIONS = {
+    // Read-only (21) — safe to auto-approve in client autoApprove arrays.
+    get_tree:                       READ_ONLY,
+    search_tabs:                    READ_ONLY,
+    list_libraries:                 READ_ONLY,
+    get_library:                    READ_ONLY,
+    get_main_tree_notes:            READ_ONLY,
+    get_bookmarks:                  READ_ONLY,
+    list_browsers:                  READ_ONLY,
+    find_duplicates:                READ_ONLY,
+    get_tree_summary:               READ_ONLY,
+    propose_categories:             READ_ONLY,
+    propose_subcategories:          READ_ONLY,
+    apply_heuristic_organize:       READ_ONLY, // returns planned moves; does NOT apply them
+    refine_folder_outliers:         READ_ONLY,
+    summarize_organize_results:     READ_ONLY,
+    resolve_duplicate_landings:     READ_ONLY, // returns classification; agent does deletes via bulk_apply
+    get_organize_state:             READ_ONLY,
+    get_observations:               READ_ONLY,
+    record_observation:             READ_ONLY, // bridge-side ephemeral log; no user data touched
+    auto_organize_bookmarks:        READ_ONLY, // opens UI panel; no user-data mutation
+    complete_organize_sort:         READ_ONLY, // transitions UI panel state
+    search_docs:                    READ_ONLY,
+    // Edit, idempotent (15) — set_X, add/remove tags, structure changes that
+    // converge on a single end state when called repeatedly.
+    set_tags:                       EDIT,
+    add_tags:                       EDIT,
+    remove_tags:                    EDIT,
+    set_memo:                       EDIT,
+    set_star_color:                 EDIT,
+    set_row_color:                  EDIT,
+    set_title:                      EDIT,
+    set_note_content:               EDIT,
+    set_library_group_title:        EDIT,
+    set_library_group_description:  EDIT,
+    reorder_library_panel:          EDIT,
+    reorder_libraries_in_group:     EDIT,
+    move_node:                      EDIT,
+    add_library_to_group:           EDIT,
+    remove_library_from_group:      EDIT,
+    // Edit, NOT idempotent (8) — create_* duplicates on retry per
+    // SERVER_INSTRUCTIONS "CREATE-* OPS ARE NOT IDEMPOTENT" rule.
+    create_group:                   EDIT_NID,
+    create_folder:                  EDIT_NID,
+    create_library:                 EDIT_NID,
+    create_note:                    EDIT_NID,
+    create_library_group:           EDIT_NID,
+    add_to_library:                 EDIT_NID,
+    indent_node:                    EDIT_NID,
+    outdent_node:                   EDIT_NID,
+    // Destructive (4) — delete_* / ghost_node permanently or near-permanently
+    // remove data. Idempotent on retry per SERVER_INSTRUCTIONS
+    // "DELETE/GHOST OPS ARE IDEMPOTENT-ON-RETRY" rule.
+    delete_node:                    DESTRUCT,
+    delete_live_node:               DESTRUCT,
+    delete_library_group:           DESTRUCT,
+    ghost_node:                     DESTRUCT,
+    // Composite (1) — variable; can carry destructive sub-ops.
+    bulk_apply:                     COMPOSITE,
+  };
+
   srv.registerTool(
     'get_tree',
     {
@@ -2393,6 +2484,7 @@ function createMcpServer() {
         limit:              z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active. Triggers paginated response when set even without `after`.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.get_tree,
     },
     async ({ mode, include_ghost_tabs = true, include_favicons = false, acknowledge_size = false, after, limit, browser }) => {
       mode = _normalizeMode(mode);
@@ -2462,6 +2554,7 @@ function createMcpServer() {
         include_favicons:   z.boolean().optional().describe('Include favIconUrl base64. Default false.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.search_tabs,
     },
     async ({ query, mode, include_ghost_tabs = true, include_favicons = false, browser }) => {
       mode = _normalizeMode(mode || 'minimal');
@@ -2492,6 +2585,7 @@ function createMcpServer() {
         limit:        z.number().int().min(1).max(500).optional().describe('Max libraries per page. Default 50 when pagination is active.'),
         browser:      z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.list_libraries,
     },
     async ({ include_tabs = false, mode, include_favicons = false, acknowledge_size = false, after, limit, browser }) => {
       mode = _normalizeMode(mode || 'minimal');
@@ -2591,6 +2685,7 @@ function createMcpServer() {
         limit:      z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active.'),
         browser:    z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.get_library,
     },
     async ({ library_id, mode, include_favicons = false, acknowledge_size = false, after, limit, browser }) => {
       mode = _normalizeMode(mode);
@@ -2687,6 +2782,7 @@ function createMcpServer() {
         limit:            z.number().int().min(1).max(1000).optional().describe('Max notes per page. Default 100 when pagination is active.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.get_main_tree_notes,
     },
     async ({ acknowledge_size = false, after, limit, browser }) => {
       const r = resolveBrowserData(browser);
@@ -2741,6 +2837,7 @@ function createMcpServer() {
         limit:            z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active. Triggers paginated response when set even without `after`.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.get_bookmarks,
     },
     async ({ acknowledge_size = false, after, limit, browser }) => {
       const r = resolveBrowserData(browser);
@@ -2812,6 +2909,7 @@ function createMcpServer() {
         match_mode: z.enum(['exact']).optional().describe('Match strategy. Currently only "exact" (byte-identical URL match) is supported.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.find_duplicates,
     },
     async ({ scope, library_id, match_mode = 'exact', browser }) => {
       const r = resolveBrowserData(browser);
@@ -2885,6 +2983,7 @@ function createMcpServer() {
         library_id: z.string().optional().describe('Library id from list_libraries. Required when scope:"library".'),
         browser:    z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.get_tree_summary,
     },
     async ({ scope = 'tree', library_id, browser }) => {
       const r = resolveBrowserData(browser);
@@ -2939,6 +3038,7 @@ function createMcpServer() {
         max_suggestions: z.number().int().min(1).max(50).optional().describe('Maximum number of category suggestions to return. Default 15.'),
         browser:       z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.propose_categories,
     },
     async ({ scope = 'tree', library_id, min_match_count, max_suggestions, browser }) => {
       const r = resolveBrowserData(browser);
@@ -3040,6 +3140,7 @@ function createMcpServer() {
         max_suggestions: z.number().int().min(1).max(50).optional().describe('Maximum number of category suggestions. Default 15.'),
         browser:       z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.auto_organize_bookmarks,
     },
     async ({ scope = 'bookmarks', min_match_count, max_suggestions, browser }) => {
       const r = resolveBrowserData(browser);
@@ -3151,6 +3252,7 @@ function createMcpServer() {
         max_moves:        z.number().int().min(1).max(10000).optional().describe('Cap on moves[] length. Default 5000. If exceeded, response truncates moves[] and includes more_moves_available:true — call again after applying the first batch to receive the next chunk (cache-friendly via the pinako-mcp prompt cache).'),
         browser:          z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.apply_heuristic_organize,
     },
     async ({ confidence_floor = 'medium', max_moves, browser }) => {
       const r = resolveBrowserData(browser);
@@ -3295,6 +3397,7 @@ function createMcpServer() {
         limit:     z.number().int().min(1).max(500).optional().describe('Max items per page. Default 200 (smaller than sift-loop default of 500 since outlier scans involve more LLM reasoning per item).'),
         browser:   z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.refine_folder_outliers,
     },
     async ({ folder_id, after, limit, browser }) => {
       const r = resolveBrowserData(browser);
@@ -3398,6 +3501,7 @@ function createMcpServer() {
       inputSchema: {
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.summarize_organize_results,
     },
     async ({ browser }) => {
       const r = resolveBrowserData(browser);
@@ -3509,6 +3613,7 @@ function createMcpServer() {
       inputSchema: {
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.resolve_duplicate_landings,
     },
     async ({ browser }) => {
       const r = resolveBrowserData(browser);
@@ -3726,6 +3831,7 @@ function createMcpServer() {
         summary: z.string().max(500).optional().describe('Optional one-line agent-side summary of what was sorted. Forwarded to the popup for future UI polish (not displayed in v1).'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.complete_organize_sort,
     },
     async ({ summary, browser }) => {
       const r = resolveBrowserData(browser);
@@ -3789,6 +3895,7 @@ function createMcpServer() {
         max_suggestions: z.number().int().min(1).max(20).optional().describe('Maximum number of sub-category suggestions. Default 10.'),
         browser:         z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.propose_subcategories,
     },
     async ({ folder_id, min_match_count, max_suggestions, browser }) => {
       const r = resolveBrowserData(browser);
@@ -3846,6 +3953,7 @@ function createMcpServer() {
       inputSchema: {
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.get_organize_state,
     },
     async ({ browser }) => {
       const r = resolveBrowserData(browser);
@@ -3917,6 +4025,7 @@ function createMcpServer() {
         batch_n:    z.number().int().min(0).optional().describe('Which sift batch this observation came from (0-indexed). Optional but helpful for cross-batch tracking.'),
         browser:    z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.record_observation,
     },
     async ({ pattern, count, examples, batch_n, browser }) => {
       const r = resolveBrowserData(browser);
@@ -3956,6 +4065,7 @@ function createMcpServer() {
         batch_n_min:    z.number().int().min(0).optional().describe('Optional lower bound (inclusive) on batch_n. Useful for "show me observations since batch N".'),
         browser:        z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.get_observations,
     },
     async ({ filter_pattern, batch_n_min, browser }) => {
       const r = resolveBrowserData(browser);
@@ -3984,6 +4094,7 @@ function createMcpServer() {
     'list_browsers',
     {
       description: 'Lists all Pinako installs currently connected to this MCP server. Each entry: browserBrand (human-readable name like "Chrome" or "Brave"), browserId (stable per-install id), updatedAt (timestamp of last data update), windowCount (live windows), libraryCount, bookmarkCount, docsCount (number of cached user-guide sections searchable via search_docs). Use the browserBrand or browserId as the "browser" argument to other tools when multiple browsers are connected.',
+      annotations: TOOL_ANNOTATIONS.list_browsers,
     },
     async () => {
       const browsers = [...cachedData.values()].map(d => ({
@@ -4078,6 +4189,7 @@ function createMcpServer() {
         max_results: z.number().int().min(1).max(20).optional().describe('Cap on returned sections. Default 5.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
+      annotations: TOOL_ANNOTATIONS.search_docs,
     },
     async ({ query, max_results, browser }) => {
       const r = resolveBrowserData(browser);
@@ -4259,6 +4371,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.set_tags,
   }, async (args) => writeToolHandler('set_tags', args));
 
   srv.registerTool('add_tags', {
@@ -4270,6 +4383,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.add_tags,
   }, async (args) => writeToolHandler('add_tags', args));
 
   srv.registerTool('remove_tags', {
@@ -4281,6 +4395,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.remove_tags,
   }, async (args) => writeToolHandler('remove_tags', args));
 
   // ─── Metadata ops ───────────────────────────────────────────────────────────
@@ -4293,6 +4408,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.set_memo,
   }, async (args) => writeToolHandler('set_memo', args));
 
   srv.registerTool('set_star_color', {
@@ -4304,6 +4420,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.set_star_color,
   }, async (args) => writeToolHandler('set_star_color', args));
 
   srv.registerTool('set_row_color', {
@@ -4315,6 +4432,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.set_row_color,
   }, async (args) => writeToolHandler('set_row_color', args));
 
   srv.registerTool('set_title', {
@@ -4326,6 +4444,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.set_title,
   }, async (args) => writeToolHandler('set_title', args));
 
   // ─── Tree-structure ops ─────────────────────────────────────────────────────
@@ -4339,6 +4458,7 @@ function createMcpServer() {
       libraryId:   z.string().optional().describe('Required when scope=library.'),
       browser:     z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.move_node,
   }, async (args) => writeToolHandler('move_node', args));
 
   srv.registerTool('create_group', {
@@ -4352,6 +4472,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.create_group,
   }, async (args) => writeToolHandler('create_group', args));
 
   srv.registerTool('delete_node', {
@@ -4363,6 +4484,7 @@ function createMcpServer() {
       libraryId:       z.string().optional().describe('Required when scope=library.'),
       browser:         z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.delete_node,
   }, async (args) => writeToolHandler('delete_node', args));
 
   srv.registerTool('ghost_node', {
@@ -4373,6 +4495,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.ghost_node,
   }, async (args) => writeToolHandler('ghost_node', args));
 
   srv.registerTool('delete_live_node', {
@@ -4384,6 +4507,7 @@ function createMcpServer() {
       libraryId:       z.string().optional().describe('Required when scope=library.'),
       browser:         z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.delete_live_node,
   }, async (args) => writeToolHandler('delete_live_node', args));
 
   srv.registerTool('indent_node', {
@@ -4394,6 +4518,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.indent_node,
   }, async (args) => writeToolHandler('indent_node', args));
 
   srv.registerTool('outdent_node', {
@@ -4404,6 +4529,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.outdent_node,
   }, async (args) => writeToolHandler('outdent_node', args));
 
   // ─── Library system ops ─────────────────────────────────────────────────────
@@ -4414,6 +4540,7 @@ function createMcpServer() {
       description: z.string().optional().describe('Optional description shown beneath title (max 1000 chars).'),
       browser:     z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.create_library,
   }, async (args) => writeToolHandler('create_library', args));
 
   srv.registerTool('add_to_library', {
@@ -4428,6 +4555,7 @@ function createMcpServer() {
       position:        z.number().optional().describe(POSITION_DESC),
       browser:         z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.add_to_library,
   }, async (args) => writeToolHandler('add_to_library', args));
 
   srv.registerTool('set_note_content', {
@@ -4440,6 +4568,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library-notes.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.set_note_content,
   }, async (args) => writeToolHandler('set_note_content', args));
 
   srv.registerTool('create_note', {
@@ -4451,6 +4580,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library-notes.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.create_note,
   }, async (args) => writeToolHandler('create_note', args));
 
   // ─── Library Group ops ──────────────────────────────────────────────────────
@@ -4461,6 +4591,7 @@ function createMcpServer() {
       description: z.string().optional().describe('Optional group description (max 1000 chars).'),
       browser:     z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.create_library_group,
   }, async (args) => writeToolHandler('create_library_group', args));
 
   srv.registerTool('delete_library_group', {
@@ -4471,6 +4602,7 @@ function createMcpServer() {
       confirmedByUser: z.literal(true).optional().describe('Required to be TRUE when cascadeMembers:true. Set ONLY after explicit user approval of cascade deletion.'),
       browser:         z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.delete_library_group,
   }, async (args) => writeToolHandler('delete_library_group', args));
 
   srv.registerTool('add_library_to_group', {
@@ -4481,6 +4613,7 @@ function createMcpServer() {
       position:  z.number().optional().describe(POSITION_DESC + ' Default appends.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.add_library_to_group,
   }, async (args) => writeToolHandler('add_library_to_group', args));
 
   srv.registerTool('remove_library_from_group', {
@@ -4490,6 +4623,7 @@ function createMcpServer() {
       libraryId: z.string().describe('Library id to remove from the group.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.remove_library_from_group,
   }, async (args) => writeToolHandler('remove_library_from_group', args));
 
   srv.registerTool('set_library_group_title', {
@@ -4499,6 +4633,7 @@ function createMcpServer() {
       title:   z.string().describe('New title.'),
       browser: z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.set_library_group_title,
   }, async (args) => writeToolHandler('set_library_group_title', args));
 
   srv.registerTool('set_library_group_description', {
@@ -4508,6 +4643,7 @@ function createMcpServer() {
       description: z.string().describe('New description (empty string clears).'),
       browser:     z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.set_library_group_description,
   }, async (args) => writeToolHandler('set_library_group_description', args));
 
   srv.registerTool('reorder_library_panel', {
@@ -4519,6 +4655,7 @@ function createMcpServer() {
       })).describe('Full ordered list of panel cards. Must match current set exactly.'),
       browser: z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.reorder_library_panel,
   }, async (args) => writeToolHandler('reorder_library_panel', args));
 
   // ─── Bookmark-scope ops (Phase 3 Slice G) ──────────────────────────────────
@@ -4537,6 +4674,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.create_folder,
   }, async (args) => writeToolHandler('create_folder', args));
 
   srv.registerTool('reorder_libraries_in_group', {
@@ -4546,6 +4684,7 @@ function createMcpServer() {
       libraryIds: z.array(z.string()).describe('Full ordered list of member library ids. Must match current membership exactly.'),
       browser:    z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.reorder_libraries_in_group,
   }, async (args) => writeToolHandler('reorder_libraries_in_group', args));
 
   // ─── Composite ─────────────────────────────────────────────────────────────
@@ -4557,6 +4696,7 @@ function createMcpServer() {
       libraryId: z.string().optional().describe('Default libraryId for sub-ops that omit it.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
+    annotations: TOOL_ANNOTATIONS.bulk_apply,
   }, async (args) => writeToolHandler('bulk_apply', args));
 
   return srv;

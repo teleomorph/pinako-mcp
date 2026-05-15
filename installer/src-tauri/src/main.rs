@@ -7,6 +7,37 @@ use std::path::{Path, PathBuf};
 const MCP_URL:   &str = "http://127.0.0.1:37421/mcp";
 const HOST_NAME: &str = "com.pinako.mcp";
 
+// Read-only MCP tools — pre-populated into Cline / Roo Code `autoApprove`
+// arrays so the AI client doesn't prompt the user before each call. Limited
+// to tools that DO NOT modify user data: data reads + UI-only side effects
+// + bridge-side ephemeral writes (record_observation). Mirrors the
+// readOnlyHint=true set on each tool in pinako-mcp/host.js TOOL_ANNOTATIONS,
+// and the READ_ONLY_TOOLS list in pinako-mcp/setup/configure.js. Keep these
+// three lists in sync when adding/removing tools.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "get_tree",
+    "search_tabs",
+    "list_libraries",
+    "get_library",
+    "get_main_tree_notes",
+    "get_bookmarks",
+    "list_browsers",
+    "find_duplicates",
+    "get_tree_summary",
+    "propose_categories",
+    "propose_subcategories",
+    "apply_heuristic_organize",
+    "refine_folder_outliers",
+    "summarize_organize_results",
+    "resolve_duplicate_landings",
+    "get_organize_state",
+    "get_observations",
+    "record_observation",
+    "auto_organize_bookmarks",
+    "complete_organize_sort",
+    "search_docs",
+];
+
 // Hardcode once the extension is published to the Chrome Web Store.
 // Format: 32 lowercase letters, e.g. "abcdefghijklmnopqrstuvwxyzabcdef"
 const PROD_EXT_ID: Option<&str> = Some("clakbccnkfpmpfooiiffomhknnfcodgd");
@@ -472,7 +503,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
             cfg["mcpServers"]["pinako"] = serde_json::json!({
-                "url": MCP_URL, "disabled": false, "autoApprove": []
+                "url": MCP_URL, "disabled": false, "autoApprove": READ_ONLY_TOOLS
             });
             write_json(&path, &cfg)
         }
@@ -484,7 +515,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
             cfg["mcpServers"]["pinako"] = serde_json::json!({
-                "url": MCP_URL, "disabled": false, "autoApprove": []
+                "url": MCP_URL, "disabled": false, "autoApprove": READ_ONLY_TOOLS
             });
             write_json(&path, &cfg)
         }
