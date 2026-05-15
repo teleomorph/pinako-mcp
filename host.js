@@ -2077,8 +2077,8 @@ ROUTING — when the user expresses one of these intents, CALL THE LISTED TOOL F
   Questions about Pinako features / terminology / "how does X work"
     → search_docs  FIRST.  Pinako has product-specific meanings for "group", "folder", "memo", "ghost tab", "library group", "snapshot" etc. that differ from generic tab-manager intuition. Cheap local lookup; never guess from the term alone.
 
-  Multiple browsers connected (Chrome + Brave both showing in list_browsers)
-    → list_browsers  to learn names, then pass the chosen browser to subsequent tools via the browser argument.
+  User mentions a task that targets browser data ("organize my bookmarks", "search my tabs", etc.) AND you don't yet know which browser to act on
+    → list_browsers FIRST. If the response shows more than one browser, ASK the user which one before any browser-scoped tool call. Do NOT guess from memory or prior conversation about the user's "primary" browser. Exception: if the user named a browser in their request itself ("organize my Brave bookmarks"), treat that as the chosen browser and skip the question. See MULTI-BROWSER → Selection rules below.
 
 WRITE TOOLS (Pro tier 1+)
 Read tools (get_tree, search_tabs, list_libraries, get_library, get_main_tree_notes, get_bookmarks, list_browsers, find_duplicates, get_tree_summary, propose_categories, get_organize_state, get_observations, resolve_duplicate_landings, search_docs) require no special handling.
@@ -2204,8 +2204,8 @@ The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the
 
 Selection rules:
 - One browser connected: omit 'browser'; tools resolve automatically.
-- Multiple connected, no browser chosen yet this conversation: tools return an ambiguity error. Ask the user which one, then retry with the chosen 'browser' value.
-- After the user has named a browser (explicitly, or by answering the ambiguity prompt), treat it as the sticky default for the rest of the conversation. Reuse the same 'browser' value on every subsequent call without re-asking. Do NOT split the work across browsers, and do NOT re-ask which browser to use.
+- Multiple connected, no browser chosen yet this conversation: do NOT guess from memory, training data, or prior knowledge of the user's "primary" browser. Call list_browsers first and ASK the user explicitly. The response is sorted by updatedAt descending — entry [0] is the most recently active install, which you can use as a recency hint to suggest a probable default. DO NOT auto-select; phrase the question with both options visible. For example: "I see you have multiple browsers open, and it looks like <X> was the most recent one you've been working with. Is that the browser where you'd like to <verb-from-task> the bookmarks? Or do you want to work with the <Y> browser?" Exception: if the user named a browser in their request itself ("organize my Brave bookmarks"), use that browser directly without the list_browsers call or the question.
+- After the user has named a browser (explicitly, or by answering the prompt above), treat it as the sticky default for the rest of the conversation. Reuse the same 'browser' value on every subsequent call without re-asking. Do NOT split the work across browsers, and do NOT re-ask which browser to use.
 - Focus-shift exception: if a DIFFERENT browser's updatedAt is newer than the sticky choice's most recent updatedAt, the user has likely shifted attention to that browser. Ask once: "I noticed recent activity in <X>. Apply this to <X>, stay on <Y>, or do both?" Then adopt the answer as the new sticky default. updatedAt advances on any tree mutation (tab open/close, memo edit, note write), not strictly on window focus, so treat this as a heuristic and do NOT fire it again until updatedAt shifts further.
 - Explicit overrides ("in both browsers", "do it in Chrome instead", "across all installs") win for that one call. If the user's phrasing sounds durable ("from now on use Chrome"), update the sticky default too.
 
@@ -2360,7 +2360,7 @@ function createMcpServer() {
     { instructions: SERVER_INSTRUCTIONS }
   );
 
-  const BROWSER_ARG_DESC = 'Which Pinako install to query (browser brand like "Brave" or "Chrome", or browserId from list_browsers). Required when multiple browsers are connected; omit when only one is connected.';
+  const BROWSER_ARG_DESC = 'Which Pinako install to query (browser brand like "Brave" or "Chrome", or browserId from list_browsers). Omit when only one browser is connected. When multiple are connected and the user has not yet chosen one this conversation, do NOT guess this value from memory or the user\'s "primary" browser — call list_browsers and ask the user (see MULTI-BROWSER in server instructions). After the user has chosen, reuse that value for the rest of the conversation.';
 
   // Slice Y (2026-05-12): the bridge cache auto-refreshes on user activity
   // within ~1-2s via popup-side debounced pushTreeUpdate. This hint appended
@@ -4093,19 +4093,21 @@ function createMcpServer() {
   srv.registerTool(
     'list_browsers',
     {
-      description: 'Lists all Pinako installs currently connected to this MCP server. Each entry: browserBrand (human-readable name like "Chrome" or "Brave"), browserId (stable per-install id), updatedAt (timestamp of last data update), windowCount (live windows), libraryCount, bookmarkCount, docsCount (number of cached user-guide sections searchable via search_docs). Use the browserBrand or browserId as the "browser" argument to other tools when multiple browsers are connected.',
+      description: 'Lists all Pinako installs currently connected to this MCP server. Each entry: browserBrand (human-readable name like "Chrome" or "Brave"), browserId (stable per-install id), updatedAt (timestamp of last data update — any tree mutation, memo edit, note write, etc.), windowCount (live windows), libraryCount, bookmarkCount, docsCount (number of cached user-guide sections searchable via search_docs). Response is sorted by updatedAt descending — entry [0] is the most recently active install, which the agent can surface as a recency hint when asking the user which browser to target. Use the browserBrand or browserId as the "browser" argument to other tools when multiple browsers are connected.',
       annotations: TOOL_ANNOTATIONS.list_browsers,
     },
     async () => {
-      const browsers = [...cachedData.values()].map(d => ({
-        browserBrand:  d.browserBrand,
-        browserId:     d.browserId,
-        updatedAt:     d.updatedAt,
-        windowCount:   (d.tree || []).filter(n => !n.incognito).length,
-        libraryCount:  (d.libraries || []).length,
-        bookmarkCount: (d.bookmarks || []).reduce((acc, root) => acc + countBookmarksRecursive(root), 0),
-        docsCount:     Array.isArray(d.docs) ? d.docs.length : 0,
-      }));
+      const browsers = [...cachedData.values()]
+        .map(d => ({
+          browserBrand:  d.browserBrand,
+          browserId:     d.browserId,
+          updatedAt:     d.updatedAt,
+          windowCount:   (d.tree || []).filter(n => !n.incognito).length,
+          libraryCount:  (d.libraries || []).length,
+          bookmarkCount: (d.bookmarks || []).reduce((acc, root) => acc + countBookmarksRecursive(root), 0),
+          docsCount:     Array.isArray(d.docs) ? d.docs.length : 0,
+        }))
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
       return { content: [{ type: 'text', text: JSON.stringify({ browsers, count: browsers.length }) }] };
     }
   );
