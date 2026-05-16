@@ -4,17 +4,20 @@ import { connectPinakoMcp, callToolOk, waitFor } from '../helpers/mcp-client.js'
 import { resolveTargetBrowser } from '../helpers/browser.js';
 import { testLabel } from '../helpers/fixtures.js';
 
-// Tier 2: probes the agent's discovery of bulk_apply. Given a prompt
-// that asks for the same op applied to N targets, does the agent reach
-// for bulk_apply (one atomic undoable unit) or hammer with N individual
-// calls? The bulk_apply description explicitly pitches itself for
-// "multi-step reorganizations" — this test sees whether that language
-// is enough for Haiku 4.5 to pick it.
+// Tier 2: probes the agent's discovery of bulk_apply at N=8, which sits
+// above the empirically-validated "6 or more" threshold the bulk_apply
+// description now teaches (Batch 9.5 sweep:
+// tests/tier2/_experiments/bulk-threshold-results.md).
 //
-// IMPORTANT: this test is *informational*, not prescriptive. Either
-// strategy completes the task correctly; the failing case would be
-// agent fails to update all 3 nodes. The tool-call sequence is logged
-// so we can observe which approach the agent picked over time.
+// At N=8, calling add_tags 8 times costs more output tokens and takes
+// ~2s longer than one bulk_apply with 8 sub-ops, AND the bulk batch
+// can be undone in one user click. The description tells the agent
+// this; this test asserts the agent acts on it.
+//
+// If a future model upgrade or description change re-introduces the
+// gap (agent picks individual at N=8), the strategy log will show it
+// and the assertion below will fail — i.e. this test is now a
+// regression guard for the bulk_apply discoverability fix.
 
 const HAS_OAUTH = !!process.env.CLAUDE_CODE_OAUTH_TOKEN;
 const HAS_API_KEY = !!process.env.ANTHROPIC_API_KEY;
@@ -50,10 +53,11 @@ describe.skipIf(!TIER2_RUNNABLE)('Tier 2 agent — bulk apply (batching intuitio
       browser,
     });
 
-    // Seed three sibling group nodes inside the library; each will be the
-    // target of a tag mutation.
+    // Seed N=8 sibling group nodes — above the "6 or more" threshold the
+    // bulk_apply description teaches. At 8 the bulk_apply path is the
+    // empirically optimal choice (cheaper, faster, atomic undo).
     targetNodeIds = [];
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 8; i++) {
       const g = await callToolOk(session.client, 'create_group', {
         title: testLabel(`tier2-bulk-target-${i}`),
         scope: 'library',
@@ -80,18 +84,17 @@ describe.skipIf(!TIER2_RUNNABLE)('Tier 2 agent — bulk apply (batching intuitio
     if (session) await session.close();
   }, TEST_TIMEOUT_MS);
 
-  it('agent tags all three target nodes — either via bulk_apply or N add_tags calls', async () => {
+  it('agent reaches for bulk_apply when tagging 8 nodes (above the N>=6 threshold)', async () => {
     const expectedTag = 'batch-test';
 
+    const targetList = targetNodeIds.map(id => `- ${id}`).join('\n');
     const prompt = [
-      `Use the Pinako MCP tools to add the tag "${expectedTag}" to THREE nodes in library "${testLibraryId}" on browser "${browser}".`,
+      `Use the Pinako MCP tools to add the tag "${expectedTag}" to ${targetNodeIds.length} nodes in library "${testLibraryId}" on browser "${browser}".`,
       ``,
       `Target node ids:`,
-      `- ${targetNodeIds[0]}`,
-      `- ${targetNodeIds[1]}`,
-      `- ${targetNodeIds[2]}`,
+      targetList,
       ``,
-      `Each of the three nodes should end up with "${expectedTag}" in its tag list. Pick whichever tool approach you think fits best.`,
+      `Each of the ${targetNodeIds.length} nodes should end up with "${expectedTag}" in its tag list. Pick whichever tool approach you think fits best.`,
       ``,
       `When done, reply with one line: DONE tagged=<n>`,
     ].join('\n');
@@ -115,18 +118,22 @@ describe.skipIf(!TIER2_RUNNABLE)('Tier 2 agent — bulk apply (batching intuitio
 
     const bulkCalls = toolCallsByName(run.toolCalls, 'mcp__pinako__bulk_apply');
     const addCalls = toolCallsByName(run.toolCalls, 'mcp__pinako__add_tags');
-    const strategy = bulkCalls.length > 0 ? 'bulk_apply' : 'individual';
+    const strategy = bulkCalls.length > 0 && addCalls.length === 0 ? 'bulk_apply'
+                   : addCalls.length > 0 && bulkCalls.length === 0 ? 'individual'
+                   : 'mixed';
 
-    // At least one of the two approaches must have been used.
+    // At N=8 (above the description's "6 or more" threshold), the agent
+    // should pick bulk_apply. If a model upgrade or description change
+    // re-introduces individual-calling at this N, this assertion catches it.
     expect(
-      bulkCalls.length + addCalls.length,
-      'agent used either bulk_apply or add_tags (or both)',
+      bulkCalls.length,
+      `bulk_apply called at least once (strategy picked: ${strategy})`,
     ).toBeGreaterThanOrEqual(1);
 
     const errored = run.toolCalls.filter(tc => tc.resultIsError);
     expect(errored, `no errored tool calls (got: ${errored.map(t => t.name).join(', ')})`).toEqual([]);
 
-    // Final state: all three nodes have the expected tag.
+    // Final state: every target node has the expected tag.
     const taggedNodes = await waitFor(async () => {
       const fetched = await callToolOk(session.client, 'get_library', {
         library_id: testLibraryId,
@@ -140,9 +147,9 @@ describe.skipIf(!TIER2_RUNNABLE)('Tier 2 agent — bulk apply (batching intuitio
       if (hits.some(n => !n)) return null;
       if (hits.every(n => (n.tags ?? []).includes(expectedTag))) return hits;
       return null;
-    }, { label: 'all-3-nodes-tagged', timeout: 12_000 });
+    }, { label: `all-${targetNodeIds.length}-nodes-tagged`, timeout: 15_000 });
 
-    expect(taggedNodes.length).toBe(3);
+    expect(taggedNodes.length).toBe(targetNodeIds.length);
     for (const node of taggedNodes) {
       expect(node.tags).toContain(expectedTag);
     }

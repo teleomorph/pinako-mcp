@@ -16,6 +16,7 @@ export async function runAgent({
   mcpUrl = DEFAULT_MCP_URL,
   mcpServers,
   allowedTools,
+  disallowedTools,
   maxTurns = 25,
   systemPrompt,
 } = {}) {
@@ -35,6 +36,7 @@ export async function runAgent({
     maxTurns,
   };
   if (Array.isArray(allowedTools)) options.allowedTools = allowedTools;
+  if (Array.isArray(disallowedTools)) options.disallowedTools = disallowedTools;
   if (systemPrompt) options.systemPrompt = systemPrompt;
 
   const start = Date.now();
