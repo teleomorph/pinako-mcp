@@ -83,9 +83,14 @@ propagation lag per write). Per-test timeout is 180s.
   per-call via `runAgent({mcpUrl})`.
 - **Permission mode:** `bypassPermissions` — auto-approves every tool call
   so the loop doesn't hang waiting for confirmation.
-- **`allowedTools`:** each test lists the exact Pinako tools the agent is
-  allowed to call. This both restricts the surface and protects the user's
-  filesystem from any built-in Read/Write/Bash usage.
+- **`allowedTools`:** the SDK uses this for *auto-approval*, NOT for surface
+  restriction. With `bypassPermissions` set, the agent can call any MCP
+  tool the connected server exposes regardless of what's in the list. We
+  pass it for documentation value (what each test expects the agent to
+  use) and as belt-and-suspenders, but tests should not assume tools
+  *outside* the list are unavailable. Empirically observed in the
+  search-and-summarize test where the agent called `list_browsers` despite
+  it being absent from `allowedTools`.
 
 ## Pattern: add a new Tier 2 test
 
@@ -100,8 +105,11 @@ propagation lag per write). Per-test timeout is 180s.
    exact titles. Tier 2 prompts should test agent *tool choice*, not
    creative interpretation — keep them unambiguous.
 
-4. Set `allowedTools` to the minimum Pinako tools needed. The agent may
-   only call those (no Read/Write/Bash unless you opt in).
+4. Set `allowedTools` to the minimum Pinako tools you expect — this is
+   documentation, not enforcement. Built-in Read/Write/Bash don't appear
+   because no `executable: 'sdk'` tools are enabled by default; the
+   agent's tool set is just the MCP server's catalog. If a test needs to
+   forbid specific MCP tools, use `disallowedTools` instead.
 
 5. Assert on:
    - `run.systemInit.mcpServers` contains `pinako` with `status: 'connected'`
@@ -130,6 +138,29 @@ Tier 1 helpers are reused from `../helpers/`:
 - `waitFor()` for cache-propagation polling
 - `resolveTargetBrowser()` for browser name
 - `testLabel()` for `pinako-mcp-test-` prefixed titles
+
+## Pitfalls (from real Tier 2 experience)
+
+- **The agent is non-deterministic.** Haiku 4.5 may pick a different
+  tool order on different runs even with the same prompt. If a prompt
+  is ambiguous about which tools to call (e.g. "analyze the open
+  tabs" could be either `get_tree_summary` or `search_tabs`), expect
+  flakes. Either spell out the tool sequence in the prompt, or soften
+  assertions to accept the alternatives.
+- **Specify the browser explicitly in prompts.** Otherwise the agent
+  may burn a turn on `list_browsers` and sometimes stops short of
+  the actual task. The harness already resolves `browser` in
+  `beforeAll`; thread it into the prompt.
+- **Library children vs library notes.** `get_library` returns BOTH
+  in its response (`children[]` for tree nodes, `notes[]` for
+  library-scope notes). `add_to_library` only accepts tree nodes; if
+  the agent passes note ids in `nodeIds`, the bridge returns
+  `SOURCE_NODE_NOT_FOUND`. Real description-quality gap; until
+  resolved, design tests that don't put the agent in this position.
+- **Diagnostic log before assertions.** When a tier 2 test fails,
+  the most useful info is what the agent *actually* did. Add a
+  `console.log` dumping `run.toolCalls` before any `expect`s, so
+  every run produces a tool-sequence record.
 
 ## Known gaps
 
