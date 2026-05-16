@@ -2333,25 +2333,35 @@ CORE INVARIANT — read this before anything else.
 
 After the user clicks "Confirm & start sift" in step-4, the confirmed bucket list in state.buckets defines the COMPLETE AND EXCLUSIVE final structure of the bookmarks tree. This is not a suggestion. It is non-negotiable.
 
+DEFINITIONS:
+  • Confirmed-folder set = every bookmarkFolderId in state.buckets[*], RECURSIVELY (top-level buckets AND any nested subfolders the user kept in step-3/step-4). Build this set by walking state.buckets and collecting bookmarkFolderId from every node and its descendants. Include state.reviewBucket.bookmarkFolderId.
+  • Immediate parent = the folder a URL bookmark lives directly inside (its chrome.bookmarks parentId, not a grandparent).
+  • Root = id \'1\' (Bookmarks Bar). The root CONTAINS the confirmed buckets but is NOT itself in the confirmed-folder set.
+
 By the time you call complete_organize_sort, the tree MUST satisfy ALL of:
 
   1. Every URL bookmark in scope is in EXACTLY ONE of:
-     (a) a confirmed bucket folder (state.buckets[*].bookmarkFolderId or any descendant), OR
-     (b) the Review folder (state.reviewBucket.bookmarkFolderId).
+     (a) a folder whose id is in the confirmed-folder set (a confirmed bucket OR a kept nested subfolder), OR
+     (b) the Review folder, OR
+     (c) the bookmarks-bar root \'1\' — IF AND ONLY IF the user has explicitly told you in chat to keep that specific bookmark at root (e.g., "leave my pinned GitHub bookmarks at the root, not in any folder"). Track these as explicit "keep at root" exemptions in working memory. NEVER infer an exemption from context; the user must say so directly.
 
-  2. NO URL bookmark remains unparented at the bookmarks-bar root (id \'1\').
+  2. NO URL bookmark remains unparented at the bookmarks-bar root EXCEPT under the (c) exemption above. Items at root with no explicit exemption are stragglers and must be moved.
 
-  3. NO URL bookmark remains in a folder the user deselected in step-3 (any folder whose chrome.bookmarks id is NOT in the confirmed bucket set).
+  3. NO URL bookmark remains in a folder whose id is NOT in the confirmed-folder set. This covers BOTH:
+     • items in deselected top-level folders (e.g., user unchecked "Music Search" at step-3 — its contents go to Review or a matching bucket), AND
+     • items in deselected nested subfolders within a kept parent (e.g., user kept "Music" but unchecked "Music/Classical" — items under Classical must be moved, even though their grandparent Music is confirmed).
 
-  4. Every folder at the bookmarks-bar root is in the confirmed bucket set. Pre-existing folders the user deselected have been emptied (contents redistributed) and then deleted.
+     The immediate-parent rule is decisive: the agent looks at the URL\'s direct parent folder, not its ancestors. "My grandparent is confirmed" does NOT preserve an item whose immediate parent was deselected.
+
+  4. Every folder in the tree (at any depth) whose id is NOT in the confirmed-folder set has been emptied (contents redistributed to a confirmed bucket or Review) and then deleted. This includes deselected top-level folders AND deselected nested subfolders. Delete leaves-first: empty the deepest deselected folders before their (also-deselected) parents.
 
   5. The Review folder may contain anything — it\'s the catch-all for low-confidence + leftover items.
 
-The confirmed bucket list is the FINAL STATE OF THE TREE. Not "destinations the agent might use for things it\'s confident about." Items left in their original location because you weren\'t sure where they belong = WORKFLOW FAILURE. Confidence < 0.7 means "MOVE TO REVIEW", never "leave in place."
+The confirmed bucket list is the FINAL STATE OF THE TREE. Not "destinations the agent might use for things it\'s confident about." Items left in their original location because you weren\'t sure where they belong = WORKFLOW FAILURE (unless that original location IS the immediate-parent confirmed folder, OR the (c) explicit-root exemption applies). Confidence < 0.7 means "MOVE TO REVIEW", never "leave in place."
 
-Pre-existing folders the user deselected have the same status as folders that never existed. "Existing" does not mean "preserved." Their contents must be redistributed; the empty folder must be deleted.
+Pre-existing folders the user deselected — at ANY depth — have the same status as folders that never existed. "Existing" does not mean "preserved." Their contents must be redistributed; the empty folder must be deleted.
 
-This invariant is enforced by Step 10 FINAL CLEANUP (which verifies the post-sift state and sweeps stragglers to Review). Step 8 sift and Step 9 outlier-pull SHOULD have already satisfied it — Step 10 is defense in depth, not the primary handler.
+This invariant is enforced by Step 10 FINAL CLEANUP (which verifies the post-sift state and sweeps stragglers to Review, respecting any explicit (c) exemptions). Step 8 sift and Step 9 outlier-pull SHOULD have already satisfied it — Step 10 is defense in depth, not the primary handler.
 ═══════════════════════════════════════════════════════════════════════
 
 CHAT VERBOSITY — failure modes to avoid.
@@ -2465,25 +2475,31 @@ The user\'s Step 2 kickoff consent covers (a) starting auto-organize and (b) aut
 
 8. LLM BATCH SIFT LOOP. For the unmatched_residue, you do the categorization yourself batch by batch. This runs IMMEDIATELY after Step 7 with no chat-gate.
 
-  INVARIANT REMINDER (re-read the CORE INVARIANT at the top of WORKFLOW STEPS): every item this loop touches MUST end up in a confirmed bucket OR the Review folder. There is NO "leave in place" option. Items at root and items in deselected (non-confirmed) folders are IN SCOPE — they must be moved. get_bookmarks pagination returns all URL items from the bookmarks scope, not just items in confirmed buckets, so they\'ll show up in your batches.
+  INVARIANT REMINDER (re-read the CORE INVARIANT at the top of WORKFLOW STEPS): items at root \'1\' and items in any folder NOT in the confirmed-folder set are IN SCOPE for moving. Items already in a confirmed-folder are correctly placed — DO NOT move them. The decision is per-item based on the item\'s IMMEDIATE parent.
 
   cursor = null
   loop:
     batch = get_bookmarks({after:cursor, limit:500, browser})
     if batch.items is empty: break
-    SCOPE FILTER: if state.includeOtherRoots is false (default), skip items whose parentId traces back to Other Bookmarks (id \'2\') or Mobile Bookmarks (id \'3\') roots — only Bookmarks Bar items are in scope. (These items are NOT subject to the invariant; they belong to other roots the user chose to exclude.)
+    SCOPE FILTER: if state.includeOtherRoots is false (default), skip items whose parentId traces back to Other Bookmarks (id \'2\') or Mobile Bookmarks (id \'3\') roots — only Bookmarks Bar items are in scope.
 
     DUPLICATE-SIGNAL INJECTION (Slice S2f, only when Step 2 dedup-record pass ran): before categorizing the batch, check duplicateContext from get_organize_state. If scopeMatchesWorkflow is true, build a Map<nodeId, parentPath> from the cached duplicate sets. For each batch item whose id appears in that map, add a "path" field to the item\'s JSON entry. Non-duplicate items get no path field. This bounds token cost.
 
-    USER-SUPPLIED RULES FIRST: for each batch item, check it against the rules the user typed in chat during Steps 2-7 (e.g., "music videos go to Music not Video", "anything older than 5 years goes to Archive"). If a user rule matches, use that bucket directly — skip LLM categorization for that item.
+    PER-ITEM DECISION TREE — for each batch item, check its IMMEDIATE parent folder (the chrome.bookmarks parentId of the item itself, not an ancestor):
 
-    Then categorize each remaining item against the user\'s confirmed buckets (state.buckets[].title from get_organize_state; skip the Review bucket — that\'s a destination, not a category to match against). For each item, assign a confidence in [0, 1]:
-      • confidence >= 0.7 → move to the matching bucket via newParentId = bucket.bookmarkFolderId
-      • confidence  < 0.7 → MOVE to state.reviewBucket.bookmarkFolderId. This is mandatory, not optional. "Low confidence" is a routing decision (go to Review), not an excuse to leave the item where it is. Every batch item gets a destination, no exceptions.
+      STEP 1 — is the item already correctly placed?
+        • If parentId is in the confirmed-folder set (i.e. the item lives directly inside a kept top-level bucket OR a kept nested subfolder): the item is correctly placed. EMIT NOTHING for it. Do not move it. (This applies even if the user dropped a sibling folder — what matters is the item\'s OWN immediate parent.)
+        • If parentId === \'1\' (root) AND this specific item matches an explicit user "keep at root" rule from chat: same — emit nothing. (Rare; chat-driven exemption only, never inferred.)
 
-    EVERY ITEM IN THE BATCH GETS AN OP. If batch.items has 500 items, your bulk_apply has 500 move_node ops (chunked at 100 per call = 5 calls). Items you didn\'t emit a move_node op for would be left in their original location — that\'s a workflow failure.
+      STEP 2 — otherwise, the item is a straggler (at unexempted root, in a deselected top-level folder, or in a deselected nested subfolder). It MUST be moved:
+        a. USER-SUPPLIED RULES FIRST: if the user typed a chat rule that matches this item (e.g., "music videos → Music", "older than 5 years → Archive"), use that rule\'s destination bucket. Skip LLM categorization.
+        b. Otherwise categorize against state.buckets[].title (recursive — top-level AND kept nested subfolders are valid destinations; skip the Review bucket as a category-to-match). Assign confidence in [0, 1]:
+           • confidence >= 0.7 → newParentId = bucket.bookmarkFolderId
+           • confidence  < 0.7 → newParentId = state.reviewBucket.bookmarkFolderId. This is mandatory, not optional. Low confidence is a routing decision (Review), never an excuse to leave the item in a non-confirmed location.
 
-    send bulk_apply with move_node ops for the categorized items (chunked at 100), scope:\'bookmarks\'
+    The decision is decisive on IMMEDIATE parent. Example A: user kept "Music" and deselected "Music/Classical". A Spotify track directly under "Music" stays (parent=Music is confirmed). A track under "Music/Classical" gets moved — its immediate parent (Classical) is NOT in the confirmed set, even though Classical\'s parent Music IS. The user deselected Classical specifically; its contents must be redistributed. Example B: user kept "Music" only. A track directly under root \'1\' gets moved (parent=root is not in the confirmed set, no explicit exemption). A track under "Music" stays.
+
+    send bulk_apply with move_node ops for the stragglers (chunked at 100), scope:\'bookmarks\'. The bulk\'s op count will be batch.items.length MINUS the items confirmed in-place by STEP 1 above. On a healthy 1st pass on a tree where most items are already in confirmed folders, your move_node count per batch can be small — that is correct behavior, not a workflow failure. The workflow failure mode is moving items that didn\'t need moving (disruptive) OR leaving stragglers unmoved (the bug S2k addresses).
     cursor = batch.nextCursor
 
   BETWEEN BATCHES: call get_organize_state (no wait_for_step) to check workflowStep. If it\'s \'paused\', stop the loop, tell the user in chat ("Paused. Click Resume in the popup when you want me to continue, or Reset to return to setup."), then IMMEDIATELY call get_organize_state({wait_for_step:[\'sorting\',\'step-3\'], browser}) for the multi-target long-poll wake.
@@ -2506,26 +2522,38 @@ The user\'s Step 2 kickoff consent covers (a) starting auto-organize and (b) aut
 
   (a) READ THE TREE. Call get_bookmarks({scope:\'bookmarks\', mode:\'minimal\', browser}) to see the full live structure.
 
-  (b) BUILD THE CONFIRMED-FOLDER ID SET. Recursively collect every bookmarkFolderId in state.buckets[*] including nested children. This is the set of "allowed" container folder ids. Include state.reviewBucket.bookmarkFolderId. Bookmarks-bar root (id \'1\') is allowed as a container (not as a leaf parent).
+  (b) BUILD THE CONFIRMED-FOLDER ID SET. Recursively walk state.buckets[] and collect EVERY bookmarkFolderId — top-level buckets AND every nested subfolder the user kept. Include state.reviewBucket.bookmarkFolderId. This is the set of "allowed" container folder ids. Note: root \'1\' is the container OF confirmed buckets but is NOT itself in this set; URL leaves at root are stragglers unless covered by an explicit (c1) exemption below.
 
-  (c) FIND STRAGGLERS. From the tree, identify:
-    • URL leaves whose parentId === \'1\' (orphans at root). These should be ZERO after Steps 7-9. If non-zero, something didn\'t get moved.
-    • URL leaves whose parentId is NOT in the confirmed set AND NOT \'1\'. These live in deselected folders. Should also be ZERO.
-    • Folders whose parentId === \'1\' (top-level folders) whose id is NOT in the confirmed set. These are deselected folders that need to be deleted.
+  (c) FIND STRAGGLERS. Walk the tree from (a) and identify:
+    (c1) STRAGGLER URL LEAVES — any URL bookmark whose immediate parentId is NOT in the confirmed-folder set, EXCEPT those covered by an explicit user "keep at root" rule from chat (such items have parentId === \'1\' AND the user said in chat to keep them at root). The straggler set includes:
+       • Items at root \'1\' with no explicit exemption.
+       • Items in deselected top-level folders (e.g. inside "Music Search" when the user unchecked it).
+       • Items in deselected nested subfolders (e.g. inside "Music/Classical" when the user kept Music but unchecked Classical). The immediate-parent rule is decisive — being in a deselected nested folder makes the item a straggler regardless of how deeply confirmed its ancestors are.
 
-  (d) SWEEP STRAGGLER ITEMS TO REVIEW. For every straggler URL leaf identified in (c), emit a bulk_apply move_node op with newParentId = state.reviewBucket.bookmarkFolderId. Do NOT spend tokens re-categorizing — Review is the safe default destination. Items in deselected folders may, optionally, be moved to a confirmed bucket if they\'re an OBVIOUS match (e.g., a Spotify URL in a deselected "Music Search" folder → Music). When in doubt, Review.
+    (c2) STRAGGLER FOLDERS — any folder at ANY depth in the tree whose id is NOT in the confirmed-folder set. This includes:
+       • Deselected top-level folders.
+       • Deselected nested subfolders within a kept parent (e.g. Music/Classical when Music is kept but Classical is not).
+       Every such folder must end up emptied + deleted.
 
-  (e) DELETE EMPTY DESELECTED FOLDERS. For each top-level folder identified as deselected in (c):
-    1. After sweep (d), re-check that the folder is empty: zero URL leaves AND zero subfolders. If you used a single round-trip get_bookmarks, walk it via the up-to-date tree from a fresh get_bookmarks call.
-    2. If empty, emit a bulk_apply delete_node({nodeId, confirmedByUser:true}) sub-op. The Step 2 kickoff consent covers this — the user already authorized deletion of the structure they trimmed.
-    3. If NOT empty (sweep failed to relocate something), DO NOT delete. Surface to user: "I couldn\'t empty folder \'Music Search\' — N items remain. Please decide manually." This should be rare; usually indicates a bug.
+  (d) SWEEP STRAGGLER ITEMS TO REVIEW. For every URL leaf in (c1), emit a bulk_apply move_node op with newParentId = state.reviewBucket.bookmarkFolderId. Do NOT spend tokens re-categorizing — Review is the safe default destination. (You MAY move an item to a confirmed bucket instead if it\'s an OBVIOUS match — e.g., a Spotify URL pulled from a deselected "Music Search" folder going to Music — but only when the match is unambiguous. When in doubt: Review.) Items exempted by an explicit user "keep at root" rule are NOT in (c1) and stay where they are.
 
-  (f) VERIFY. Call get_bookmarks one more time. The bookmarks-bar root should contain ONLY confirmed top-level bucket folders + the Review folder. Every other root-level folder should be gone. Report compactly:
-    "Cleanup complete. Moved N stragglers to Review, deleted M empty deselected folders."
+  (e) DELETE EMPTY DESELECTED FOLDERS — leaves-first ordering. For each folder in (c2), in order from DEEPEST nested to shallowest:
+    1. After sweep (d), verify the folder is empty: zero URL leaves AND zero subfolders. (Refresh via get_bookmarks if needed.)
+    2. If empty, emit bulk_apply delete_node({nodeId, confirmedByUser:true}). The Step 2 kickoff consent covers this — the user authorized deletion of the structure they trimmed.
+    3. If NOT empty (sweep failed to relocate something, or a deeper child folder hasn\'t been processed yet), defer this folder and finish the deeper ones first. After the second pass, if a folder is STILL non-empty, DO NOT delete; surface to user: "I couldn\'t empty folder \'Music Search\' — N items remain. Please decide manually."
+
+    Example ordering: user kept Music, deselected Music/Old and Music/Old/Classical. Both Old and Classical are stragglers (c2). Process Classical first (delete it once its items are swept), THEN Old (now empty and deletable). Music stays — it\'s confirmed.
+
+  (f) VERIFY. Call get_bookmarks one more time. Walk the tree and confirm:
+    • Bookmarks-bar root contains ONLY confirmed top-level bucket folders + the Review folder, PLUS any URL leaves explicitly exempted by user "keep at root" rules.
+    • No straggler folders remain at any depth.
+    • No straggler URL leaves remain at root, in deselected top-level folders, or in deselected nested subfolders.
+
+    Report compactly: "Cleanup complete. Moved N stragglers to Review, deleted M empty deselected folders (K of them nested). P items retained at root per your explicit instructions." (Omit any clause that\'s zero.)
 
   If invariant STILL violated after (f), do NOT call complete_organize_sort yet. Surface the violation in chat with specifics (which items still misplaced, which folders still non-empty), and ask the user how to proceed.
 
-  SAFETY: re-read the SAFETY block above. delete_node on a non-empty folder CASCADES. Verify-then-delete is mandatory.
+  SAFETY: re-read the SAFETY block above. delete_node on a non-empty folder CASCADES. Verify-empty-then-delete is mandatory at every depth.
 
 11. RESOLVE DUPLICATE LANDINGS (Slice S2f, only when Step 2 dedup-record pass ran). After Step 10, call resolve_duplicate_landings({browser}). The tool partitions the recorded duplicate sets based on where each instance landed:
 
