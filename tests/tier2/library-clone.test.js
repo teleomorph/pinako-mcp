@@ -64,20 +64,29 @@ describe.skipIf(!TIER2_RUNNABLE)('Tier 2 agent — library-to-library clone', ()
       browser,
     });
 
-    // Seed the source library with a single distinctive group (a TREE
-    // child, not a library-scope note) so we can later assert it appears
-    // in the destination after the clone. Deliberately NOT seeding a
-    // library-notes entry — add_to_library only operates on tree
-    // children, and including notes makes the agent's job ambiguous
-    // (the agent has to know to filter them out of get_library's
-    // response). That ambiguity is real and worth logging as a finding,
-    // but it shouldn't be the source of flakiness for this proof.
+    // Seed the source library with BOTH a tree-scope group AND a
+    // library-scope note. This deliberately reintroduces the ambiguity
+    // that tripped Haiku in the first suite run (Batch 8 finding):
+    // get_library returns children[] + notes[], and a naive agent
+    // would pass note ids into add_to_library's nodeIds. After the
+    // host.js description fix (Batch 8.5), the agent should know
+    // notes are not clonable via add_to_library. Test still asserts no
+    // errored tool calls — so if the agent ignores the description
+    // guidance and the bridge returns SOURCE_NODE_NOT_FOUND, this test
+    // catches it.
     seededGroupTitle = testLabel('tier2-clone-seed-group');
-    seededNoteTitle = null; // intentionally unused; preserved for log parity
+    seededNoteTitle = testLabel('tier2-clone-seed-note');
     await callToolOk(session.client, 'create_group', {
       title: seededGroupTitle,
       scope: 'library',
       libraryId: srcLibraryId,
+      browser,
+    });
+    await callToolOk(session.client, 'create_note', {
+      title: seededNoteTitle,
+      scope: 'library-notes',
+      libraryId: srcLibraryId,
+      content: '<p>tier2 clone seed (notes shouldn\'t be cloned via add_to_library)</p>',
       browser,
     });
   }, TEST_TIMEOUT_MS);
@@ -117,6 +126,14 @@ describe.skipIf(!TIER2_RUNNABLE)('Tier 2 agent — library-to-library clone', ()
       allowedTools: [
         'mcp__pinako__get_library',
         'mcp__pinako__add_to_library',
+        // create_note is allowed so the agent has a clean escape hatch
+        // if it decides to duplicate the source's library-scope note. The
+        // description-fix verification test passes either way: success is
+        // (a) agent skips notes entirely OR (b) agent calls create_note
+        // for the note in addition to add_to_library for the tree node.
+        // What MUST NOT happen: agent passes note ids to add_to_library
+        // and errors. That regression would surface as a failed test.
+        'mcp__pinako__create_note',
       ],
       maxTurns: 15,
     });
