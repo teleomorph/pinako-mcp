@@ -2143,7 +2143,7 @@ const SERVER_INSTRUCTIONS = `Pinako is a browser tab manager Chrome extension. T
 ROUTING — when the user expresses one of these intents, CALL THE LISTED TOOL FIRST instead of planning the task yourself by reading the tree:
 
   "organize / reorganize / clean up / sort / categorize / auto-organize / tidy / structure my bookmarks"
-    → auto_organize_bookmarks  (drives the bookmark reorganization workflow end-to-end via an interactive popup panel; works on small AND large trees; do NOT read get_bookmarks and plan manually). BUT: this tool is Step 3 of the workflow. BEFORE calling it, offer the user a backup (Step 1) AND unconditionally run a dedup-scan-and-record pass (Step 2 — call find_duplicates without asking the user first; it's a read-only millisecond local scan that produces parentPath signal for better sorting). See AUTO-ORGANIZE BOOKMARKS WORKFLOW section below for the full sequence — read it before kickoff. Do NOT ask the user "want me to check for duplicates first?" — that's an old framing; the new flow folds dedup findings into a single combined kickoff message.
+    → Auto-organize via MCP is currently under development. Tell the user: "To organize your bookmarks now, open the Pinako extension and use the native AI chat panel (Pro tier 1+), or click the auto-organize button on the bookmarks panel in Pinako." DO NOT attempt to plan a manual organization from get_bookmarks output — large bookmark trees won't fit in your context window and the safety nets that make organization reliable (review folder, per-batch confirmation, duplicate reconciliation) only exist in the native chat workflow.
 
   "find / remove duplicate bookmarks" / "dedupe"
     → find_duplicates  (then ASK the user whether to (1) move duplicates to a 'Duplicates' folder for visual review or (2) delete the duplicate copies directly via bulk_apply delete_node({confirmedByUser:true}). Both are normal Pinako operations; present them as equal options, don\'t default-pick.)
@@ -2155,9 +2155,9 @@ ROUTING — when the user expresses one of these intents, CALL THE LISTED TOOL F
     → list_browsers FIRST. If the response shows more than one browser, ASK the user which one before any browser-scoped tool call. Do NOT guess from memory or prior conversation about the user's "primary" browser. Exception: if the user named a browser in their request itself ("organize my Brave bookmarks"), treat that as the chosen browser and skip the question. See MULTI-BROWSER → Selection rules below.
 
 WRITE TOOLS (Pro tier 1+)
-Read tools (get_tree, search_tabs, list_libraries, get_library, get_main_tree_notes, get_bookmarks, list_browsers, find_duplicates, get_tree_summary, propose_categories, get_organize_state, get_observations, resolve_duplicate_landings, search_docs) require no special handling.
+Read tools (get_tree, search_tabs, list_libraries, get_library, get_main_tree_notes, get_bookmarks, list_browsers, find_duplicates, get_tree_summary, search_docs) require no special handling.
 
-AUTO-ORGANIZE WORKFLOW TOOLS (see AUTO-ORGANIZE BOOKMARKS WORKFLOW section below): auto_organize_bookmarks (kickoff — call ONCE per session), get_organize_state (poll for user confirmation + Pause detection), apply_heuristic_organize (Step 7 broad-sweep returning planned moves), refine_folder_outliers (Step 9 per-folder outlier-pull within confirmed buckets; Step 10 cleanup uses get_bookmarks + bulk_apply directly), resolve_duplicate_landings (Step 11 reconcile duplicate sets with sift outcomes), complete_organize_sort (Step 12 transition into editable polish state), summarize_organize_results (Step 13 polish-menu data), propose_subcategories (Step 13 / Step 14 recursive sub-folder proposals), record_observation / get_observations (cross-batch sift-loop memory).
+AUTO-ORGANIZE WORKFLOW: temporarily unavailable via MCP. The tools auto_organize_bookmarks, apply_heuristic_organize, refine_folder_outliers, summarize_organize_results, resolve_duplicate_landings, complete_organize_sort, propose_subcategories, get_organize_state, record_observation, get_observations, and propose_categories all return MCP_AUTO_ORGANIZE_UNAVAILABLE if called. Direct the user to Pinako's native AI chat panel for organization tasks (Pro tier 1+; open the Pinako extension popup).
 
 Write tools fall into four categories:
 - METADATA: set_tags, add_tags, remove_tags, set_memo, set_star_color, set_row_color, set_title.
@@ -2299,333 +2299,30 @@ When you receive this response:
 1. Read suggested_actions. Each entry has {type, param, note}. Pick the option that matches the user's intent:
    - type:'mode', param:'minimal' — call the same tool again with mode:'minimal' (smaller payload, no tree structure / no rich content)
    - type:'scope', param:'per-library' — drop include_tabs and fetch one library at a time via get_library
-   - type:'workflow', param:'auto_organize' — for organize/reorganize tasks, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow below
-   - type:'acknowledge', param:'true' — only when the user genuinely needs the full payload and your model has sufficient context
-
-2. NEVER paper over the warning by silently retrying with acknowledge_size:true. The guard exists to keep the agent from burning context on a payload too large to reason over.
-
-3. For very large bookmark trees (10k+ entries) the warning is the rule, not the exception. Defer to auto-organize workflow for any reorganization task.
-
-If the user's actual intent is reorganization rather than just "show me the tree," the right move is the auto-organize workflow (designed for this exact scale problem). Cost-optimization note: model choice matters. For pure categorization-into-folders tasks at scale, a small/cheap model (Haiku, GPT-4-mini, Grok-fast) is sufficient — categorization is a narrow pattern-match task that does NOT require frontier model capabilities. If the user is currently on a premium model and looking at a large-tree reorganize, mention that switching to a cheaper model for the bulk pass and reserving the premium for refinement can reduce cost roughly 3-5x with minimal quality loss. Final cost math is for you to estimate based on your current model's pricing and the est_tokens in the warning — Pinako stays out of model-pricing maintenance.
-
-AUTO-ORGANIZE BOOKMARKS WORKFLOW
-
-When the user asks you to "organize my bookmarks", "reorganize", "clean up my bookmarks", "auto-categorize", "sort my bookmarks into folders", or anything that maps to bulk reorganization of their bookmark collection, DO NOT plan it yourself by reading get_bookmarks and proposing categories manually. Pinako ships a dedicated workflow for this exact task with an interactive panel UI. You DRIVE the workflow from MCP tool calls; the USER drives the panel UI for the folder-structure decisions.
-
-PRE-FLIGHT — BEFORE you call auto_organize_bookmarks, you MUST handle these in order:
-  (a) Offer the user a backup (Step 1 below). For 1000+ bookmarks, insist. For a few hundred, mention it. WAIT for the user's response before continuing.
-  (b) ALWAYS call find_duplicates({scope:'bookmarks', browser}) as part of pre-flight — do NOT ask permission first; it's a read-only millisecond local scan with zero side effects. This produces the parentPath context that the Step 8 LLM sift uses for better placement.
-  (c) Roll the dedup findings + the destructive-consent ask into the SAME message that announces kickoff (see Step 2 for the prescribed phrasing). The user's "OK" approves both: (i) starting auto-organize AND (ii) the Step 11 auto-deletion of converged duplicate copies (delete_node with confirmedByUser:true). One combined consent. Then call auto_organize_bookmarks.
-Skipping the backup offer is the most common mistake. ALWAYS at least mention the backup option before kickoff.
-
-DO NOT ask the user "want me to check for duplicates?" as a separate question. The scan is part of standard pre-flight and runs unconditionally. The user's only consent is the combined kickoff prompt.
-
-WORKFLOW STEPS (14-step, condensed)
-
-USER MENTAL MODEL: there are TWO passes through the bookmark collection.
-  • 1st pass = heuristic moves (mechanical pattern-match, no LLM) + LLM sift of the residue + outlier-pull + final cleanup. This is one continuous operation with NO chat-gates between sub-phases. Ends with the polish menu.
-  • 2nd+ pass = per-folder LLM refinement (starting with Review folder), with subfolder proposals and cross-folder reassignment. Triggered by the user clicking the panel\'s "Continue" button or telling you in chat to do another pass.
-
-The user can stop at the polish menu after the 1st pass and click "Done" — that\'s a valid "good enough" exit. Or they can iterate as many times as they want via Continue.
-
-═══════════════════════════════════════════════════════════════════════
-CORE INVARIANT — read this before anything else.
-
-After the user clicks "Confirm & start sift" in step-4, the confirmed bucket list in state.buckets defines the COMPLETE AND EXCLUSIVE final structure of the bookmarks tree. This is not a suggestion. It is non-negotiable.
-
-DEFINITIONS:
-  • Confirmed-folder set = every bookmarkFolderId in state.buckets[*], RECURSIVELY (top-level buckets AND any nested subfolders the user kept in step-3/step-4). Build this set by walking state.buckets and collecting bookmarkFolderId from every node and its descendants. Include state.reviewBucket.bookmarkFolderId.
-  • Immediate parent = the folder a URL bookmark lives directly inside (its chrome.bookmarks parentId, not a grandparent).
-  • Root = id \'1\' (Bookmarks Bar). The root CONTAINS the confirmed buckets but is NOT itself in the confirmed-folder set.
-
-By the time you call complete_organize_sort, the tree MUST satisfy ALL of:
-
-  1. Every URL bookmark in scope is in EXACTLY ONE of:
-     (a) a folder whose id is in the confirmed-folder set (a confirmed bucket OR a kept nested subfolder), OR
-     (b) the Review folder, OR
-     (c) the bookmarks-bar root \'1\' — IF AND ONLY IF the user has explicitly told you in chat to keep that specific bookmark at root (e.g., "leave my pinned GitHub bookmarks at the root, not in any folder"). Track these as explicit "keep at root" exemptions in working memory. NEVER infer an exemption from context; the user must say so directly.
-
-  2. NO URL bookmark remains unparented at the bookmarks-bar root EXCEPT under the (c) exemption above. Items at root with no explicit exemption are stragglers and must be moved.
-
-  3. NO URL bookmark remains in a folder whose id is NOT in the confirmed-folder set. This covers BOTH:
-     • items in deselected top-level folders (e.g., user unchecked "Music Search" at step-3 — its contents go to Review or a matching bucket), AND
-     • items in deselected nested subfolders within a kept parent (e.g., user kept "Music" but unchecked "Music/Classical" — items under Classical must be moved, even though their grandparent Music is confirmed).
-
-     The immediate-parent rule is decisive: the agent looks at the URL\'s direct parent folder, not its ancestors. "My grandparent is confirmed" does NOT preserve an item whose immediate parent was deselected.
-
-  4. Every folder in the tree (at any depth) whose id is NOT in the confirmed-folder set has been emptied (contents redistributed to a confirmed bucket or Review) and then deleted. This includes deselected top-level folders AND deselected nested subfolders. Delete leaves-first: empty the deepest deselected folders before their (also-deselected) parents.
-
-  5. The Review folder may contain anything — it\'s the catch-all for low-confidence + leftover items.
-
-The confirmed bucket list is the FINAL STATE OF THE TREE. Not "destinations the agent might use for things it\'s confident about." Items left in their original location because you weren\'t sure where they belong = WORKFLOW FAILURE (unless that original location IS the immediate-parent confirmed folder, OR the (c) explicit-root exemption applies). Confidence < 0.7 means "MOVE TO REVIEW", never "leave in place."
-
-Pre-existing folders the user deselected — at ANY depth — have the same status as folders that never existed. "Existing" does not mean "preserved." Their contents must be redistributed; the empty folder must be deleted.
-
-This invariant is enforced by Step 10 FINAL CLEANUP (which verifies the post-sift state and sweeps stragglers to Review, respecting any explicit (c) exemptions). Step 8 sift and Step 9 outlier-pull SHOULD have already satisfied it — Step 10 is defense in depth, not the primary handler.
-═══════════════════════════════════════════════════════════════════════
-
-CHAT VERBOSITY — failure modes to avoid.
-
-Do NOT list items individually in chat. Aggregate counts only:
-  GOOD: "Sorted 487 items (Music: 148, Read: 92, Travel: 67, Review: 23)."
-  BAD:  "Moving spotify.com/track/abc to Music. Moving spotify.com/track/def to Music. Moving spotify.com/track/xyz to Music..."
-
-Do NOT list duplicate URLs individually during dedup:
-  GOOD: "Found 412 duplicates across 287 URLs."
-  BAD:  [reading each duplicate URL]
-
-Do NOT recap your own internal categorization decisions. The user sees the panel updating live.
-
-Progress updates: brief, one line, no bullets:
-  GOOD: "Processing batch 12 of 38…"
-  BAD:  "Working on Spotify links now. Next, GitHub items. Then arxiv. Then…"
-
-Listing per-bucket counts in the final post-sort summary IS appropriate — that\'s synthesis, not enumeration. So is the polish menu\'s per-bucket count display.
-
-═══════════════════════════════════════════════════════════════════════
-
-SAFETY — destructive operations.
-
-NEVER call delete_node on a folder that still contains URL leaves or subfolders. The delete cascades and items are lost; Pinako has snapshot undo but it is not a guarantee, and the user will be upset. Before any folder delete:
-
-  1. Verify the folder is empty. Read get_bookmarks and inspect the folder\'s children. URL-leaf count AND subfolder count must BOTH be zero.
-  2. If non-empty, move the contents first (to Review by default, or to a confirmed bucket if the item is an obvious match). Re-verify empty.
-  3. ONLY THEN call delete_node({nodeId, confirmedByUser:true}).
-
-The user\'s Step 2 kickoff consent covers (a) starting auto-organize and (b) auto-deleting CONVERGED DUPLICATE COPIES in Step 11. It does NOT cover deleting populated folders. If you ever conclude that a populated folder needs to be deleted as-is (with contents), you MUST obtain an explicit per-action consent in chat first — show the user what\'s inside and ask. Do not assume.
-
-═══════════════════════════════════════════════════════════════════════
-
-1. SUGGEST A BACKUP. Pinako bookmark backup (preserves Pinako-specific metadata) or Chrome's native export (Bookmark Manager → menu → Export bookmarks). For a few hundred bookmarks, mention it; for 1000+ insist. ALWAYS surface this BEFORE calling auto_organize_bookmarks. Wait for the user's response; don't proceed until they have decided (back up, skip, or already done).
-
-2. DEDUP-RECORD PASS (mandatory pre-flight, dedup-as-signal). UNCONDITIONALLY call find_duplicates({scope:'bookmarks', browser}) after the user has decided about backup (Step 1) and BEFORE calling auto_organize_bookmarks. The bridge auto-caches the result (each duplicate set carries each instance\'s parentPath — slash-joined breadcrumb of its current folder location) on lastDuplicateScan; the auto-organize pipeline reads this in Step 8 to use folder names as semantic signal, then reconciles post-sift in Step 11 via resolve_duplicate_landings.
-
-   Do NOT move or delete duplicates here. Do NOT ask the user beforehand whether to scan — the scan is part of standard pre-flight. After the call returns, draft the COMBINED KICKOFF MESSAGE that bundles dedup findings + destructive consent + the OK-to-start prompt into ONE message. DO NOT include the rules-invitation here — that comes in the post-panel-open chat (Step 3) so the user can think about rules while actually examining their folders. Template (adapt wording naturally):
-
-   "Found [totalDuplicateInstances] duplicate copies across [uniqueDuplicateUrls] URLs. I\'ll use each copy\'s current folder as a sorting hint, then auto-delete redundant copies that land in the same bucket and flag divergent ones (different buckets) for your review.
-
-   Ready to kick off the auto-organize? I\'ll open the panel in your Pinako popup — you\'ll review and adjust your existing folder structure first, then I\'ll show heuristic-suggested additions for you to accept or reject."
-
-   Adapt the wording if zero duplicates: "No duplicates found — clean tree. Ready to kick off?"
-
-   The user\'s "yes" / "OK" / "go ahead" is the single consent that authorizes BOTH (a) calling auto_organize_bookmarks now AND (b) the Step 11 auto-deletion of converged duplicate copies via delete_node({confirmedByUser:true}). No second prompt at Step 11 — the consent covers it.
-
-   COLLECTING RULES (anytime once the panel is open, ongoing): the user types rules in chat. Rules collection is invited in the Step 3 post-panel chat (see Step 3 template). Acknowledge each one briefly ("Got it — videos that look like music videos go to Music"). Keep them in your working memory. Apply them during Step 8 (LLM sift) by checking each item against user-supplied rules BEFORE falling back to general LLM categorization. v1 limitation: you can\'t register custom rules in the heuristic library, so rule application is entirely on you. If the user types a rule BEFORE the panel opens (uncommon but possible), accept and acknowledge — don\'t reject it.
-
-   EXPLICIT-SKIP-DEDUP CASE: only if the user volunteers "skip dedup", may you bypass the scan. Do not preemptively offer the skip option.
-
-   STANDALONE DEDUP CASE: if the user wants to dedup OUTSIDE the auto-organize workflow, the original two-option flow applies — see find_duplicates tool description case A (move-to-Duplicates-folder vs delete-directly).
-
-3. KICKOFF — open the panel. Call auto_organize_bookmarks({scope:\'bookmarks\', browser}) EXACTLY ONCE. This atomically:
-  (a) computes heuristic-suggested category folders from the user\'s bookmark URL patterns — returned in the response as suggestions:[{target, count, sampleTitles}]. The popup also caches them; they\'ll surface in step-4 of the panel UI.
-  (b) opens the auto-organize panel in the popup, starting at step-3 (existing-folders review).
-
-  Do NOT call this tool more than once per session.
-
-  POST-PANEL CHAT REPLY — instructions + rules invitation. Send a single message that (i) explains the step-3 panel mechanics in actionable terms and (ii) invites the user to type any sorting rules now while they have the panel open. Do NOT list the response\'s matched-categories as "the structure your bookmarks will use" — that misframes the workflow. Use this template (adapt naturally):
-
-  "Panel is open. Take a moment to review your existing folder structure:
-  - Keep folders you want by leaving them checked.
-  - Drop folders you don\'t want by unchecking them. Their contents will be redistributed during sorting.
-  - Drag rows to reorder, or to nest a folder under another.
-  - Add new top-level folders by clicking the \'Add folder\' row at the top of the panel.
-
-  While you\'re reviewing, feel free to type any organizing guidelines or rules you\'d like me to apply during the sort — for example: \'put music videos in Music, not Video\', \'older than 5 years → Archive\', or \'reddit.com/r/cooking → Food\'. I\'ll apply them when I get to the actual sorting work.
-
-  When you\'re ready, click Continue to see [N] heuristic-suggested categories I can propose to add. You\'ll be able to accept, reject, or rename each one on that next screen. Then click \'Confirm & start sift\' to kick off the sort."
-
-  ([N] = suggestions.length from the tool response. If 0, omit the "see [N]…" sentence and just say "When you\'re ready, click Continue to confirm your structure and start the sort.")
-
-4. STEP-3 WAIT + STEP-4 WALKTHROUGH. Call get_organize_state({wait_for_step:[\'step-4\',\'sorting\'], browser}) immediately after auto_organize_bookmarks. This multi-target long-poll wakes when EITHER the user clicks Continue (→ \'step-4\', shows suggestion overlay) OR they skip directly to Confirm & start sift (→ \'sorting\').
-
-  • On step-4 wake: the panel is now showing kept existing folders + heuristic-suggested additions (suggestions are UNCHECKED by default, marked with a ✨ suggested tag). Send a brief chat message explaining the suggestion phase:
-    "I\'ve added [N] suggested folders to the panel based on patterns in your bookmarks (Spotify items → Music, GitHub → Programming, etc.). Scroll down in the panel if you don\'t see them — they\'re appended below your existing folders. Check the ones you want to keep, uncheck the ones you don\'t, and drag to reorder or nest. These suggestions are basic pattern-matching, not AI judgement — the AI will do more refined sorting and may propose more folders later, during the actual sort. When you\'re ready, click \'Confirm & start sift\' to begin."
-
-    Then call get_organize_state({wait_for_step:\'sorting\', browser}) to wake on Confirm.
-
-  • On sorting wake (direct): no walkthrough needed. Proceed straight to Step 6.
-
-  Do NOT chain-poll without wait_for_step. Do NOT ask the user to verbally confirm they clicked buttons — the bridge sees clicks directly. If a wait returns with waitResult.timedOut:true (5 min), ask in chat whether to keep waiting or abort.
-
-5. (Reserved — rules are collected throughout per Step 2, no separate ask.)
-
-6. READ THE CONFIRMED STRUCTURE. Once workflowStep === \'sorting\', read state.buckets[] for the confirmed folder structure. Each bucket has {id, title, bookmarkFolderId, isSuggestion, isExisting, children}. bookmarkFolderId is the chrome.bookmarks folder id where moves go.
-
-  EMPTY-BUCKETS BOOTSTRAP MODE. If state.buckets is empty or contains only the Review bucket (isReview:true), the user explicitly opted into "let the AI build the structure from scratch." Bootstrap BEFORE Step 7\'s regular flow:
-    (a) Call apply_heuristic_organize as normal. moves[] will be empty; skippedTargets[] will be heavily populated.
-    (b) Read skippedTargets[] (sorted by count descending). These ARE your bucket candidates.
-    (c) Pick top candidates: count >= 10, cap ~15 buckets total. Skip any whose title duplicates Review.
-    (d) For each picked candidate, call create_folder({scope:\'bookmarks\', parentId:\'1\', title:target}). The Bug 2 fix (2026-05-15) ensures the popup ingests each freshly-created top-level folder into state.buckets BEFORE the create_folder MCP call resolves; the bridge\'s organizeStateUpdate arrives first, then editApplied. So when you call apply_heuristic_organize next, state.buckets already includes the new folders.
-    (e) Call apply_heuristic_organize AGAIN — now the bucket-title lookup hits the newly-created folders and moves[] populates. Apply via bulk_apply per Step 7.
-    (f) Continue to Step 8 sift loop as normal.
-
-    Tell the user before step (d): "You didn\'t pre-define any categories, so I\'ll create them based on what\'s actually in your bookmarks. Found [N] likely categories — creating now: Music (148 items), Programming (92), Research (23), …"
-
-    This is the ONLY case where YOU populate the bucket structure on the user\'s behalf. If state.buckets has SOME user-kept entries, respect them — don\'t auto-create for skippedTargets in that case.
-
-7. HEURISTIC BROAD-SWEEP. Call apply_heuristic_organize({browser}) once. Returns:
-  - moves[] — ready-to-apply moves
-  - skippedTargets[] — heuristic rules whose target title doesn\'t exist as a bucket. DO NOT stop and chat-prompt the user about these. The user already decided the bucket structure in step-3 + step-4; skipped targets just mean the LLM (Step 8) will categorize those items into whatever buckets DO exist, or send them to Review. Note skippedTargets in your working memory in case it\'s useful at polish time, but proceed.
-  - bucketSummary[] — preview of moves per bucket
-  - unmatched_residue — count needing the LLM sift loop in Step 8
-
-  APPLY THE MOVES via bulk_apply chunked at 100 ops per call, scope:\'bookmarks\'. Each op: {type:\'move_node\', nodeId, newParentId}. Pass chrome.bookmarks ids through; the popup translates server-side.
-
-  CONTINUE IMMEDIATELY TO STEP 8 — no chat-gate between heuristic and LLM. The user has already authorized the full 1st pass via the Step 2 kickoff consent + the step-4 Confirm click. Halting here to ask "want me to add folders?" is wrong — that\'s polish-menu territory after the full 1st pass completes.
-
-8. LLM BATCH SIFT LOOP. For the unmatched_residue, you do the categorization yourself batch by batch. This runs IMMEDIATELY after Step 7 with no chat-gate.
-
-  INVARIANT REMINDER (re-read the CORE INVARIANT at the top of WORKFLOW STEPS): items at root \'1\' and items in any folder NOT in the confirmed-folder set are IN SCOPE for moving. Items already in a confirmed-folder are correctly placed — DO NOT move them. The decision is per-item based on the item\'s IMMEDIATE parent.
-
-  cursor = null
-  loop:
-    batch = get_bookmarks({after:cursor, limit:500, browser})
-    if batch.items is empty: break
-    SCOPE FILTER: if state.includeOtherRoots is false (default), skip items whose parentId traces back to Other Bookmarks (id \'2\') or Mobile Bookmarks (id \'3\') roots — only Bookmarks Bar items are in scope.
-
-    DUPLICATE-SIGNAL INJECTION (Slice S2f, only when Step 2 dedup-record pass ran): before categorizing the batch, check duplicateContext from get_organize_state. If scopeMatchesWorkflow is true, build a Map<nodeId, parentPath> from the cached duplicate sets. For each batch item whose id appears in that map, add a "path" field to the item\'s JSON entry. Non-duplicate items get no path field. This bounds token cost.
-
-    PER-ITEM DECISION TREE — for each batch item, check its IMMEDIATE parent folder (the chrome.bookmarks parentId of the item itself, not an ancestor):
-
-      STEP 1 — is the item already correctly placed?
-        • If parentId is in the confirmed-folder set (i.e. the item lives directly inside a kept top-level bucket OR a kept nested subfolder): the item is correctly placed. EMIT NOTHING for it. Do not move it. (This applies even if the user dropped a sibling folder — what matters is the item\'s OWN immediate parent.)
-        • If parentId === \'1\' (root) AND this specific item matches an explicit user "keep at root" rule from chat: same — emit nothing. (Rare; chat-driven exemption only, never inferred.)
-
-      STEP 2 — otherwise, the item is a straggler (at unexempted root, in a deselected top-level folder, or in a deselected nested subfolder). It MUST be moved:
-        a. USER-SUPPLIED RULES FIRST: if the user typed a chat rule that matches this item (e.g., "music videos → Music", "older than 5 years → Archive"), use that rule\'s destination bucket. Skip LLM categorization.
-        b. Otherwise categorize against state.buckets[].title (recursive — top-level AND kept nested subfolders are valid destinations; skip the Review bucket as a category-to-match). Assign confidence in [0, 1]:
-           • confidence >= 0.7 → newParentId = bucket.bookmarkFolderId
-           • confidence  < 0.7 → newParentId = state.reviewBucket.bookmarkFolderId. This is mandatory, not optional. Low confidence is a routing decision (Review), never an excuse to leave the item in a non-confirmed location.
-
-    The decision is decisive on IMMEDIATE parent. Example A: user kept "Music" and deselected "Music/Classical". A Spotify track directly under "Music" stays (parent=Music is confirmed). A track under "Music/Classical" gets moved — its immediate parent (Classical) is NOT in the confirmed set, even though Classical\'s parent Music IS. The user deselected Classical specifically; its contents must be redistributed. Example B: user kept "Music" only. A track directly under root \'1\' gets moved (parent=root is not in the confirmed set, no explicit exemption). A track under "Music" stays.
-
-    send bulk_apply with move_node ops for the stragglers (chunked at 100), scope:\'bookmarks\'. The bulk\'s op count will be batch.items.length MINUS the items confirmed in-place by STEP 1 above. On a healthy 1st pass on a tree where most items are already in confirmed folders, your move_node count per batch can be small — that is correct behavior, not a workflow failure. The workflow failure mode is moving items that didn\'t need moving (disruptive) OR leaving stragglers unmoved (the bug S2k addresses).
-    cursor = batch.nextCursor
-
-  BETWEEN BATCHES: call get_organize_state (no wait_for_step) to check workflowStep. If it\'s \'paused\', stop the loop, tell the user in chat ("Paused. Click Resume in the popup when you want me to continue, or Reset to return to setup."), then IMMEDIATELY call get_organize_state({wait_for_step:[\'sorting\',\'step-3\'], browser}) for the multi-target long-poll wake.
-    • Wake on \'sorting\': resume the sift loop from the current cursor.
-    • Wake on \'step-3\': user is re-editing structure. state.buckets is invalidated. Re-register wait_for_step:\'sorting\'. After re-Confirm wake, restart Step 7+8 from cursor:null.
-
-  Do NOT chat-prompt "tell me when you\'re ready" — the wait is server-side.
-
-  USE THE OBSERVATION LOG. As you notice cross-batch patterns, call record_observation({pattern, count, examples, batch_n}). Before each next batch, call get_observations and include the digest in your reasoning — cross-batch memory.
-
-  After the loop exits (batch.items empty), continue IMMEDIATELY to Step 9 — no chat-gate.
-
-9. OUTLIER-PULL REFINEMENT (per populated CONFIRMED folder). After Step 8 completes, scan each populated confirmed bucket for items that landed there but don\'t belong. Iterate over state.buckets[] minus the Review bucket; for each, call refine_folder_outliers({folder_id: bucket.bookmarkFolderId, browser}). It returns the items in that folder + the sibling buckets. SCAN THE ITEMS for outliers — output should be SPARSE (5-15% relocations typical). For items that clearly belong in a sibling bucket, emit bulk_apply move_node ops with newParentId = siblingBucket.bookmarkFolderId. For ambiguous items (confidence < 0.7), route to reviewBucket.bookmarkFolderId. Items confidently in the right bucket stay; emit nothing for them.
-
-  Note: Step 9 only operates on CONFIRMED buckets. Deselected folders and root-level stragglers are handled by Step 10 FINAL CLEANUP.
-
-  PATTERN EMERGENCE: if you notice a strong sub-pattern within a folder (e.g., 40% of "Music" items are clearly podcasts, or "News" splits into "Tech News" + "World News"), call record_observation. The user will see these in the Step 13 polish menu as sub-folder suggestions.
-
-10. FINAL CLEANUP (invariant enforcement). Mandatory step between Step 9 and the duplicate resolution / polish transition. This is where the CORE INVARIANT (top of WORKFLOW STEPS) is verified and enforced as defense-in-depth — Step 8 should have placed everything correctly, but reality often diverges.
-
-  (a) READ THE TREE. Call get_bookmarks({scope:\'bookmarks\', mode:\'minimal\', browser}) to see the full live structure.
-
-  (b) BUILD THE CONFIRMED-FOLDER ID SET. Recursively walk state.buckets[] and collect EVERY bookmarkFolderId — top-level buckets AND every nested subfolder the user kept. Include state.reviewBucket.bookmarkFolderId. This is the set of "allowed" container folder ids. Note: root \'1\' is the container OF confirmed buckets but is NOT itself in this set; URL leaves at root are stragglers unless covered by an explicit (c1) exemption below.
-
-  (c) FIND STRAGGLERS. Walk the tree from (a) and identify:
-    (c1) STRAGGLER URL LEAVES — any URL bookmark whose immediate parentId is NOT in the confirmed-folder set, EXCEPT those covered by an explicit user "keep at root" rule from chat (such items have parentId === \'1\' AND the user said in chat to keep them at root). The straggler set includes:
-       • Items at root \'1\' with no explicit exemption.
-       • Items in deselected top-level folders (e.g. inside "Music Search" when the user unchecked it).
-       • Items in deselected nested subfolders (e.g. inside "Music/Classical" when the user kept Music but unchecked Classical). The immediate-parent rule is decisive — being in a deselected nested folder makes the item a straggler regardless of how deeply confirmed its ancestors are.
-
-    (c2) STRAGGLER FOLDERS — any folder at ANY depth in the tree whose id is NOT in the confirmed-folder set. This includes:
-       • Deselected top-level folders.
-       • Deselected nested subfolders within a kept parent (e.g. Music/Classical when Music is kept but Classical is not).
-       Every such folder must end up emptied + deleted.
-
-  (d) SWEEP STRAGGLER ITEMS TO REVIEW. For every URL leaf in (c1), emit a bulk_apply move_node op with newParentId = state.reviewBucket.bookmarkFolderId. Do NOT spend tokens re-categorizing — Review is the safe default destination. (You MAY move an item to a confirmed bucket instead if it\'s an OBVIOUS match — e.g., a Spotify URL pulled from a deselected "Music Search" folder going to Music — but only when the match is unambiguous. When in doubt: Review.) Items exempted by an explicit user "keep at root" rule are NOT in (c1) and stay where they are.
-
-  (e) DELETE EMPTY DESELECTED FOLDERS — leaves-first ordering. For each folder in (c2), in order from DEEPEST nested to shallowest:
-    1. After sweep (d), verify the folder is empty: zero URL leaves AND zero subfolders. (Refresh via get_bookmarks if needed.)
-    2. If empty, emit bulk_apply delete_node({nodeId, confirmedByUser:true}). The Step 2 kickoff consent covers this — the user authorized deletion of the structure they trimmed.
-    3. If NOT empty (sweep failed to relocate something, or a deeper child folder hasn\'t been processed yet), defer this folder and finish the deeper ones first. After the second pass, if a folder is STILL non-empty, DO NOT delete; surface to user: "I couldn\'t empty folder \'Music Search\' — N items remain. Please decide manually."
-
-    Example ordering: user kept Music, deselected Music/Old and Music/Old/Classical. Both Old and Classical are stragglers (c2). Process Classical first (delete it once its items are swept), THEN Old (now empty and deletable). Music stays — it\'s confirmed.
-
-  (f) VERIFY. Call get_bookmarks one more time. Walk the tree and confirm:
-    • Bookmarks-bar root contains ONLY confirmed top-level bucket folders + the Review folder, PLUS any URL leaves explicitly exempted by user "keep at root" rules.
-    • No straggler folders remain at any depth.
-    • No straggler URL leaves remain at root, in deselected top-level folders, or in deselected nested subfolders.
-
-    Report compactly: "Cleanup complete. Moved N stragglers to Review, deleted M empty deselected folders (K of them nested). P items retained at root per your explicit instructions." (Omit any clause that\'s zero.)
-
-  If invariant STILL violated after (f), do NOT call complete_organize_sort yet. Surface the violation in chat with specifics (which items still misplaced, which folders still non-empty), and ask the user how to proceed.
-
-  SAFETY: re-read the SAFETY block above. delete_node on a non-empty folder CASCADES. Verify-empty-then-delete is mandatory at every depth.
-
-11. RESOLVE DUPLICATE LANDINGS (Slice S2f, only when Step 2 dedup-record pass ran). After Step 10, call resolve_duplicate_landings({browser}). The tool partitions the recorded duplicate sets based on where each instance landed:
-
-    CONVERGED — all surviving instances in same bucket. Per the Step 2 pre-consent, AUTO-DELETE the redundant copies: send ONE bulk_apply containing a delete_node sub-op per deleteNodeId across all converged sets, with confirmedByUser:true and scope:'bookmarks'. Aggregate the total deletableCount and the bucket distribution into a one-line user report: "Auto-deleted 287 duplicate copies — kept one of each in [Music, Programming, Recipes, …]."
-
-    DIVERGED — instances split across multiple destinations. DO NOT auto-act. Hold the divergedSets[] for the Step 13 polish menu (the divergent count is surfaced there as a menu option). When the user picks that option, present each set per-row with options: consolidate to one bucket (delete the rest), leave as multiple homes (no action), or move minorities elsewhere.
-
-    RESIDUE — all instances still in their original folders (sift didn\'t categorize any of them). Note: with the CORE INVARIANT enforced by Step 10, this case should be rare — most items will have been swept to Review or a confirmed bucket. Any remaining residue is fine to leave.
-
-    MISSING — instances that no longer exist (manual deletes during the workflow). Reported in summary.missing; the set is processed using surviving instances. Sets reduced to 1 surviving instance are skipped (no longer a duplicate).
-
-    AMBIGUOUS-CASE PARKING: items routed to the Review bucket in Steps 8 and 9 are still the safety net. Mention to the user as part of the summary: "I sorted N items. M went to Review for your judgment. K duplicates were auto-consolidated; L duplicate sets need your decision in the polish menu."
-
-12. ENTER POLISH STATE. After Step 11 completes (or skipped if Step 2 dedup was bypassed), call complete_organize_sort({browser}) to transition the popup from the read-only sorting view to the editable polish view. The user can now add / rename / drag / delete-empty buckets directly in the panel, OR click panel buttons (Continue / Done), OR chat with you. Without this call, the panel stays in sorting state.
-
-13. POLISH MENU. After complete_organize_sort returns, call summarize_organize_results({browser}) for the post-sort summary: per-bucket counts, Review folder count, observation digest, sub-folder candidates (high-count buckets), and (Slice S2f) duplicates counts if Step 2 ran. Present the polish menu in chat:
-
-    "1st pass complete. I sorted [totalSorted] items:
-      - Music: 148
-      - Programming: 92
-      - Research: 23
-      - Review: 12 items I wasn\'t sure about
-      - Auto-consolidated [converged] duplicate set(s); [diverged] need your review
-
-    Options:
-      • Click \'Continue\' in the panel for a 2nd pass — I\'ll re-examine each folder (starting with Review), propose sub-folders where it makes sense, and move things between folders if I notice better fits.
-      • Tell me any further rules or hints in chat — they\'ll apply on the next pass.
-      • Resolve [diverged] divergent duplicate set(s) — pick one bucket per URL or keep multiple homes  [omit if diverged === 0]
-      • Make corrections — name a specific misplacement (\"the Spotify Daft Punk track should be in Music not Review\")
-      • Click \'Done\' in the panel when you\'re satisfied — closes the auto-organize panel; the bookmarks panel stays open."
-
-    Then register the polish-wait: call get_organize_state({wait_for_step:[\'idle\',\'refining\'], browser}). This is the multi-target long-poll for polish-button clicks:
-      • Wake on \'refining\': user clicked Continue. Proceed to Step 14 (2nd pass).
-      • Wake on \'idle\': user clicked Done. Confirm completion: "Done. Your bookmarks are organized. Closing the panel — your bookmarks panel stays open so you can keep browsing." Workflow ends.
-
-    While the long-poll is open, the user may also type in chat. Most chat fires another tool call on your side which would compete with the long-poll. That\'s fine — both the long-poll and your chat-reply actions can run; whichever fires first wins. If the user makes chat-driven changes (corrections, divergent-duplicate decisions, etc.), apply them via the appropriate tools, then re-register the polish-wait at the end of your reply if the workflow is still in \'polish\'.
-
-    CHAT-DRIVEN ACTIONS during polish (use whichever the user requests):
-      - Resolve divergent duplicate sets → use divergedSets[] from the resolve_duplicate_landings response. Walk the user through each set: show the URL, sample title, and each instance\'s currentBucketTitle + originalParentPath. Ask: "[URL Title]: copies landed in [Music, Programming]; original folders were [Gift ideas for mom, March 2022]. Keep all, consolidate to Music (delete Programming copy), or consolidate to Programming?" Apply via bulk_apply (delete_node for consolidations).
-      - Make corrections → user names a specific misplacement (e.g., "move the Spotify track from Review to Music"). Use bulk_apply move_node directly. Don\'t require a Continue click.
-      - User wants new buckets → tell them to add the folder by typing a name in the Add Folder row in the panel and pressing Enter (the panel allows direct editing during polish). New buckets they add will appear in state.buckets on next get_organize_state read.
-
-14. SECOND-PASS REFINEMENT (S2j, 2026-05-15). Triggered when the polish-wait wakes on workflowStep === \'refining\' (user clicked Continue button). The 2nd pass differs from the 1st in approach: per-folder analysis instead of sequential batches.
-
-    LOAD CONTEXT: call get_organize_state to read the current state.buckets[]. Build a working list of (bucketTitle, bookmarkFolderId) pairs — keep this list in working memory throughout the pass. It\'s your reference for cross-folder reassignment.
-
-    PASS ORDER:
-    (a) START WITH THE REVIEW FOLDER. Call refine_folder_outliers({folder_id: reviewBucket.bookmarkFolderId, browser}) and walk through ALL items (not just outliers — Review is the dumping ground for low-confidence; everything here needs a fresh look). Apply any user-supplied rules added since the 1st pass. For each item: pick the best bucket from your working list (using the rules + the new folders the user added during polish). If still ambiguous, leave in Review.
-
-    (b) PER-FOLDER REFINEMENT. For each populated bucket (state.buckets minus Review):
-        • Call refine_folder_outliers({folder_id: bucket.bookmarkFolderId, browser}) to read its items + sibling-bucket context.
-        • Apply any user-supplied rules first (e.g., the "music videos → Music" rule re-runs against items currently in Videos).
-        • CROSS-FOLDER REASSIGNMENT: for each item, consider whether it actually fits a DIFFERENT bucket better given the user\'s rules and the full folder list. Use your working memory of (bucketTitle, bookmarkFolderId) pairs. If you find a better fit, emit bulk_apply move_node with newParentId = the better bucket\'s bookmarkFolderId.
-        • SUB-FOLDER PROPOSALS: if the bucket has 50+ items and you notice a clear sub-pattern (e.g., 40% of Music is podcasts, or News splits into Tech News + World News), call propose_subcategories({folder_id: bucket.bookmarkFolderId, browser}) to get the bridge\'s domain/path-token analysis for that bucket. If the proposals look good, mention to the user in chat: "Music has 148 items; I see a strong podcast pattern (~60 items) and a soundtracks cluster (~25 items). Want me to create sub-folders?" If they say yes (or implied yes from earlier rules), create the sub-folders via create_folder({scope:\'bookmarks\', parentId: bucket.bookmarkFolderId, title: <suggestion>}) and move matching items into them. Stop at depth 3 per bucket to avoid runaway nesting; track depth in working memory.
-
-    (c) AFTER ALL FOLDERS PROCESSED, call complete_organize_sort({browser}) again to transition back to polish state. Re-present the polish menu with the updated summary (call summarize_organize_results again). Register get_organize_state({wait_for_step:[\'idle\',\'refining\']}) — loop.
-
-    NOTES:
-    • The 2nd pass IS more expensive than the 1st (per-folder + cross-folder analysis). User explicitly opts in by clicking Continue. Don\'t hedge on cost in chat; the user already chose. You may briefly mention model choice if they\'re on a premium tier ("This pass is a bit more thorough; if you want to keep cost down, you can switch to a cheaper model for it").
-    • Subfolders created in this pass are NOT auto-added to state.buckets (the popup\'s ingest helper only tracks top-level folders). Track them in your own working memory using the returned create_folder bookmarkId. For Step 14 purposes this is fine — you\'re moving items, not re-categorizing across the new subfolders.
-    • If user clicks Pause during refining: handle exactly like Step 8 pause — wait_for_step:[\'sorting\',\'step-3\',\'refining\']. (See Step 8 BETWEEN BATCHES handling; \'refining\' wake just means Resume continues the pass.)
-
-SCOPE
-v1 ships scope:'bookmarks' only. tree + library scopes (auto-organize main tree into libraries, sub-folder a large library) are planned but not implemented yet.
-
-COST AND MODEL
-Categorization at scale is a narrow pattern-match task. If the user is on a premium model (Sonnet, GPT-4, etc.) and looking at a large tree, mention that switching to a cheaper model (Haiku, GPT-4-mini, Grok-fast) for the bulk Step-8 sift and reserving the premium model for any refinement step reduces cost roughly 3-5x with minimal quality loss.
-
+   - type:'workflow', param:'auto_organize' — for organize/reorganize tasks, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW (TEMPORARILY UNAVAILABLE)
+The auto-organize MCP tools (auto_organize_bookmarks, apply_heuristic_organize, refine_folder_outliers, summarize_organize_results, resolve_duplicate_landings, complete_organize_sort, propose_subcategories, get_organize_state, record_observation, get_observations, propose_categories) are temporarily disabled and return MCP_AUTO_ORGANIZE_UNAVAILABLE. The full MCP-based workflow is preserved in code for a future revisit but is not active in v1.
+If the user asks to organize / reorganize / clean up / sort / categorize / auto-organize / tidy / structure their bookmarks: direct them to open the Pinako extension popup and use the native AI chat panel (Pro tier 1+), or click the auto-organize button on the bookmarks panel in Pinako. Do NOT attempt to plan a manual organization from get_bookmarks output — large bookmark trees exceed agent context windows and the safety nets (review folder, per-batch confirmation, duplicate reconciliation) only exist in the native chat workflow.
 CONNECTION RECOVERY
 If a tool returns "No data yet — open the Pinako extension first", or list_browsers returns an empty list when the user expects browsers to be connected, the Pinako extension's connection to this MCP server has lapsed. Tell the user to open the Pinako extension popup (click the Pinako icon in their browser toolbar). That re-establishes the native-messaging connection and brings the data back. This rarely happens after initial install, but can occur after PC sleep/wake, browser restart, or extended idle periods. The user does not need to restart your client (Claude Desktop, Cursor, etc.) — just opening the popup is enough.
 
 For complete documentation, see: https://pinako.pro/docs/ai-connect`;
+
+// Auto-organize MCP route is temporarily disabled. The handlers below for auto_organize_bookmarks,
+// apply_heuristic_organize, refine_folder_outliers, summarize_organize_results,
+// resolve_duplicate_landings, complete_organize_sort, propose_subcategories, get_organize_state,
+// record_observation, get_observations, and propose_categories all early-return this shape.
+// Underlying helpers (_applyHeuristicsToTree, _findDuplicateUrls, _proposeCategoriesFromResidue,
+// _organizeStateWaiters, _organizeObservationLog, etc.) are preserved in code for a future revisit.
+const MCP_AUTO_ORGANIZE_DISABLED_RESPONSE = {
+  content: [{ type: 'text', text: JSON.stringify({
+    ok: false,
+    error: {
+      code: 'MCP_AUTO_ORGANIZE_UNAVAILABLE',
+      message: 'Auto-organize via MCP is still under development. To organize your bookmarks now, open the Pinako native AI chat in the extension, or click the auto-organize button on the bookmarks panel in Pinako.',
+    },
+  }) }],
+  isError: true,
+};
 
 function createMcpServer() {
   const srv = new McpServer(
@@ -2794,7 +2491,7 @@ function createMcpServer() {
         suggestedActions: [
           { type: 'mode', param: 'minimal', note: 'Compact mode reduces tokens per node ~2-4x' },
           { type: 'pagination', param: 'after+limit', note: 'Pass limit:500 (and after:<lastId> on subsequent calls) for paginated reads — bypasses this guard and chunks the tree' },
-          { type: 'workflow', param: 'auto_organize', note: 'If the user wants to reorganize, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow (see SERVER_INSTRUCTIONS); it reads in cursor-paginated batches and writes in chunked bulk_apply' },
+          { type: 'native_chat', param: 'pinako_extension', note: 'If the user wants to reorganize, direct them to the Pinako native AI chat in the extension (auto-organize via MCP is currently unavailable)' },
         ],
       });
       if (guard) {
@@ -2891,7 +2588,7 @@ function createMcpServer() {
             { type: 'mode', param: 'minimal', note: 'Use mode:"minimal" to reduce per-node tokens (~2-4x compression)' },
             { type: 'scope', param: 'per-library', note: 'Drop include_tabs and fetch one library at a time via get_library' },
             { type: 'pagination', param: 'after+limit', note: 'Pass limit:50 to chunk through libraries (cross-library tabs still embedded per-library; use get_library pagination for a single huge library)' },
-            { type: 'workflow', param: 'auto_organize', note: 'If the user wants to reorganize, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow' },
+            { type: 'native_chat', param: 'pinako_extension', note: 'If the user wants to reorganize, direct them to the Pinako native AI chat in the extension (auto-organize via MCP is currently unavailable)' },
           ],
         });
         if (guard) {
@@ -3023,7 +2720,7 @@ function createMcpServer() {
         suggestedActions: [
           { type: 'mode', param: 'minimal', note: 'Use mode:"minimal" or "lite" to reduce per-node tokens' },
           { type: 'pagination', param: 'after+limit', note: 'Pass limit:500 (and after:<lastId> on subsequent calls) for paginated reads — bypasses this guard and chunks the library' },
-          { type: 'workflow', param: 'auto_organize', note: 'If the user wants to reorganize this library, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow scoped to this library' },
+          { type: 'native_chat', param: 'pinako_extension', note: 'If the user wants to reorganize this library, direct them to the Pinako native AI chat in the extension (auto-organize via MCP is currently unavailable)' },
         ],
       });
       if (guard) {
@@ -3144,7 +2841,7 @@ function createMcpServer() {
         browserData: r.data, acknowledge: acknowledge_size,
         suggestedActions: [
           { type: 'pagination', param: 'after+limit', note: 'Pass limit:500 (and after:<lastId> on subsequent calls) for paginated reads — bypasses this guard and chunks the tree' },
-          { type: 'workflow', param: 'auto_organize', note: 'For organize/reorganize tasks, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow (see SERVER_INSTRUCTIONS); it reads in cursor-paginated batches' },
+          { type: 'native_chat', param: 'pinako_extension', note: 'For organize/reorganize tasks, direct the user to the Pinako native AI chat in the extension (auto-organize via MCP is currently unavailable)' },
           { type: 'acknowledge', param: 'true', note: 'If you only need a one-shot read and your model has a large context window, pass acknowledge_size:true' },
         ],
       });
@@ -3168,13 +2865,11 @@ function createMcpServer() {
     'find_duplicates',
     {
       description: 'Finds exact-URL duplicates within a single scope (tree, bookmarks, or a specific library). Bridge-side scan; no LLM, no agent reasoning required. For v1 ships with exact URL match only — byte-identical URLs grouped together; URLs differing in tracking params (utm_source, fbclid, etc.) or fragment identifiers are treated as DISTINCT. Fuzzy / near-duplicate matching deferred to v2 polish.\n\n' +
-        'AGENT FLOW DEPENDS ON CONTEXT — two cases:\n\n' +
-        'CASE A: STANDALONE DEDUP (no auto-organize workflow active). Summarize counts + sample titles to the user → ASK which of two equally-valid paths:\n\n' +
+        'AGENT FLOW: Summarize counts + sample titles to the user → ASK which of two equally-valid paths:\n\n' +
         '  Option 1 — Move to a "Duplicates" folder: bulk_apply with move_node to relocate the duplicate copies into a single "Duplicates" folder under Bookmarks Bar. The user can scroll through the folder in Chrome\'s Bookmark Manager and remove them at leisure (Ctrl+A inside the folder + Delete clears the lot in ~3 seconds).\n\n' +
-        '  Option 2 — Delete the duplicate copies directly: bulk_apply with delete_node({confirmedByUser:true}) on the duplicate node ids. Bounded (specific identified node ids), confirmed (user picked this path), recoverable via the user\'s Step 1 backup.\n\n' +
+        '  Option 2 — Delete the duplicate copies directly: bulk_apply with delete_node({confirmedByUser:true}) on the duplicate node ids. Bounded (specific identified node ids), confirmed (user picked this path), recoverable via the user\'s backup.\n\n' +
         'Phrase the choice neutrally; both options are normal Pinako operations. See PINAKO DELETION MODEL above for context.\n\n' +
-        'CASE B: AUTO-ORGANIZE WORKFLOW (Step 2 of LARGE TREE ORGANIZATION). DO NOT ask the user "want me to check for duplicates?" first — this call is mandatory pre-flight, not optional. Do NOT move or delete duplicates here. The bridge auto-caches the duplicate sets (including each instance\'s parentPath) on lastDuplicateScan so the auto-organize pipeline can use each duplicate\'s original folder as semantic signal during the LLM sift (Step 8), then reconcile them post-sift via resolve_duplicate_landings (Step 11). After this call returns, draft ONE combined message that reports duplicate counts + auto-delete-on-converge consent + ready-to-start question — e.g. "Found N duplicates across M URLs. I\'ll use each copy\'s current folder as a sorting hint, then auto-delete redundant copies that land in the same bucket and bring divergent ones to you for review. Ready to start sorting?" The user\'s OK to that single message authorizes BOTH the auto_organize_bookmarks kickoff AND the Step 11 delete_node ops on converged duplicates (confirmedByUser:true). One consent, end-to-end.\n\n' +
-        'In CASE A, keep ONE copy of each URL — the duplicate SETS contain ALL nodes with that URL; you move/delete count-1 (e.g., a set of 3 → 2 moved/deleted). "totalDuplicateInstances" = sum(count-1) across all sets — the number that would be acted on.\n\n' +
+        'Keep ONE copy of each URL — the duplicate SETS contain ALL nodes with that URL; you move/delete count-1 (e.g., a set of 3 → 2 moved/deleted). "totalDuplicateInstances" = sum(count-1) across all sets — the number that would be acted on.\n\n' +
         'Response: duplicateSets ordered by frequency descending (most-duplicated URL first). Each set: {url, count, nodeIds[], parentPaths[] (parallel to nodeIds; slash-joined parent breadcrumb for each instance, e.g. "Music/Classical"; empty string for items at root level), sampleTitles[] (up to 3 distinct)}. Top-level also returns {cached:true, cachedAt} so the agent knows the parentPath context is available for downstream tools.',
       inputSchema: {
         scope: z.enum(['tree', 'bookmarks', 'library']).describe('Which data source to scan. "tree" = live tab tree (windows/groups/tabs). "bookmarks" = browser bookmark tree (Chrome bookmarks API source). "library" = a specific Pinako library (requires library_id).'),
@@ -3314,6 +3009,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.propose_categories,
     },
     async ({ scope = 'tree', library_id, min_match_count, max_suggestions, browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
 
@@ -3416,6 +3112,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.auto_organize_bookmarks,
     },
     async ({ scope = 'bookmarks', min_match_count, max_suggestions, browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
 
@@ -3536,6 +3233,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.apply_heuristic_organize,
     },
     async ({ confidence_floor = 'medium', max_moves, browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
 
@@ -3681,6 +3379,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.refine_folder_outliers,
     },
     async ({ folder_id, after, limit, browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const state = r.data.organizeState;
@@ -3785,6 +3484,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.summarize_organize_results,
     },
     async ({ browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const state = r.data.organizeState;
@@ -3897,6 +3597,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.resolve_duplicate_landings,
     },
     async ({ browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const state = r.data.organizeState;
@@ -4115,6 +3816,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.complete_organize_sort,
     },
     async ({ summary, browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const state = r.data.organizeState;
@@ -4179,6 +3881,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.propose_subcategories,
     },
     async ({ folder_id, min_match_count, max_suggestions, browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const folder = _findBookmarkFolderByChromeId(r.data.bookmarks || [], folder_id);
@@ -4253,6 +3956,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.get_organize_state,
     },
     async ({ browser, wait_for_step }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       let r = resolveBrowserData(browser);
       if (r.error) return r.error;
       let state = r.data.organizeState || null;
@@ -4367,6 +4071,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.record_observation,
     },
     async ({ pattern, count, examples, batch_n, browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const browserId = r.data.browserId;
@@ -4407,6 +4112,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.get_observations,
     },
     async ({ filter_pattern, batch_n_min, browser }) => {
+      return MCP_AUTO_ORGANIZE_DISABLED_RESPONSE;
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const log_ = _organizeObservationLog.get(r.data.browserId) || [];
