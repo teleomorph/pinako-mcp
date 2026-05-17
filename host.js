@@ -2192,6 +2192,141 @@ function searchInTree(nodes, query, includeGhost, results = []) {
   return results;
 }
 
+// Omnibus search across a tree-shaped scope (main tree, library children, or
+// chrome.bookmarks tree). Mirrors Pinako's UI search bars: matches title, URL,
+// memoText, and tags across NON-tab nodes too (groups, windows, folders,
+// library-folders). Each hit returns the set of matchedFields that produced
+// it, plus parentPath, so the agent can prioritize or display per-source.
+// Powers MCP `search_pinako` (the omnibus tool); legacy `search_tabs`
+// continues to use searchInTree above for tab-only main-tree results.
+function _searchInTreeOmni({
+  tree, query, scope, sourceLibraryId, matchFields, exactTag, includeGhost, limit, results,
+}) {
+  if (!Array.isArray(tree) || tree.length === 0) return;
+  const q = query.toLowerCase();
+  const wantTitle = matchFields.includes('title');
+  const wantUrl   = matchFields.includes('url');
+  const wantMemo  = matchFields.includes('memo');
+  const wantTags  = matchFields.includes('tags');
+  const pathStack = [];
+
+  function walk(node) {
+    if (!node) return;
+    if (results.length >= limit) return;
+    // Never expose incognito nodes via MCP
+    if (node.incognito) return;
+
+    const title    = String(node.title || '');
+    const url      = node.url || '';
+    const memo     = node.memoText || '';
+    const tagArr   = Array.isArray(node.tags) ? node.tags : [];
+    const nodeType = node.type || (typeof url === 'string' && url.length > 0 ? 'bookmark' : 'folder');
+
+    // For tree scope, optionally skip ghost tabs.
+    const isGhostTab = node.type === 'tab' && node.chromeId === null;
+
+    const matched = [];
+    if (wantTitle && title && title.toLowerCase().includes(q)) matched.push('title');
+    if (wantUrl   && url   && url.toLowerCase().includes(q))   matched.push('url');
+    if (wantMemo  && memo  && memo.toLowerCase().includes(q))  matched.push('memo');
+    if (wantTags  && tagArr.length > 0) {
+      if (exactTag) {
+        if (tagArr.some(t => String(t).toLowerCase() === q)) matched.push('tags');
+      } else {
+        if (tagArr.some(t => String(t).toLowerCase().includes(q))) matched.push('tags');
+      }
+    }
+
+    if (matched.length > 0 && !(isGhostTab && !includeGhost)) {
+      const entry = {
+        type:           nodeType,
+        scope,
+        nodeId:         node.id,
+        title,
+        matchedFields:  matched,
+        parentPath:     pathStack.join('/'),
+      };
+      if (sourceLibraryId) entry.sourceLibraryId = sourceLibraryId;
+      if (url)             entry.url = url;
+      if (tagArr.length)   entry.tags = [...tagArr];
+      if (memo)            entry.memoText = memo;
+      if (node.type === 'tab' && node.chromeId === null) entry.ghost = true;
+      results.push(entry);
+    }
+
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      const pushed = title.length > 0;
+      if (pushed) pathStack.push(title);
+      for (const child of node.children) {
+        if (results.length >= limit) break;
+        walk(child);
+      }
+      if (pushed) pathStack.pop();
+    }
+  }
+  for (const root of tree) {
+    if (results.length >= limit) break;
+    walk(root);
+  }
+}
+
+function _stripHtmlForSearch(html) {
+  // Bridge-side DOM strip: replace tag soup with spaces, collapse whitespace.
+  // Pinako notes are Tiptap HTML — typically well-formed; this is enough for
+  // substring search. Not a full HTML parser; doesn't try to decode entities
+  // because they wouldn't normally land in user-typed search queries anyway.
+  return String(html || '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function _searchInNotes({
+  notesArray, query, scope, sourceLibraryId, matchFields, limit, results,
+}) {
+  if (!Array.isArray(notesArray) || notesArray.length === 0) return;
+  const q = query.toLowerCase();
+  const wantTitle   = matchFields.includes('title');
+  const wantContent = matchFields.includes('content');
+  for (const note of notesArray) {
+    if (results.length >= limit) return;
+    if (!note) continue;
+    const title = String(note.title || '');
+    const matched = [];
+    if (wantTitle && title && title.toLowerCase().includes(q)) matched.push('title');
+
+    let stripped = '';
+    let contentHitIdx = -1;
+    if (wantContent) {
+      stripped = _stripHtmlForSearch(note.content);
+      if (stripped) {
+        contentHitIdx = stripped.toLowerCase().indexOf(q);
+        if (contentHitIdx >= 0) matched.push('content');
+      }
+    }
+    if (matched.length === 0) continue;
+
+    // 200-char snippet centered on the first content hit; otherwise the
+    // note's leading 200 chars so the agent has SOME context.
+    let snippet;
+    if (contentHitIdx >= 0) {
+      const start = Math.max(0, contentHitIdx - 80);
+      const end   = Math.min(stripped.length, contentHitIdx + q.length + 80);
+      snippet = (start > 0 ? '…' : '') + stripped.slice(start, end) + (end < stripped.length ? '…' : '');
+    } else {
+      snippet = stripped.length > 200 ? stripped.slice(0, 200) + '…' : stripped;
+    }
+
+    const entry = {
+      type:           'note',
+      scope,
+      noteId:         note.id,
+      title,
+      matchedFields:  matched,
+      snippet,
+    };
+    if (sourceLibraryId) entry.sourceLibraryId = sourceLibraryId;
+    results.push(entry);
+  }
+}
+
 function countTabsInLibrary(nodes) {
   let n = 0;
   for (const node of nodes) {
@@ -2229,6 +2364,9 @@ ROUTING — when the user expresses one of these intents, CALL THE LISTED TOOL F
   "do I already have this saved" / "is this open tab already a bookmark" / "is this URL in any of my libraries" / "find any URL that\'s in more than one place"
     → find_duplicates({scope:"cross-scope"})  (defaults to unioning tree + bookmarks + all-libraries; narrow via crossScopes if the user\'s question is more specific, e.g. ["tree","bookmarks"] to check only open tabs vs bookmarks). Each duplicate set\'s sourceScopes[] / sourceLibraryIds[] tells you which surface each instance lives on; route downstream bulk_apply ops accordingly (one batch per scope, NOT one outer scope).
 
+  "find all my items tagged X" / "show me everything tagged exactly Y" / "anything with memo containing Z" / "any note that mentions W" / "search my bookmarks/libraries/notes for ..."
+    → search_pinako  (literal substring search; picks the right scope via the scope param: "libraries-all" for cross-library tag/title/memo lookup, "bookmarks" for bookmark search, "notes" for note-content search, "all" for everything). For exact-tag lookups (user names a specific tag and false-positives on substrings like "food" matching "football" would be wrong) MUST pass exact_tag:true. Do NOT call list_libraries({include_tabs:true}) and grep in your head when search_pinako will do it bridge-side in one call.
+
   Questions about Pinako features / terminology / "how does X work"
     → search_docs  FIRST.  Pinako has product-specific meanings for "group", "folder", "memo", "ghost tab", "library group", "snapshot" etc. that differ from generic tab-manager intuition. Cheap local lookup; never guess from the term alone.
 
@@ -2236,7 +2374,7 @@ ROUTING — when the user expresses one of these intents, CALL THE LISTED TOOL F
     → list_browsers FIRST. If the response shows more than one browser, ASK the user which one before any browser-scoped tool call. Do NOT guess from memory or prior conversation about the user's "primary" browser. Exception: if the user named a browser in their request itself ("organize my Brave bookmarks"), treat that as the chosen browser and skip the question. See MULTI-BROWSER → Selection rules below.
 
 WRITE TOOLS (Pro tier 1+)
-Read tools (get_tree, search_tabs, list_libraries, get_library, get_main_tree_notes, get_bookmarks, list_browsers, find_duplicates, get_tree_summary, search_docs) require no special handling.
+Read tools (get_tree, search_tabs, search_pinako, list_libraries, get_library, get_main_tree_notes, get_bookmarks, list_browsers, find_duplicates, get_tree_summary, search_docs) require no special handling.
 
 AUTO-ORGANIZE WORKFLOW: temporarily unavailable via MCP. The tools auto_organize_bookmarks, apply_heuristic_organize, refine_folder_outliers, summarize_organize_results, resolve_duplicate_landings, complete_organize_sort, propose_subcategories, get_organize_state, record_observation, get_observations, and propose_categories all return MCP_AUTO_ORGANIZE_UNAVAILABLE if called. Direct the user to Pinako's native AI chat panel for organization tasks (Pro tier 1+; open the Pinako extension popup).
 
@@ -2476,6 +2614,7 @@ function createMcpServer() {
     // Read-only (21) — safe to auto-approve in client autoApprove arrays.
     get_tree:                       READ_ONLY,
     search_tabs:                    READ_ONLY,
+    search_pinako:                  READ_ONLY,
     list_libraries:                 READ_ONLY,
     get_library:                    READ_ONLY,
     get_main_tree_notes:            READ_ONLY,
@@ -2621,7 +2760,7 @@ function createMcpServer() {
   srv.registerTool(
     'search_tabs',
     {
-      description: 'LITERAL substring search across main-tree tabs. Matches title, URL, memo text, and tags against the exact query string. Use ONLY when the user names a literal substring ("tabs from stackoverflow.com", "the tab titled exactly X"). For SEMANTIC / categorical intent ("find my exercise tabs", "anything about gardening") do NOT iterate this tool with synonyms — instead call get_tree({mode:"minimal"}) + list_libraries({include_tabs:true, mode:"minimal"}) and match in your own head. See SEARCH SCOPE in server instructions. Mode param: "minimal" (flat, compact URLs — default for this tool since results are already a focused list), "lite" (tree shape), "full" (everything except favicons).' + FRESHNESS_HINT,
+      description: 'LITERAL substring search across main-tree TAB nodes ONLY (groups, windows, folders, libraries, bookmarks, and notes are NOT searched here). Matches title, URL, memo text, and tags. Kept for backward compatibility — for broader literal search across non-tab nodes, libraries, bookmarks, and notes content, USE search_pinako instead (it is the omnibus version with a scope parameter). Use ONLY when the user names a literal substring ("tabs from stackoverflow.com", "the tab titled exactly X"). For SEMANTIC / categorical intent ("find my exercise tabs", "anything about gardening") do NOT iterate this tool with synonyms — instead call get_tree({mode:"minimal"}) + list_libraries({include_tabs:true, mode:"minimal"}) and match in your own head. See SEARCH SCOPE in server instructions. Mode param: "minimal" (flat, compact URLs — default for this tool since results are already a focused list), "lite" (tree shape), "full" (everything except favicons).' + FRESHNESS_HINT,
       inputSchema: {
         query: z.string().describe('LITERAL substring (case-insensitive). For semantic intent, prefer get_tree.'),
         mode:  z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "minimal" since search results are already a focused list.'),
@@ -2642,6 +2781,160 @@ function createMcpServer() {
         mode,
         results: out,
         count:   out.length,
+      }) }] };
+    }
+  );
+
+  srv.registerTool(
+    'search_pinako',
+    {
+      description: 'Omnibus LITERAL substring search across Pinako data surfaces — the broad replacement for search_tabs. Bridge-side scan; no LLM. Use this WHENEVER the user names a literal substring and the question may match non-tab nodes (groups, folders, library titles), non-tree surfaces (libraries, bookmarks, notes), or wants exact-tag semantics (default fuzzy substring matching can over-match a tag like "food" against "football"). Avoids the fetch-and-filter anti-pattern (list_libraries with include_tabs then grep in your own head), which costs LLM tokens proportional to data size and falls over at scale.\n\n' +
+        'SCOPE SELECTION:\n' +
+        '  - "tree" (default) — live tab tree (main-tree windows, groups, folders, tabs). Default match_fields: title, url, tags, memo. Returns non-tab nodes too when their title / tag / memo matches (this is the legacy search_tabs gap).\n' +
+        '  - "library" — one specific library (requires library_id). Default match_fields: title, url, tags, memo.\n' +
+        '  - "libraries-all" — UNION across every library in the install. Default match_fields: title, url, tags, memo. The right scope for "find tabs tagged X across all my libraries". Each hit is tagged with sourceLibraryId.\n' +
+        '  - "bookmarks" — Chrome\'s bookmark tree. Default match_fields: title, url (Chrome bookmark items don\'t carry tags or memos; if either is passed in match_fields it simply yields zero hits for that field).\n' +
+        '  - "notes" — Pinako notes (BOTH library-notes AND main-tree global notes in one pass). Default match_fields: title, content (Tiptap HTML is server-side stripped of tags before matching). Each hit returns a 200-char snippet centered on the first content match.\n' +
+        '  - "all" — union of tree + every library + bookmarks + notes. Use sparingly; for "is this thing anywhere in my Pinako" questions. Limit param applies to the combined result count.\n\n' +
+        'TAG MATCHING: by default tag matching is SUBSTRING (matches "foo" against "food", "footnote", etc.). Pass exact_tag:true to require the tag value to EQUAL the query exactly (case-insensitive). When the user names a specific tag ("show me items tagged exactly \'food\'") MUST set exact_tag:true; substring matching otherwise leaks false positives.\n\n' +
+        'LIMIT: default 200 results. Pass limit (max 2000) to widen. Response includes truncated:true when the limit was hit so the agent knows results were cut off (in which case narrow the scope/query or raise limit).\n\n' +
+        'RESPONSE: results[] is a flat array sorted in discovery order (depth-first walk). Each entry: {type ("tab" | "group" | "window" | "folder" | "library-folder" | "note" | "bookmark"), scope, nodeId or noteId, sourceLibraryId? (present for library scopes), matchedFields (subset of the requested match_fields that actually matched), title, url? (when present), tags? (when present), memoText? (when present), parentPath (slash-joined ancestor breadcrumb; tree/library/bookmarks scopes), snippet? (notes only, 200-char window centered on the first content hit), ghost? (true when a tree-scope tab is a ghost tab AND include_ghost_tabs was true)}.' + FRESHNESS_HINT,
+      inputSchema: {
+        query:              z.string().describe('LITERAL substring (case-insensitive). For semantic intent, prefer get_tree/list_libraries + in-head matching.'),
+        scope:              z.enum(['tree', 'library', 'libraries-all', 'bookmarks', 'notes', 'all']).optional().describe('Which data surface to search. Default "tree".'),
+        library_id:         z.string().optional().describe('Library id from list_libraries. Required when scope:"library".'),
+        match_fields:       z.array(z.enum(['title', 'url', 'tags', 'memo', 'content'])).optional().describe('Which fields to match. Defaults are scope-aware: tree/library/libraries-all default to ["title","url","tags","memo"]; bookmarks defaults to ["title","url"]; notes defaults to ["title","content"]; "all" scope uses the scope-appropriate default per surface. "content" only applies to notes scope; for other scopes it is ignored.'),
+        exact_tag:          z.boolean().optional().describe('When true, tag matches must equal the query exactly (case-insensitive). When false (default), tag matches use substring semantics. Use exact_tag:true whenever the user names a specific tag.'),
+        include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs in tree scope. Default true.'),
+        limit:              z.number().int().min(1).max(2000).optional().describe('Max results across all surfaces in this call. Default 200.'),
+        browser:            z.string().optional().describe(BROWSER_ARG_DESC),
+      },
+      annotations: TOOL_ANNOTATIONS.search_pinako,
+    },
+    async ({ query, scope = 'tree', library_id, match_fields, exact_tag = false, include_ghost_tabs = true, limit, browser }) => {
+      if (typeof query !== 'string' || query.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'EMPTY_QUERY', message: 'query must be a non-empty string' },
+        }) }], isError: true };
+      }
+      const r = resolveBrowserData(browser);
+      if (r.error) return r.error;
+
+      const effectiveLimit = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 2000) : 200;
+      const treeFields     = (Array.isArray(match_fields) && match_fields.length > 0) ? match_fields : ['title', 'url', 'tags', 'memo'];
+      const bookmarkFields = (Array.isArray(match_fields) && match_fields.length > 0) ? match_fields : ['title', 'url'];
+      const noteFields     = (Array.isArray(match_fields) && match_fields.length > 0) ? match_fields : ['title', 'content'];
+
+      const results = [];
+
+      function runTree() {
+        _searchInTreeOmni({
+          tree:            r.data.tree || [],
+          query, scope:    'tree',
+          sourceLibraryId: null,
+          matchFields:     treeFields,
+          exactTag:        exact_tag,
+          includeGhost:    include_ghost_tabs,
+          limit:           effectiveLimit,
+          results,
+        });
+      }
+      function runLibrary(lib) {
+        _searchInTreeOmni({
+          tree:            lib.children || [],
+          query, scope:    'library',
+          sourceLibraryId: lib.id,
+          matchFields:     treeFields,
+          exactTag:        exact_tag,
+          includeGhost:    true,
+          limit:           effectiveLimit,
+          results,
+        });
+      }
+      function runBookmarks() {
+        _searchInTreeOmni({
+          tree:            r.data.bookmarks || [],
+          query, scope:    'bookmarks',
+          sourceLibraryId: null,
+          matchFields:     bookmarkFields,
+          exactTag:        exact_tag,
+          includeGhost:    true,
+          limit:           effectiveLimit,
+          results,
+        });
+      }
+      function runNotes() {
+        for (const lib of (r.data.libraries || [])) {
+          if (results.length >= effectiveLimit) return;
+          _searchInNotes({
+            notesArray:      lib.notes,
+            query, scope:    'library-notes',
+            sourceLibraryId: lib.id,
+            matchFields:     noteFields,
+            limit:           effectiveLimit,
+            results,
+          });
+        }
+        if (results.length < effectiveLimit) {
+          _searchInNotes({
+            notesArray:      r.data.globalNotes,
+            query, scope:    'main-tree-notes',
+            sourceLibraryId: null,
+            matchFields:     noteFields,
+            limit:           effectiveLimit,
+            results,
+          });
+        }
+      }
+
+      if (scope === 'tree') {
+        runTree();
+      } else if (scope === 'bookmarks') {
+        runBookmarks();
+      } else if (scope === 'library') {
+        if (!library_id) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            error: { code: 'LIBRARY_ID_REQUIRED', message: 'library_id is required when scope:"library"' },
+          }) }], isError: true };
+        }
+        const lib = (r.data.libraries || []).find(l => l.id === library_id);
+        if (!lib) {
+          return { content: [{ type: 'text', text: JSON.stringify({
+            error: { code: 'LIBRARY_NOT_FOUND', message: `Library not found: ${library_id} (in ${r.data.browserBrand})` },
+          }) }], isError: true };
+        }
+        runLibrary(lib);
+      } else if (scope === 'libraries-all') {
+        for (const lib of (r.data.libraries || [])) {
+          if (results.length >= effectiveLimit) break;
+          runLibrary(lib);
+        }
+      } else if (scope === 'notes') {
+        runNotes();
+      } else if (scope === 'all') {
+        runTree();
+        if (results.length < effectiveLimit) {
+          for (const lib of (r.data.libraries || [])) {
+            if (results.length >= effectiveLimit) break;
+            runLibrary(lib);
+          }
+        }
+        if (results.length < effectiveLimit) runBookmarks();
+        if (results.length < effectiveLimit) runNotes();
+      }
+
+      return { content: [{ type: 'text', text: JSON.stringify({
+        browser:   r.data.browserBrand,
+        browserId: r.data.browserId,
+        query,
+        scope,
+        libraryId:           scope === 'library' ? library_id : null,
+        matchFieldsApplied: Array.isArray(match_fields) && match_fields.length > 0 ? match_fields : 'scope-default',
+        exactTag:           exact_tag,
+        limit:              effectiveLimit,
+        results,
+        count:              results.length,
+        truncated:          results.length >= effectiveLimit,
       }) }] };
     }
   );
