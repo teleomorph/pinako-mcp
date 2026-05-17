@@ -130,3 +130,21 @@ describe('search_docs', () => {
     }
   });
 });
+
+describe('list_browsers', () => {
+  it('returns the connected browsers with subscriptionTier on each entry', async () => {
+    const result = await callToolOk(session.client, 'list_browsers', {});
+    expect(Array.isArray(result.browsers)).toBe(true);
+    expect(typeof result.count).toBe('number');
+    expect(result.count).toBe(result.browsers.length);
+    expect(result.browsers.length).toBeGreaterThan(0);
+    for (const b of result.browsers) {
+      expect(typeof b.browserBrand).toBe('string');
+      expect(typeof b.browserId).toBe('string');
+      expect(typeof b.subscriptionTier).toBe('number');
+      expect(Number.isInteger(b.subscriptionTier)).toBe(true);
+      expect(b.subscriptionTier).toBeGreaterThanOrEqual(0);
+      expect(b.subscriptionTier).toBeLessThanOrEqual(4);
+    }
+  });
+});

@@ -4162,19 +4162,20 @@ function createMcpServer() {
   srv.registerTool(
     'list_browsers',
     {
-      description: 'Lists all Pinako installs currently connected to this MCP server. Each entry: browserBrand (human-readable name like "Chrome" or "Brave"), browserId (stable per-install id), updatedAt (timestamp of last data update — any tree mutation, memo edit, note write, etc.), windowCount (live windows), libraryCount, bookmarkCount, docsCount (number of cached user-guide sections searchable via search_docs). Response is sorted by updatedAt descending — entry [0] is the most recently active install, which the agent can surface as a recency hint when asking the user which browser to target. Use the browserBrand or browserId as the "browser" argument to other tools when multiple browsers are connected.',
+      description: 'Lists all Pinako installs currently connected to this MCP server. Each entry: browserBrand (human-readable name like "Chrome" or "Brave"), browserId (stable per-install id), updatedAt (timestamp of last data update — any tree mutation, memo edit, note write, etc.), windowCount (live windows), libraryCount, bookmarkCount, docsCount (number of cached user-guide sections searchable via search_docs), subscriptionTier (integer 0-4 indicating the install\'s Pinako subscription: 0=Free, 1=Pro, 2=Pro+, 3=Premium, 4=Enterprise; the per-tier note content character cap is 50K / 50K / 150K / 250K / 500K respectively, so BEFORE a planned create_note or set_note_content whose content might exceed the cap for this tier, warn the user proactively instead of letting NOTE_CONTENT_OVER_TIER_LIMIT surface as a rejection). Response is sorted by updatedAt descending — entry [0] is the most recently active install, which the agent can surface as a recency hint when asking the user which browser to target. Use the browserBrand or browserId as the "browser" argument to other tools when multiple browsers are connected.',
       annotations: TOOL_ANNOTATIONS.list_browsers,
     },
     async () => {
       const browsers = [...cachedData.values()]
         .map(d => ({
-          browserBrand:  d.browserBrand,
-          browserId:     d.browserId,
-          updatedAt:     d.updatedAt,
-          windowCount:   (d.tree || []).filter(n => !n.incognito).length,
-          libraryCount:  (d.libraries || []).length,
-          bookmarkCount: (d.bookmarks || []).reduce((acc, root) => acc + countBookmarksRecursive(root), 0),
-          docsCount:     Array.isArray(d.docs) ? d.docs.length : 0,
+          browserBrand:     d.browserBrand,
+          browserId:        d.browserId,
+          updatedAt:        d.updatedAt,
+          windowCount:      (d.tree || []).filter(n => !n.incognito).length,
+          libraryCount:     (d.libraries || []).length,
+          bookmarkCount:    (d.bookmarks || []).reduce((acc, root) => acc + countBookmarksRecursive(root), 0),
+          docsCount:        Array.isArray(d.docs) ? d.docs.length : 0,
+          subscriptionTier: Number.isFinite(d.userTier) ? d.userTier : 0,
         }))
         .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
       return { content: [{ type: 'text', text: JSON.stringify({ browsers, count: browsers.length }) }] };

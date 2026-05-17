@@ -220,3 +220,116 @@ describe('delete_note (main-tree-notes scope)', () => {
     }, { label: 'global-note-removed' });
   });
 });
+
+// Mirror of NOTE_CHAR_LIMITS at pinako-mcp/host.js:80. Kept in the test so
+// the assertion verifies the cap value the bridge actually enforced rather
+// than reading it back out of the same module under test.
+const NOTE_CHAR_LIMITS = { 0: 50000, 1: 50000, 2: 150000, 3: 250000, 4: 500000 };
+
+async function readSubscriptionTier() {
+  const list = await callToolOk(session.client, 'list_browsers', {});
+  const me = list.browsers.find(b => b.browserBrand === browser || b.browserId === browser);
+  expect(me, `browser ${browser} found in list_browsers`).toBeTruthy();
+  expect(typeof me.subscriptionTier).toBe('number');
+  return me.subscriptionTier;
+}
+
+describe('NOTE_CONTENT_OVER_TIER_LIMIT (tier-cap enforcement at MCP boundary)', () => {
+  it('rejects set_note_content (mode=replace) one char over the tier cap', async () => {
+    const tier      = await readSubscriptionTier();
+    const tierLimit = NOTE_CHAR_LIMITS[tier];
+    expect(tierLimit).toBeGreaterThan(0);
+
+    // Seed a real note so the test exercises the same path agents will
+    // hit. The tier-cap check runs at the bridge BEFORE dispatch, so the
+    // note's pre-existing content doesn't matter for replace mode — only
+    // the new content's length does.
+    const created = await callToolOk(session.client, 'create_note', {
+      title: testLabel('tier-cap-replace-target'),
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      content: '<p>seed</p>',
+      browser,
+    });
+    const noteId = created.result.createdNoteId;
+
+    const oversize = 'a'.repeat(tierLimit + 1);
+    const result = await callTool(session.client, 'set_note_content', {
+      noteId,
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      mode: 'replace',
+      content: oversize,
+      browser,
+    });
+    expect(result.isError || result.parsed?.ok === false).toBeTruthy();
+    expect(result.parsed?.error?.code).toBe('NOTE_CONTENT_OVER_TIER_LIMIT');
+    expect(result.parsed?.error?.context?.tier).toBe(tier);
+    expect(result.parsed?.error?.context?.tierLimit).toBe(tierLimit);
+    expect(result.parsed?.error?.context?.inputLength).toBe(tierLimit + 1);
+    expect(result.parsed?.error?.context?.mode).toBe('replace');
+  });
+
+  it('rejects create_note whose initial content exceeds the tier cap by one char', async () => {
+    const tier      = await readSubscriptionTier();
+    const tierLimit = NOTE_CHAR_LIMITS[tier];
+
+    const oversize = 'b'.repeat(tierLimit + 1);
+    const result = await callTool(session.client, 'create_note', {
+      title: testLabel('tier-cap-create-target'),
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      content: oversize,
+      browser,
+    });
+    expect(result.isError || result.parsed?.ok === false).toBeTruthy();
+    expect(result.parsed?.error?.code).toBe('NOTE_CONTENT_OVER_TIER_LIMIT');
+    expect(result.parsed?.error?.context?.tier).toBe(tier);
+    expect(result.parsed?.error?.context?.tierLimit).toBe(tierLimit);
+    expect(result.parsed?.error?.context?.inputLength).toBe(tierLimit + 1);
+  });
+
+  it('rejects set_note_content (mode=append) when existing+new would cross the cap', async () => {
+    const tier      = await readSubscriptionTier();
+    const tierLimit = NOTE_CHAR_LIMITS[tier];
+
+    // Seed at half-cap, append slightly over half-cap+1 so the combined
+    // length lands one char above the cap. Exercises the append branch
+    // of _checkNoteContentTierAtBridge which reads existing content from
+    // cache before comparing.
+    const half        = Math.floor(tierLimit / 2);
+    const seedContent = 'c'.repeat(half);
+    const created = await callToolOk(session.client, 'create_note', {
+      title: testLabel('tier-cap-append-target'),
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      content: seedContent,
+      browser,
+    });
+    const noteId = created.result.createdNoteId;
+
+    // Wait for the create to propagate so the append check sees the
+    // seed content in cache.
+    await waitFor(async () => {
+      const notes = await readLibraryNotes();
+      const t = notes.find(n => n.id === noteId);
+      return t && t.content && t.content.length >= half ? t : null;
+    }, { label: 'tier-cap-seed-visible' });
+
+    const appendChunk = 'd'.repeat(tierLimit - half + 1);
+    const result = await callTool(session.client, 'set_note_content', {
+      noteId,
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      mode: 'append',
+      content: appendChunk,
+      browser,
+    });
+    expect(result.isError || result.parsed?.ok === false).toBeTruthy();
+    expect(result.parsed?.error?.code).toBe('NOTE_CONTENT_OVER_TIER_LIMIT');
+    expect(result.parsed?.error?.context?.tier).toBe(tier);
+    expect(result.parsed?.error?.context?.tierLimit).toBe(tierLimit);
+    expect(result.parsed?.error?.context?.mode).toBe('append');
+    expect(result.parsed?.error?.context?.finalLength).toBeGreaterThan(tierLimit);
+  });
+});
