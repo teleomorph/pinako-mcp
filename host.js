@@ -1278,6 +1278,84 @@ function _findDuplicateUrls(tree) {
   };
 }
 
+// Cross-scope duplicate scan. Walks multiple scoped trees in a single pass and
+// tags each URL occurrence with its sourceScope (and sourceLibraryId for
+// library-scope instances). A URL counts as a duplicate if it appears 2+ times
+// across the unioned scopes — one tab + one bookmark with the same URL is a
+// cross-scope duplicate. Used when the user's question spans multiple surfaces
+// ("do I already have this saved" / "is this open tab a bookmark already").
+// Each duplicateSet's response adds parallel sourceScopes[] + sourceLibraryIds[]
+// arrays alongside the existing nodeIds[] / parentPaths[] so the agent can route
+// downstream bulk_apply ops to the correct scope per-instance (single bulk_apply
+// with one outer scope won't work when instances span scopes).
+function _findDuplicateUrlsCrossScope(scopedTrees) {
+  const urlMap = new Map();
+  let scanned = 0;
+  for (const { tree, sourceScope, sourceLibraryId } of scopedTrees) {
+    const pathStack = [];
+    function walk(node) {
+      if (!node) return;
+      const url = node && typeof node.url === 'string' ? node.url : '';
+      if (url.length > 0) {
+        scanned++;
+        let arr = urlMap.get(url);
+        if (!arr) { arr = []; urlMap.set(url, arr); }
+        arr.push({
+          id:              node.id,
+          title:           String(node.title || ''),
+          parentPath:      pathStack.join('/'),
+          sourceScope,
+          sourceLibraryId: sourceLibraryId || null,
+        });
+      }
+      if (Array.isArray(node.children) && node.children.length > 0) {
+        const title = node.title ? String(node.title) : '';
+        const pushed = title.length > 0;
+        if (pushed) pathStack.push(title);
+        for (const child of node.children) walk(child);
+        if (pushed) pathStack.pop();
+      }
+    }
+    if (Array.isArray(tree)) {
+      for (const root of tree) walk(root);
+    } else {
+      walk(tree);
+    }
+  }
+  const duplicateSets = [];
+  let totalDuplicateInstances = 0;
+  for (const [url, instances] of urlMap.entries()) {
+    if (instances.length > 1) {
+      const seen = new Set();
+      const sampleTitles = [];
+      for (const inst of instances) {
+        if (inst.title && !seen.has(inst.title)) {
+          seen.add(inst.title);
+          sampleTitles.push(inst.title);
+          if (sampleTitles.length >= 3) break;
+        }
+      }
+      duplicateSets.push({
+        url,
+        count:            instances.length,
+        nodeIds:          instances.map(x => x.id),
+        parentPaths:      instances.map(x => x.parentPath),
+        sourceScopes:     instances.map(x => x.sourceScope),
+        sourceLibraryIds: instances.map(x => x.sourceLibraryId),
+        sampleTitles,
+      });
+      totalDuplicateInstances += instances.length - 1;
+    }
+  }
+  duplicateSets.sort((a, b) => b.count - a.count);
+  return {
+    duplicateSets,
+    totalDuplicateInstances,
+    uniqueDuplicateUrls: duplicateSets.length,
+    totalScannedWithUrl: scanned,
+  };
+}
+
 // ─── Slice S2a (2026-05-13): cursor pagination helpers ──────────────────────
 // Cursor = last-seen stable Pinako node id (or Chrome bookmark id for
 // bookmarks). Pagination is opt-in: callers that pass `after` OR `limit` get
@@ -2146,7 +2224,10 @@ ROUTING — when the user expresses one of these intents, CALL THE LISTED TOOL F
     → Auto-organize via MCP is currently under development. Tell the user: "To organize your bookmarks now, open the Pinako extension and use the native AI chat panel (Pro tier 1+), or click the auto-organize button on the bookmarks panel in Pinako." DO NOT attempt to plan a manual organization from get_bookmarks output — large bookmark trees won't fit in your context window and the safety nets that make organization reliable (review folder, per-batch confirmation, duplicate reconciliation) only exist in the native chat workflow.
 
   "find / remove duplicate bookmarks" / "dedupe"
-    → find_duplicates  (then ASK the user whether to (1) move duplicates to a 'Duplicates' folder for visual review or (2) delete the duplicate copies directly via bulk_apply delete_node({confirmedByUser:true}). Both are normal Pinako operations; present them as equal options, don\'t default-pick.)
+    → find_duplicates({scope:"bookmarks"})  (then ASK the user whether to (1) move duplicates to a 'Duplicates' folder for visual review or (2) delete the duplicate copies directly via bulk_apply delete_node({confirmedByUser:true}). Both are normal Pinako operations; present them as equal options, don\'t default-pick.)
+
+  "do I already have this saved" / "is this open tab already a bookmark" / "is this URL in any of my libraries" / "find any URL that\'s in more than one place"
+    → find_duplicates({scope:"cross-scope"})  (defaults to unioning tree + bookmarks + all-libraries; narrow via crossScopes if the user\'s question is more specific, e.g. ["tree","bookmarks"] to check only open tabs vs bookmarks). Each duplicate set\'s sourceScopes[] / sourceLibraryIds[] tells you which surface each instance lives on; route downstream bulk_apply ops accordingly (one batch per scope, NOT one outer scope).
 
   Questions about Pinako features / terminology / "how does X work"
     → search_docs  FIRST.  Pinako has product-specific meanings for "group", "folder", "memo", "ghost tab", "library group", "snapshot" etc. that differ from generic tab-manager intuition. Cheap local lookup; never guess from the term alone.
@@ -2888,33 +2969,40 @@ function createMcpServer() {
   srv.registerTool(
     'find_duplicates',
     {
-      description: 'Finds exact-URL duplicates within a single scope (tree, bookmarks, or a specific library). Bridge-side scan; no LLM, no agent reasoning required. For v1 ships with exact URL match only — byte-identical URLs grouped together; URLs differing in tracking params (utm_source, fbclid, etc.) or fragment identifiers are treated as DISTINCT. Fuzzy / near-duplicate matching deferred to v2 polish.\n\n' +
-        'AGENT FLOW: Summarize counts + sample titles to the user → ASK which of two equally-valid paths:\n\n' +
+      description: 'Finds exact-URL duplicates within a single scope OR unioned across multiple scopes. Bridge-side scan; no LLM, no agent reasoning required. For v1 ships with exact URL match only — byte-identical URLs grouped together; URLs differing in tracking params (utm_source, fbclid, etc.) or fragment identifiers are treated as DISTINCT. Fuzzy / near-duplicate matching deferred to v2 polish.\n\n' +
+        'SCOPE SELECTION:\n' +
+        '  - "tree" / "bookmarks" / "library" — single-scope dedup. Use when the user\'s question is bounded to one surface ("do I have duplicate tabs", "are there duplicate bookmarks", "are there dupes in my Research library").\n' +
+        '  - "cross-scope" — unioned dedup across multiple scopes. Use this WHENEVER the user\'s question spans surfaces ("do I already have this saved" / "is this open tab a duplicate of a bookmark I have" / "am I about to bookmark something that\'s already in a library"). ONE call beats 3x scoped calls + manual URL-set join at LLM cost. Specify which scopes to union via crossScopes (defaults to all three: tree + bookmarks + all-libraries). A URL is a duplicate if it appears 2+ times across the requested union (1 in tree + 1 in bookmarks = a cross-scope duplicate).\n\n' +
+        'AGENT FLOW (applies to all scopes): Summarize counts + sample titles to the user → ASK which of two equally-valid paths:\n\n' +
         '  Option 1 — Move to a "Duplicates" folder: bulk_apply with move_node to relocate the duplicate copies into a single "Duplicates" folder under Bookmarks Bar. The user can scroll through the folder in Chrome\'s Bookmark Manager and remove them at leisure (Ctrl+A inside the folder + Delete clears the lot in ~3 seconds).\n\n' +
         '  Option 2 — Delete the duplicate copies directly: bulk_apply with delete_node({confirmedByUser:true}) on the duplicate node ids. Bounded (specific identified node ids), confirmed (user picked this path), recoverable via the user\'s backup.\n\n' +
         'Phrase the choice neutrally; both options are normal Pinako operations. See PINAKO DELETION MODEL above for context.\n\n' +
         'Keep ONE copy of each URL — the duplicate SETS contain ALL nodes with that URL; you move/delete count-1 (e.g., a set of 3 → 2 moved/deleted). "totalDuplicateInstances" = sum(count-1) across all sets — the number that would be acted on.\n\n' +
-        'Response: duplicateSets ordered by frequency descending (most-duplicated URL first). Each set: {url, count, nodeIds[], parentPaths[] (parallel to nodeIds; slash-joined parent breadcrumb for each instance, e.g. "Music/Classical"; empty string for items at root level), sampleTitles[] (up to 3 distinct)}. Top-level also returns {cached:true, cachedAt} so the agent knows the parentPath context is available for downstream tools.',
+        'CROSS-SCOPE DOWNSTREAM: when acting on cross-scope duplicates (move or delete), each duplicate INSTANCE may live in a different scope (one in tree, one in bookmarks, one in a library). A single bulk_apply with one outer scope WILL NOT WORK in that case. The agent MUST group nodeIds by their sourceScopes[] value and issue ONE bulk_apply per distinct scope (with the matching scope/libraryId on each sub-op). For the "Move to Duplicates folder" path, target a single destination but route per-source-scope; for the "Delete duplicate copies" path, fan out one delete batch per scope.\n\n' +
+        'Response: duplicateSets ordered by frequency descending (most-duplicated URL first). Each set: {url, count, nodeIds[], parentPaths[] (parallel to nodeIds; slash-joined parent breadcrumb for each instance, e.g. "Music/Classical"; empty string for items at root level), sampleTitles[] (up to 3 distinct)}. CROSS-SCOPE additionally returns parallel sourceScopes[] (values: "tree" | "bookmarks" | "library", parallel to nodeIds[]) and sourceLibraryIds[] (library id string for "library" entries, null for tree/bookmarks). Top-level also returns {cached:true, cachedAt} so the agent knows the parentPath context is available for downstream tools.',
       inputSchema: {
-        scope: z.enum(['tree', 'bookmarks', 'library']).describe('Which data source to scan. "tree" = live tab tree (windows/groups/tabs). "bookmarks" = browser bookmark tree (Chrome bookmarks API source). "library" = a specific Pinako library (requires library_id).'),
+        scope: z.enum(['tree', 'bookmarks', 'library', 'cross-scope']).describe('Which data source to scan. "tree" = live tab tree (windows/groups/tabs). "bookmarks" = browser bookmark tree (Chrome bookmarks API source). "library" = a specific Pinako library (requires library_id). "cross-scope" = union of multiple scopes; specify which via crossScopes (defaults to all three).'),
         library_id: z.string().optional().describe('Library id from list_libraries. Required when scope:"library".'),
+        crossScopes: z.array(z.enum(['tree', 'bookmarks', 'libraries'])).optional().describe('Which scopes to union when scope:"cross-scope". Defaults to ["tree", "bookmarks", "libraries"] (all three). Use ["tree", "bookmarks"] for the prototypical "is this open tab already bookmarked" question. "libraries" (plural) means ALL libraries in this install — a URL appearing in any single library counts toward the cross-scope dedup. Ignored when scope is not "cross-scope".'),
         match_mode: z.enum(['exact']).optional().describe('Match strategy. Currently only "exact" (byte-identical URL match) is supported.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
       annotations: TOOL_ANNOTATIONS.find_duplicates,
     },
-    async ({ scope, library_id, match_mode = 'exact', browser }) => {
+    async ({ scope, library_id, crossScopes, match_mode = 'exact', browser }) => {
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
 
       let scanTree;
-      let scopeIdentifier;
+      let scopeIdentifier = null;
+      let result;
+      let effectiveCrossScopes = null;
       if (scope === 'tree') {
         scanTree = r.data.tree || [];
-        scopeIdentifier = null;
+        result = _findDuplicateUrls(scanTree);
       } else if (scope === 'bookmarks') {
         scanTree = r.data.bookmarks || [];
-        scopeIdentifier = null;
+        result = _findDuplicateUrls(scanTree);
       } else if (scope === 'library') {
         if (!library_id) {
           return { content: [{ type: 'text', text: JSON.stringify({
@@ -2929,20 +3017,43 @@ function createMcpServer() {
         }
         scanTree = lib.children || [];
         scopeIdentifier = library_id;
+        result = _findDuplicateUrls(scanTree);
+      } else if (scope === 'cross-scope') {
+        const requested = Array.isArray(crossScopes) && crossScopes.length > 0
+          ? crossScopes
+          : ['tree', 'bookmarks', 'libraries'];
+        // Dedup + freeze for the response so the agent sees exactly which
+        // scopes the bridge actually walked (a duplicate 'tree' value would
+        // double-count silently otherwise).
+        effectiveCrossScopes = [...new Set(requested)];
+        const scopedTrees = [];
+        if (effectiveCrossScopes.includes('tree')) {
+          scopedTrees.push({ tree: r.data.tree || [], sourceScope: 'tree', sourceLibraryId: null });
+        }
+        if (effectiveCrossScopes.includes('bookmarks')) {
+          scopedTrees.push({ tree: r.data.bookmarks || [], sourceScope: 'bookmarks', sourceLibraryId: null });
+        }
+        if (effectiveCrossScopes.includes('libraries')) {
+          for (const lib of (r.data.libraries || [])) {
+            scopedTrees.push({ tree: lib.children || [], sourceScope: 'library', sourceLibraryId: lib.id });
+          }
+        }
+        result = _findDuplicateUrlsCrossScope(scopedTrees);
       }
-
-      const result = _findDuplicateUrls(scanTree);
 
       // Side effect: cache result on the per-browser cache entry so the
       // auto-organize workflow (Step 7 sift loop, Step 9 resolve_duplicate_landings)
       // can read each duplicate instance's parentPath as semantic signal. Always
       // caches the latest scan, regardless of whether auto-organize is active —
-      // the workflow checks workflowStep + scope match before consuming.
+      // the workflow checks workflowStep + scope match before consuming, and a
+      // cached scope of "cross-scope" naturally fails the workflow's per-scope
+      // match check so cross-scope results don't leak into the sift loop.
       const cachedAt = Date.now();
       r.data.lastDuplicateScan = {
         scope,
         libraryId: scopeIdentifier,
         matchMode: match_mode,
+        crossScopes: effectiveCrossScopes,
         scannedAt: cachedAt,
         duplicateSets: result.duplicateSets,
         totalDuplicateInstances: result.totalDuplicateInstances,
@@ -2951,12 +3062,13 @@ function createMcpServer() {
       };
 
       return { content: [{ type: 'text', text: JSON.stringify({
-        browser:    r.data.browserBrand,
-        browserId:  r.data.browserId,
+        browser:     r.data.browserBrand,
+        browserId:   r.data.browserId,
         scope,
-        libraryId:  scopeIdentifier,
-        matchMode:  match_mode,
-        cached:     true,
+        libraryId:   scopeIdentifier,
+        ...(effectiveCrossScopes ? { crossScopes: effectiveCrossScopes } : {}),
+        matchMode:   match_mode,
+        cached:      true,
         cachedAt,
         ...result,
       }) }] };
