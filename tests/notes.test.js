@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { connectPinakoMcp, callToolOk, waitFor } from './helpers/mcp-client.js';
+import { connectPinakoMcp, callTool, callToolOk, waitFor } from './helpers/mcp-client.js';
 import { resolveTargetBrowser } from './helpers/browser.js';
 import { testLabel } from './helpers/fixtures.js';
 
@@ -106,5 +106,117 @@ describe('create_note + set_note_content (library-notes scope)', () => {
     expect(afterAppend.content).toContain('replaced body');
     expect(afterAppend.content).toContain('appended chunk');
     expect(afterAppend.content.indexOf('replaced body')).toBeLessThan(afterAppend.content.indexOf('appended chunk'));
+  });
+});
+
+describe('delete_note (library-notes scope)', () => {
+  it('creates a note, deletes it, verifies it is gone from the library', async () => {
+    const noteTitle = testLabel('delete-note-target');
+    const created = await callToolOk(session.client, 'create_note', {
+      title: noteTitle,
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      content: '<p>doomed</p>',
+      browser,
+    });
+    const noteId = created.result.createdNoteId;
+    expect(noteId).toMatch(/^note-/);
+
+    await callToolOk(session.client, 'delete_note', {
+      noteId,
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      confirmedByUser: true,
+      browser,
+    });
+
+    await waitFor(async () => {
+      const notes = await readLibraryNotes();
+      return notes.some(n => n.id === noteId) ? null : notes;
+    }, { label: 'note-removed' });
+
+    const after = await readLibraryNotes();
+    expect(after.some(n => n.id === noteId), 'note should be gone').toBe(false);
+  });
+
+  it('rejects without confirmedByUser (Zod schema gate)', async () => {
+    const created = await callToolOk(session.client, 'create_note', {
+      title: testLabel('delete-note-noconf'),
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      browser,
+    });
+    const noteId = created.result.createdNoteId;
+
+    // Wait for create to propagate to the cache before any read.
+    await waitFor(async () => {
+      const notes = await readLibraryNotes();
+      return notes.some(n => n.id === noteId) ? notes : null;
+    }, { label: 'note-visible-before-rejection' });
+
+    const result = await callTool(session.client, 'delete_note', {
+      noteId,
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      browser,
+    });
+    expect(result.isError).toBe(true);
+    const rawText = result.parsed?._rawText ?? JSON.stringify(result.parsed);
+    expect(rawText).toMatch(/validation error|Invalid|Required/i);
+    expect(rawText).toContain('confirmedByUser');
+
+    // Note should still exist (Zod failed; no engine touch).
+    const after = await readLibraryNotes();
+    expect(after.some(n => n.id === noteId), 'note should NOT have been deleted').toBe(true);
+
+    // Cleanup with confirmation.
+    await callToolOk(session.client, 'delete_note', {
+      noteId,
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      confirmedByUser: true,
+      browser,
+    });
+  });
+
+  it('returns NOTE_NOT_FOUND for unknown note id', async () => {
+    const result = await callTool(session.client, 'delete_note', {
+      noteId: 'note-does-not-exist-xyz',
+      scope: 'library-notes',
+      libraryId: testLibraryId,
+      confirmedByUser: true,
+      browser,
+    });
+    expect(result.isError || result.parsed?.ok === false).toBeTruthy();
+    expect(result.parsed?.error?.code).toBe('NOTE_NOT_FOUND');
+  });
+});
+
+describe('delete_note (main-tree-notes scope)', () => {
+  it('deletes a global note via main-tree-notes scope (wire-normalized to global-notes)', async () => {
+    // Use 'main-tree-notes' (the user-facing canonical) on the wire;
+    // the bridge normalizes to the legacy 'global-notes' before
+    // dispatch.
+    const created = await callToolOk(session.client, 'create_note', {
+      title: testLabel('global-delete-target'),
+      scope: 'main-tree-notes',
+      content: '<p>global note doomed</p>',
+      browser,
+    });
+    const noteId = created.result.createdNoteId;
+    expect(noteId).toMatch(/^note-/);
+
+    await callToolOk(session.client, 'delete_note', {
+      noteId,
+      scope: 'main-tree-notes',
+      confirmedByUser: true,
+      browser,
+    });
+
+    await waitFor(async () => {
+      const fetched = await callToolOk(session.client, 'get_main_tree_notes', { browser });
+      const stillThere = (fetched.notes || []).some(n => n.id === noteId);
+      return stillThere ? null : fetched;
+    }, { label: 'global-note-removed' });
   });
 });
