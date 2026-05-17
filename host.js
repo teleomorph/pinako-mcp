@@ -2162,6 +2162,7 @@ AUTO-ORGANIZE WORKFLOW: temporarily unavailable via MCP. The tools auto_organize
 Write tools fall into four categories:
 - METADATA: set_tags, add_tags, remove_tags, set_memo, set_star_color, set_row_color, set_title.
 - TREE STRUCTURE: move_node, indent_node, outdent_node, create_group, delete_node, ghost_node, delete_live_node, create_folder.
+- BOOKMARKS WRITE: add_to_bookmarks (clones tree or library content INTO Chrome bookmarks; type=window/group source nodes auto-convert to bookmark folders). Reorder/delete bookmark nodes via move_node / delete_node with scope:"bookmarks". For the inverse direction (clone FROM bookmarks INTO a library), use add_to_library with sourceScope:"bookmarks". The "MOVE to bookmarks" verb is a two-step pattern: call add_to_bookmarks first, then delete_node on the source after success (there is no atomic move_to_bookmarks for v1).
 - LIBRARY SYSTEM: create_library, delete_library, add_to_library, set_library_title, set_library_description, set_note_content, create_note, delete_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group. Rename rules: set_library_title for the library itself, set_library_group_title for the umbrella group. set_title does NOT work on library-folder nodes (it returns INVALID_TARGET) — MUST route library renames through set_library_title. Delete rules: delete_library removes a single library; delete_library_group removes the group (and with cascadeMembers:true, also its member libraries). To detach a library from a group without deleting content, use remove_library_from_group. For panel reordering, call list_libraries first to get the current groups + panel_order, then pass the modified panel_order to reorder_library_panel. Never construct the panel array blindly — group ids and panel positions must come from a fresh list_libraries call.
 - COMPOSITE: bulk_apply (up to 100 sub-ops, atomic, undoable as a single unit).
 
@@ -2432,7 +2433,7 @@ function createMcpServer() {
     move_node:                      EDIT,
     add_library_to_group:           EDIT,
     remove_library_from_group:      EDIT,
-    // Edit, NOT idempotent (8) — create_* duplicates on retry per
+    // Edit, NOT idempotent (9) — create_* duplicates on retry per
     // SERVER_INSTRUCTIONS "CREATE-* OPS ARE NOT IDEMPOTENT" rule.
     create_group:                   EDIT_NID,
     create_folder:                  EDIT_NID,
@@ -2440,6 +2441,7 @@ function createMcpServer() {
     create_note:                    EDIT_NID,
     create_library_group:           EDIT_NID,
     add_to_library:                 EDIT_NID,
+    add_to_bookmarks:               EDIT_NID,
     indent_node:                    EDIT_NID,
     outdent_node:                   EDIT_NID,
     // Destructive (6) — delete_* / ghost_node permanently or near-permanently
@@ -4626,6 +4628,20 @@ function createMcpServer() {
     },
     annotations: TOOL_ANNOTATIONS.add_to_library,
   }, async (args) => writeToolHandler('add_to_library', args));
+
+  srv.registerTool('add_to_bookmarks', {
+    description: 'Inverse direction of add_to_library: clones tree or library nodes INTO the browser\'s native bookmark tree (chrome.bookmarks). VERB MAPPING: "save tab X as a bookmark", "back up these tabs to bookmarks", "add library Y to bookmarks folder Z" → use this tool. "MOVE to bookmarks" → call this tool first, then delete_node on the source after success (two-step, agent-managed; there is no atomic move_to_bookmarks for v1). SOURCESCOPE: "tree" (default — main tab tree) or "library" (sourceLibraryId required). TYPE CONVERSION (automatic): tab source → bookmark leaf (preserves url/title), window/group/folder source → bookmark folder (the bookmark tree has no concept of window or group; conversion mirrors the manual drag-to-bookmarks behavior). PARENT: pass parentBookmarkFolderId pointing at a folder node id from get_bookmarks; omit to default to the first root ("Bookmarks Bar"). Returns addedBookmarkNodeIds (Pinako internal ids of the inserted bookmark nodes). NOT IDEMPOTENT — each call creates new Chrome bookmarks. On transient failures, DO NOT auto-retry; call get_bookmarks first to check whether the previous attempt succeeded. BOOKMARK-SCOPE RECOVERY NOTE: chrome.bookmarks.create has no Pinako undo coverage; an erroneous add cannot be rolled back via Ctrl+Z. For batch operations (more than a few items), suggest the user back up bookmarks first via the import/export button on the Bookmarks panel. Max 100 source ids per call.',
+    inputSchema: {
+      nodeIds:                 z.array(z.string()).min(1).describe('Source TREE node ids (max 100). MUST be ids from the source\'s tree (windows/tabs/groups/folders).'),
+      sourceScope:             z.string().optional().describe('"tree" (default) or "library". Bookmarks→bookmarks is not supported here (use move_node for in-bookmark reorder).'),
+      sourceLibraryId:         z.string().optional().describe('Required when sourceScope="library".'),
+      includeChildren:         z.boolean().optional().describe('Default TRUE: include each source node\'s subtree. Set FALSE to clone only the leaf node.'),
+      parentBookmarkFolderId:  z.string().optional().describe('Pinako internal id of the destination bookmark folder (from get_bookmarks). Omit to default to the first root ("Bookmarks Bar").'),
+      position:                z.number().optional().describe(POSITION_DESC),
+      browser:                 z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+    annotations: TOOL_ANNOTATIONS.add_to_bookmarks,
+  }, async (args) => writeToolHandler('add_to_bookmarks', args));
 
   srv.registerTool('set_note_content', {
     description: 'Updates an existing note\'s content. MODE GUIDANCE: "replace" (default) overwrites — use for "update note X with Y", "replace note X". "append" concatenates after existing content — use for "add Y to note X", "note down that ...". For prepend, read existing content first then call replace with the combined string. Note char limit is tier-gated (50K Pro / 150K Pro+ / 250K Premium / 500K Enterprise); for append mode the FINAL length is what\'s gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. Idempotent on retry for replace mode; append mode on retry would double-append, so DO NOT auto-retry append on transient failures — re-read first.',
