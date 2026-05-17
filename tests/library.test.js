@@ -101,6 +101,79 @@ describe('add_to_library', () => {
   });
 });
 
+describe('set_library_title', () => {
+  it('renames a library and round-trips via get_library', async () => {
+    const { libraryId } = await makeLibraryInGroup('rename-orig');
+    const newTitle = testLabel('rename-new');
+
+    await callToolOk(session.client, 'set_library_title', {
+      libraryId,
+      title: newTitle,
+      browser,
+    });
+
+    const renamed = await waitFor(async () => {
+      const fetched = await callToolOk(session.client, 'get_library', {
+        library_id: libraryId,
+        mode: 'lite',
+        browser,
+      });
+      return fetched.library?.title === newTitle ? fetched.library : null;
+    }, { label: 'set_library_title-applied' });
+    expect(renamed.title).toBe(newTitle);
+  });
+
+  it('returns LIBRARY_NOT_FOUND for unknown library id', async () => {
+    const result = await session.client.callTool({
+      name: 'set_library_title',
+      arguments: { libraryId: 'folder-does-not-exist-xyz', title: 'irrelevant', browser },
+    });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error?.code).toBe('LIBRARY_NOT_FOUND');
+  });
+});
+
+describe('set_library_description', () => {
+  it('sets a description and then clears it on empty string', async () => {
+    const { libraryId } = await makeLibraryInGroup('desc');
+    const description = 'A test description for the library.';
+
+    await callToolOk(session.client, 'set_library_description', {
+      libraryId,
+      description,
+      browser,
+    });
+
+    const withDesc = await waitFor(async () => {
+      const fetched = await callToolOk(session.client, 'get_library', {
+        library_id: libraryId,
+        mode: 'lite',
+        browser,
+      });
+      return fetched.library?.description === description ? fetched.library : null;
+    }, { label: 'set_library_description-applied' });
+    expect(withDesc.description).toBe(description);
+
+    await callToolOk(session.client, 'set_library_description', {
+      libraryId,
+      description: '',
+      browser,
+    });
+
+    const cleared = await waitFor(async () => {
+      const fetched = await callToolOk(session.client, 'get_library', {
+        library_id: libraryId,
+        mode: 'lite',
+        browser,
+      });
+      const d = fetched.library?.description;
+      return (d === '' || d == null) ? fetched.library : null;
+    }, { label: 'set_library_description-cleared' });
+    expect(cleared.description == null || cleared.description === '').toBe(true);
+  });
+});
+
 function collectTitles(nodes, out = []) {
   for (const n of nodes || []) {
     if (n.title) out.push(n.title);

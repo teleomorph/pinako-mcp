@@ -2162,7 +2162,7 @@ AUTO-ORGANIZE WORKFLOW: temporarily unavailable via MCP. The tools auto_organize
 Write tools fall into four categories:
 - METADATA: set_tags, add_tags, remove_tags, set_memo, set_star_color, set_row_color, set_title.
 - TREE STRUCTURE: move_node, indent_node, outdent_node, create_group, delete_node, ghost_node, delete_live_node, create_folder.
-- LIBRARY SYSTEM: create_library, add_to_library, set_note_content, create_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group. For panel reordering, call list_libraries first to get the current groups + panel_order, then pass the modified panel_order to reorder_library_panel. Never construct the panel array blindly — group ids and panel positions must come from a fresh list_libraries call.
+- LIBRARY SYSTEM: create_library, add_to_library, set_library_title, set_library_description, set_note_content, create_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group. Rename rules: set_library_title for the library itself, set_library_group_title for the umbrella group. set_title does NOT work on library-folder nodes (it returns INVALID_TARGET) — MUST route library renames through set_library_title. For panel reordering, call list_libraries first to get the current groups + panel_order, then pass the modified panel_order to reorder_library_panel. Never construct the panel array blindly — group ids and panel positions must come from a fresh list_libraries call.
 - COMPOSITE: bulk_apply (up to 100 sub-ops, atomic, undoable as a single unit).
 
 DESTRUCTIVE OPS need explicit user approval. Set confirmedByUser:true on these tools ONLY after the user has confirmed THIS specific action (not as a default, not on retry after a failure):
@@ -2359,7 +2359,7 @@ function createMcpServer() {
   //                      log only). 21 tools.
   //   EDIT             — modifies user data but additively / reversibly.
   //                      set_*, add_*, create_*, move_*, indent_*, outdent_*,
-  //                      reorder_*, ghost_node, add_to_library, etc. 24 tools.
+  //                      reorder_*, ghost_node, add_to_library, etc. 26 tools.
   //   DESTRUCTIVE      — permanent data loss without explicit recovery path.
   //                      delete_node, delete_live_node, delete_library_group,
   //                      remove_*_from_group. bulk_apply marked destructive
@@ -2395,7 +2395,7 @@ function createMcpServer() {
     auto_organize_bookmarks:        READ_ONLY, // opens UI panel; no user-data mutation
     complete_organize_sort:         READ_ONLY, // transitions UI panel state
     search_docs:                    READ_ONLY,
-    // Edit, idempotent (15) — set_X, add/remove tags, structure changes that
+    // Edit, idempotent (17) — set_X, add/remove tags, structure changes that
     // converge on a single end state when called repeatedly.
     set_tags:                       EDIT,
     add_tags:                       EDIT,
@@ -2407,6 +2407,8 @@ function createMcpServer() {
     set_note_content:               EDIT,
     set_library_group_title:        EDIT,
     set_library_group_description:  EDIT,
+    set_library_title:              EDIT,
+    set_library_description:        EDIT,
     reorder_library_panel:          EDIT,
     reorder_libraries_in_group:     EDIT,
     move_node:                      EDIT,
@@ -4692,6 +4694,26 @@ function createMcpServer() {
     },
     annotations: TOOL_ANNOTATIONS.set_library_group_description,
   }, async (args) => writeToolHandler('set_library_group_description', args));
+
+  srv.registerTool('set_library_title', {
+    description: 'Renames a library. Trimmed, non-empty, max 200 chars. THIS IS THE ONLY rename path for libraries — set_title rejects library-folder nodes with INVALID_TARGET (the library root is not a renamable tree node). MUST use this tool, not set_title, when the user asks to "rename library X to Y" or fix a library name typo. Mirrors set_library_group_title for the umbrella-group case.',
+    inputSchema: {
+      libraryId: z.string().describe('Target library id (folder-* format, from list_libraries / get_library).'),
+      title:     z.string().describe('New title.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+    annotations: TOOL_ANNOTATIONS.set_library_title,
+  }, async (args) => writeToolHandler('set_library_title', args));
+
+  srv.registerTool('set_library_description', {
+    description: 'Updates a library\'s description (shown beneath the title on library cards). Empty string clears it. Max 1000 chars. Mirrors set_library_group_description for the umbrella-group case.',
+    inputSchema: {
+      libraryId:   z.string().describe('Target library id.'),
+      description: z.string().describe('New description (empty string clears).'),
+      browser:     z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+    annotations: TOOL_ANNOTATIONS.set_library_description,
+  }, async (args) => writeToolHandler('set_library_description', args));
 
   srv.registerTool('reorder_library_panel', {
     description: 'Reorders the cards in the library panel (standalone library cards + library group cards). Pass the COMPLETE current list of entries in the desired order. Each entry is {type:"library"|"group", id:<id>}. ORDER ONLY — every existing entry must be present (rejects with PANEL_ORDER_MISMATCH if count differs, PANEL_ORDER_UNKNOWN_ENTRY if an unknown id is introduced). Use create_library / delete_library_group / etc. to change membership; this op cannot add or remove cards. Always call list_libraries first to fetch the current panel_order array — never construct the entries array blindly; group ids and panel positions must come from a fresh list_libraries call (the panel_order field in its response maps 1:1 to this op\'s entries arg). Max 200 entries.',
