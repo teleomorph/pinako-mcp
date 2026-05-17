@@ -2162,12 +2162,13 @@ AUTO-ORGANIZE WORKFLOW: temporarily unavailable via MCP. The tools auto_organize
 Write tools fall into four categories:
 - METADATA: set_tags, add_tags, remove_tags, set_memo, set_star_color, set_row_color, set_title.
 - TREE STRUCTURE: move_node, indent_node, outdent_node, create_group, delete_node, ghost_node, delete_live_node, create_folder.
-- LIBRARY SYSTEM: create_library, add_to_library, set_library_title, set_library_description, set_note_content, create_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group. Rename rules: set_library_title for the library itself, set_library_group_title for the umbrella group. set_title does NOT work on library-folder nodes (it returns INVALID_TARGET) — MUST route library renames through set_library_title. For panel reordering, call list_libraries first to get the current groups + panel_order, then pass the modified panel_order to reorder_library_panel. Never construct the panel array blindly — group ids and panel positions must come from a fresh list_libraries call.
+- LIBRARY SYSTEM: create_library, delete_library, add_to_library, set_library_title, set_library_description, set_note_content, create_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group. Rename rules: set_library_title for the library itself, set_library_group_title for the umbrella group. set_title does NOT work on library-folder nodes (it returns INVALID_TARGET) — MUST route library renames through set_library_title. Delete rules: delete_library removes a single library; delete_library_group removes the group (and with cascadeMembers:true, also its member libraries). To detach a library from a group without deleting content, use remove_library_from_group. For panel reordering, call list_libraries first to get the current groups + panel_order, then pass the modified panel_order to reorder_library_panel. Never construct the panel array blindly — group ids and panel positions must come from a fresh list_libraries call.
 - COMPOSITE: bulk_apply (up to 100 sub-ops, atomic, undoable as a single unit).
 
 DESTRUCTIVE OPS need explicit user approval. Set confirmedByUser:true on these tools ONLY after the user has confirmed THIS specific action (not as a default, not on retry after a failure):
 - delete_node (removes a ghost tree record permanently; only Chrome history retains the URL)
 - delete_live_node (closes live tabs AND removes the tree record)
+- delete_library (deletes the library AND all its content permanently; partial undo only)
 - delete_library_group with cascadeMembers:true (also deletes member libraries' content)
 Note: ghost_node (closes live tabs, preserves tree record) is NOT destructive — the user can re-open from the tree.
 
@@ -2361,9 +2362,10 @@ function createMcpServer() {
   //                      set_*, add_*, create_*, move_*, indent_*, outdent_*,
   //                      reorder_*, ghost_node, add_to_library, etc. 26 tools.
   //   DESTRUCTIVE      — permanent data loss without explicit recovery path.
-  //                      delete_node, delete_live_node, delete_library_group,
-  //                      remove_*_from_group. bulk_apply marked destructive
-  //                      because it can carry delete sub-ops. 4+1 tools.
+  //                      delete_node, delete_live_node, delete_library,
+  //                      delete_library_group, ghost_node. bulk_apply marked
+  //                      destructive because it can carry delete sub-ops.
+  //                      5+1 tools.
   //
   // openWorldHint=false on every Pinako tool — the surface is closed: local
   // browser data only, no external network calls.
@@ -2424,11 +2426,12 @@ function createMcpServer() {
     add_to_library:                 EDIT_NID,
     indent_node:                    EDIT_NID,
     outdent_node:                   EDIT_NID,
-    // Destructive (4) — delete_* / ghost_node permanently or near-permanently
+    // Destructive (5) — delete_* / ghost_node permanently or near-permanently
     // remove data. Idempotent on retry per SERVER_INSTRUCTIONS
     // "DELETE/GHOST OPS ARE IDEMPOTENT-ON-RETRY" rule.
     delete_node:                    DESTRUCT,
     delete_live_node:               DESTRUCT,
+    delete_library:                 DESTRUCT,
     delete_library_group:           DESTRUCT,
     ghost_node:                     DESTRUCT,
     // Composite (1) — variable; can carry destructive sub-ops.
@@ -4714,6 +4717,16 @@ function createMcpServer() {
     },
     annotations: TOOL_ANNOTATIONS.set_library_description,
   }, async (args) => writeToolHandler('set_library_description', args));
+
+  srv.registerTool('delete_library', {
+    description: 'Permanently deletes a single library and ALL its content (tabs, notes, tags, memos, child windows/groups/folders). Removes the library from any group it belongs to AND from the panel order. DESTRUCTIVE: cannot be fully undone — Ctrl+Z restores the libraryData entry but does NOT restore the group/panelOrder cleanup and does NOT recreate the cloud row. Use this instead of the hack of wrapping the library in a temporary group and cascade-deleting the group; that workaround required two MCP roundtrips and a visible UI artifact. confirmedByUser:true is REQUIRED — obtain explicit user approval for THIS specific library deletion (not as a default, not on retry). Returns LIBRARY_NOT_FOUND for unknown ids. To remove a library from a group without deleting its content, use remove_library_from_group instead.',
+    inputSchema: {
+      libraryId:        z.string().describe('Target library id (folder-* format, from list_libraries / get_library).'),
+      confirmedByUser:  z.boolean().describe('Must be true. Represents explicit user authorization for THIS specific destructive op — not a default and not satisfied by an earlier in-session confirmation.'),
+      browser:          z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+    annotations: TOOL_ANNOTATIONS.delete_library,
+  }, async (args) => writeToolHandler('delete_library', args));
 
   srv.registerTool('reorder_library_panel', {
     description: 'Reorders the cards in the library panel (standalone library cards + library group cards). Pass the COMPLETE current list of entries in the desired order. Each entry is {type:"library"|"group", id:<id>}. ORDER ONLY — every existing entry must be present (rejects with PANEL_ORDER_MISMATCH if count differs, PANEL_ORDER_UNKNOWN_ENTRY if an unknown id is introduced). Use create_library / delete_library_group / etc. to change membership; this op cannot add or remove cards. Always call list_libraries first to fetch the current panel_order array — never construct the entries array blindly; group ids and panel positions must come from a fresh list_libraries call (the panel_order field in its response maps 1:1 to this op\'s entries arg). Max 200 entries.',

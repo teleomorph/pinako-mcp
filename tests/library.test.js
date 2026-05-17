@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { connectPinakoMcp, callToolOk, waitFor } from './helpers/mcp-client.js';
+import { connectPinakoMcp, callTool, callToolOk, waitFor } from './helpers/mcp-client.js';
 import { resolveTargetBrowser } from './helpers/browser.js';
 import { testLabel } from './helpers/fixtures.js';
 
@@ -171,6 +171,78 @@ describe('set_library_description', () => {
       return (d === '' || d == null) ? fetched.library : null;
     }, { label: 'set_library_description-cleared' });
     expect(cleared.description == null || cleared.description === '').toBe(true);
+  });
+});
+
+describe('delete_library', () => {
+  it('deletes a grouped library: gone from list_libraries, gone from group membership', async () => {
+    const { libraryId } = await makeLibraryInGroup('delete-grouped');
+
+    await callToolOk(session.client, 'delete_library', {
+      libraryId,
+      confirmedByUser: true,
+      browser,
+    });
+
+    const gone = await waitFor(async () => {
+      const fetched = await callToolOk(session.client, 'list_libraries', { browser });
+      const stillThere = (fetched.libraries || []).some(l => l.id === libraryId);
+      return stillThere ? null : fetched;
+    }, { label: 'library-removed-from-list' });
+
+    const goneGroup = (gone.groups || []).find(g => g.id === testGroupId);
+    expect(goneGroup?.libraryIds || [], `library ${libraryId} should be stripped from its group's libraryIds`).not.toContain(libraryId);
+  });
+
+  it('rejects without confirmedByUser (Zod schema gate)', async () => {
+    const { libraryId } = await makeLibraryInGroup('delete-noconf');
+
+    const result = await callTool(session.client, 'delete_library', {
+      libraryId,
+      browser,
+    });
+    expect(result.isError).toBe(true);
+    const rawText = result.parsed?._rawText ?? JSON.stringify(result.parsed);
+    expect(rawText).toMatch(/validation error|Invalid|Required/i);
+    expect(rawText).toContain('confirmedByUser');
+
+    // Cleanup: actually delete the library this test created so the
+    // shared testGroupId doesn't leak it past afterAll.
+    await callToolOk(session.client, 'delete_library', {
+      libraryId,
+      confirmedByUser: true,
+      browser,
+    });
+  });
+
+  it('rejects confirmedByUser:false (engine .refine gate)', async () => {
+    const { libraryId } = await makeLibraryInGroup('delete-confalse');
+
+    const result = await callTool(session.client, 'delete_library', {
+      libraryId,
+      confirmedByUser: false,
+      browser,
+    });
+    expect(result.isError || result.parsed?.ok === false, 'should reject').toBeTruthy();
+    const rawText = result.parsed?._rawText ?? JSON.stringify(result.parsed);
+    expect(rawText).toContain('confirmedByUser');
+
+    // Cleanup.
+    await callToolOk(session.client, 'delete_library', {
+      libraryId,
+      confirmedByUser: true,
+      browser,
+    });
+  });
+
+  it('returns LIBRARY_NOT_FOUND for unknown library id', async () => {
+    const result = await callTool(session.client, 'delete_library', {
+      libraryId: 'folder-does-not-exist-xyz',
+      confirmedByUser: true,
+      browser,
+    });
+    expect(result.isError || result.parsed?.ok === false).toBeTruthy();
+    expect(result.parsed?.error?.code).toBe('LIBRARY_NOT_FOUND');
   });
 });
 
