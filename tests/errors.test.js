@@ -202,15 +202,13 @@ describe('Engine constraints', () => {
     expectEngineError(result, 'LIBRARY_ORDER_MISMATCH');
   });
 
-  // SKIPPED — real bug in the extension: reorder_libraries_in_group with
-  // an unknown (well-formed but nonexistent) library id consistently
-  // returns PORT_DISCONNECTED instead of the documented
-  // LIBRARY_ORDER_UNKNOWN_MEMBER. The mismatch + duplicate cases reject
-  // gracefully, so the engine's validation logic appears to dereference
-  // the unknown id deeper before classifying it, crashing the native-
-  // messaging port. Tracked in agentic-ai-pre-ship-fixes.md #4. Unskip
-  // once the engine returns LIBRARY_ORDER_UNKNOWN_MEMBER gracefully.
-  it.skip('LIBRARY_ORDER_UNKNOWN_MEMBER: reorder with an unknown library id', async () => {
+  // Pre-ship #4 (Batch 18): reorder_libraries_in_group with an unknown
+  // (well-formed but nonexistent) library id previously returned
+  // PORT_DISCONNECTED because the engine handler ran BEFORE the
+  // refineScopeShape strict() check completed — and somewhere in the
+  // dispatch path an unhandled exception crashed the native-messaging
+  // port. Engine now throws LIBRARY_ORDER_UNKNOWN_MEMBER cleanly.
+  it('LIBRARY_ORDER_UNKNOWN_MEMBER: reorder with an unknown library id', async () => {
     const result = await callTool(session.client, 'reorder_libraries_in_group', {
       groupId: reorderGroupId,
       libraryIds: [reorderLibA, reorderLibB, 'folder-stranger-xyz'],
