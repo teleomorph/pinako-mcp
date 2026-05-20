@@ -1381,7 +1381,11 @@ const PAGINATION_DEFAULT_LIMITS = {
 // Mode-aware flat-item shaper for tree-like data (tree, library children).
 // Each output item is one node (no nested children) with parentId set so the
 // agent can reconstruct hierarchy if needed. Returns a fresh array.
-function _flattenTreeWithMode(nodes, scope, libraryId, mode, includeFavicons, parentId = null, out = []) {
+//
+// `opts` (2026-05-19): composable shape opt-ins for the lite branch. Pass-
+// through to liteNode (then children are stripped since pagination is flat).
+// Ignored by minimal and full modes (their shapes are fixed).
+function _flattenTreeWithMode(nodes, scope, libraryId, mode, includeFavicons, opts, parentId = null, out = []) {
   if (!Array.isArray(nodes)) return out;
   for (const node of nodes) {
     if (!node) continue;
@@ -1389,20 +1393,13 @@ function _flattenTreeWithMode(nodes, scope, libraryId, mode, includeFavicons, pa
     if (mode === 'minimal') {
       shaped = minimalNode(node, scope, libraryId, parentId);
     } else if (mode === 'lite') {
-      shaped = {
-        id:    node.id,
-        type:  node.type,
-        title: node.title || '',
-      };
-      if (scope)     shaped.scope     = scope;
-      if (libraryId) shaped.libraryId = libraryId;
-      if (parentId)  shaped.parentId  = parentId;
-      if (node.url) shaped.url = node.url;
-      if (node.type === 'tab' && node.chromeId === null) shaped.ghost = true;
-      if (node.type === 'tab' && node.openedDate) shaped.openedDate = node.openedDate;
-      if (Array.isArray(node.tags) && node.tags.length > 0) shaped.tags = node.tags;
-      if (node.memoText) shaped.memoText = node.memoText;
-      if (node.collapsed) shaped.collapsed = true;
+      // Route through liteNode so composable opt-ins apply consistently
+      // between paginated (flat) and non-paginated (tree-shaped) reads.
+      // Strip children after shaping since pagination is flat.
+      const lite = liteNode(node, scope, libraryId, opts);
+      const { children: _ignoreChildren, ...rest } = lite;
+      shaped = rest;
+      if (parentId) shaped.parentId = parentId;
     } else { // full
       const sanitized = sanitizeNode(node);
       const noFavicons = includeFavicons ? sanitized : stripFavicons(sanitized);
@@ -1414,7 +1411,7 @@ function _flattenTreeWithMode(nodes, scope, libraryId, mode, includeFavicons, pa
     }
     out.push(shaped);
     if (Array.isArray(node.children) && node.children.length > 0) {
-      _flattenTreeWithMode(node.children, scope, libraryId, mode, includeFavicons, node.id, out);
+      _flattenTreeWithMode(node.children, scope, libraryId, mode, includeFavicons, opts, node.id, out);
     }
   }
   return out;
@@ -2031,8 +2028,39 @@ function stripFavicons(node) {
 // Lite-mode node (tree shape). Keeps hierarchy, drops favicons, timestamps,
 // visual fields, the empty per-node `notes` array. Includes openedDate so
 // agents can answer time-based queries ("tabs older than 6 months").
-function liteNode(node, scope, libraryId) {
+//
+// COMPOSABLE OPTS (2026-05-19): the 4th argument `opts` lets callers tailor
+// the lite shape per field. Field-level defaults match the pre-2026-05-19
+// MCP lite shape for fields MCP already returned (openedDate, tags, memoText,
+// collapsed all default-true) PLUS adds the chat-side fields for parity
+// (parentWindow, parentGroup, chromeGroupId/Title/Color, starColor, rowColor,
+// customTitle all default-true; only emitted when present, so cheap-when-
+// absent — most existing MCP callers see no behavior change since these
+// fields are typically unset on tab nodes). The mutation engine + audit log
+// are unaffected.
+//
+// `opts.minimal: true` forces every include_* flag to false → basics-only
+// shape (id, type, title, scope, libraryId, url, ghost). Shortcut for cheap
+// large-tree scans.
+//
+// Pinako Group nodes (type='group') are tree nodes — always returned as
+// nodes regardless of include_chrome_tab_groups. That flag controls only
+// the Chromium Tab Group METADATA fields (chromeGroupId/Title/Color)
+// emitted on individual tab nodes.
+function liteNode(node, scope, libraryId, opts) {
   if (!node || typeof node !== 'object') return node;
+  opts = opts || {};
+  const minimal = opts.minimal === true;
+
+  const wantOpenedDate     = minimal ? false : (opts.include_opened_date       !== false);
+  const wantTags           = minimal ? false : (opts.include_tags              !== false);
+  const wantMemos          = minimal ? false : (opts.include_memos             !== false);
+  const wantLineage        = minimal ? false : (opts.include_lineage           !== false);
+  const wantChromeGroups   = minimal ? false : (opts.include_chrome_tab_groups !== false);
+  const wantStarColor      = minimal ? false : (opts.include_star_color        !== false);
+  const wantRowColor       = minimal ? false : (opts.include_row_color         !== false);
+  const wantCustomTitle    = minimal ? false : (opts.include_custom_title      !== false);
+
   const out = {
     id:    node.id,
     type:  node.type,
@@ -2042,12 +2070,27 @@ function liteNode(node, scope, libraryId) {
   if (libraryId) out.libraryId = libraryId;
   if (node.url) out.url = node.url;
   if (node.type === 'tab' && node.chromeId === null) out.ghost = true;
-  if (node.type === 'tab' && node.openedDate) out.openedDate = node.openedDate;
-  if (Array.isArray(node.tags) && node.tags.length > 0) out.tags = node.tags;
-  if (node.memoText) out.memoText = node.memoText;
-  if (node.collapsed) out.collapsed = true;
+
+  if (wantOpenedDate && node.type === 'tab' && node.openedDate) out.openedDate = node.openedDate;
+  if (wantTags && Array.isArray(node.tags) && node.tags.length > 0) out.tags = node.tags;
+  if (wantMemos && node.memoText) out.memoText = node.memoText;
+
+  if (wantLineage) {
+    if (node.parentWindow) out.parentWindow = node.parentWindow;
+    if (node.parentGroup) out.parentGroup = node.parentGroup;
+    if (node.collapsed) out.collapsed = true;
+  }
+  if (wantChromeGroups) {
+    if (node.chromeGroupId != null) out.chromeGroupId = node.chromeGroupId;
+    if (node.chromeGroupTitle) out.chromeGroupTitle = node.chromeGroupTitle;
+    if (node.chromeGroupColor) out.chromeGroupColor = node.chromeGroupColor;
+  }
+  if (wantStarColor && node.starColor) out.starColor = node.starColor;
+  if (wantRowColor && node.rowColor) out.rowColor = node.rowColor;
+  if (wantCustomTitle && node.customTitle) out.customTitle = true;
+
   if (Array.isArray(node.children) && node.children.length > 0) {
-    out.children = node.children.map(c => liteNode(c, scope, libraryId));
+    out.children = node.children.map(c => liteNode(c, scope, libraryId, opts));
   }
   return out;
 }
@@ -2088,11 +2131,34 @@ function flattenForMinimal(nodes, scope, libraryId, parentId = null, out = []) {
 }
 
 // Dispatch helper: shape a tree (array of root nodes) according to mode.
-function shapeTree(rootNodes, scope, libraryId, mode, includeFavicons) {
+// `opts` (2026-05-19): composable per-field opt-ins for the lite path. Pass-
+// through to liteNode; ignored by minimal/full modes (which have their own
+// fixed shapes). When mode='lite' AND composable opts are set, composable
+// behavior wins (mode is the legacy dispatcher).
+function shapeTree(rootNodes, scope, libraryId, mode, includeFavicons, opts) {
   if (mode === 'minimal') return flattenForMinimal(rootNodes, scope, libraryId);
-  if (mode === 'lite')    return rootNodes.map(n => liteNode(n, scope, libraryId));
+  if (mode === 'lite')    return rootNodes.map(n => liteNode(n, scope, libraryId, opts));
   // full
   return includeFavicons ? rootNodes : rootNodes.map(stripFavicons);
+}
+
+// Extract composable shape opts from a tool input destructure. Returns an
+// opts object suitable for liteNode / shapeTree. Used by get_tree, get_library,
+// list_libraries (when include_tabs:true). Only forwards keys the agent
+// explicitly set; liteNode applies its own defaults for omitted keys.
+function _extractShapeOpts(input) {
+  if (!input || typeof input !== 'object') return {};
+  const opts = {};
+  if (input.minimal === true) opts.minimal = true;
+  if (input.include_opened_date       !== undefined) opts.include_opened_date       = input.include_opened_date;
+  if (input.include_tags              !== undefined) opts.include_tags              = input.include_tags;
+  if (input.include_memos             !== undefined) opts.include_memos             = input.include_memos;
+  if (input.include_lineage           !== undefined) opts.include_lineage           = input.include_lineage;
+  if (input.include_chrome_tab_groups !== undefined) opts.include_chrome_tab_groups = input.include_chrome_tab_groups;
+  if (input.include_star_color        !== undefined) opts.include_star_color        = input.include_star_color;
+  if (input.include_row_color         !== undefined) opts.include_row_color         = input.include_row_color;
+  if (input.include_custom_title      !== undefined) opts.include_custom_title      = input.include_custom_title;
+  return opts;
 }
 
 // Strip rich-text note content to id+title only. Note `content` is HTML/
@@ -2681,27 +2747,40 @@ function createMcpServer() {
     'get_tree',
     {
       description:
-        'Returns the tab tree (Windows → Groups → Tabs) from the Pinako extension. Three modes: ' +
+        'Returns the tab tree (Windows → Groups → Tabs) from the Pinako extension. Three legacy modes (will be superseded by composable shape opts next release): ' +
         '"minimal" (FLAT list, compact URLs, drops children/collapsed/ghost, keeps openedDate — best for semantic search across 500+ tab trees); ' +
         '"lite" (DEFAULT — tree shape with children/collapsed/ghost, full URLs, keeps openedDate, no favicons); ' +
         '"full" (everything in source data EXCEPT favicons; useful only for visual-field workflows). ' +
         'Favicons are NEVER returned unless include_favicons:true (they\'re 1-3KB base64 blobs of zero agent value). ' +
         'Returns a structured {warning:"tree_too_large", suggested_actions:[...]} response (instead of the tree) when the estimated payload exceeds the per-tier read budget — call again with mode:"minimal" to shrink, with pagination (after/limit) to chunk through, or with acknowledge_size:true to bypass the guard. ' +
-        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N}. Items lose tree nesting but carry parentId so hierarchy can be reconstructed. Pagination bypasses the size guard automatically. Designed for the auto-organize sift loop — read 500 items, classify, bulk_apply moves, then read the next 500 via nextCursor. Cursor is robust to list churn: if the cursor node was moved between calls, pagination restarts from index 0 (the agent should still progress because moved items no longer appear in the flat list).' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N}. Items lose tree nesting but carry parentId so hierarchy can be reconstructed. Pagination bypasses the size guard automatically. Designed for the auto-organize sift loop — read 500 items, classify, bulk_apply moves, then read the next 500 via nextCursor. Cursor is robust to list churn: if the cursor node was moved between calls, pagination restarts from index 0 (the agent should still progress because moved items no longer appear in the flat list). ' +
+        'SHAPE COMPOSITION (2026-05-19): per-field opt-ins are now available alongside `mode` for finer control. They apply when mode is "lite" (default) or unset. Defaults match the prior lite shape PLUS add parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present (these were previously emitted only on chat surface; added to MCP for parity). Pass `minimal:true` to shrink lite to basics-only (id/type/title/url/ghost); pass any individual `include_*:false` to opt out of a specific field group, or `include_favicons:true` to opt in to per-tab favIconUrl base64 (heavy: 1-3KB per tab, useful only for color-organize workflows that sample favicon colors). Composable opts take precedence over `mode` when both are passed.' +
         FRESHNESS_HINT,
       inputSchema: {
-        mode: z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "lite". Use "minimal" for semantic-search scans.'),
+        mode: z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "lite". Composable opts (minimal + include_*) take precedence when both are passed.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs (chromeId=null). Default true.'),
-        include_favicons:   z.boolean().optional().describe('Include favIconUrl base64 data. Default false. Set true only for color-organization workflows.'),
+        include_favicons:   z.boolean().optional().describe('Include favIconUrl base64 data per tab. Default false. Heavy: 1-3KB per tab. Set true only for color-organize workflows that sample favicon colors.'),
         acknowledge_size:   z.boolean().optional().describe('Bypass the per-tier read-size guard and return the full payload anyway. Default false. Use only when your model has a context window large enough to comfortably absorb the warning\'s reported est_tokens.'),
         after:              z.string().optional().describe('Pagination cursor: last-seen node id from a previous paginated call. Omit on the first call. When present, returns items AFTER this id in DFS pre-order.'),
         limit:              z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active. Triggers paginated response when set even without `after`.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
+        // ── Composable shape opt-ins (active when mode is "lite" or unset) ──
+        minimal:                   z.boolean().optional().describe('Shortcut: when true, forces every include_* flag to false. Returns basics-only (id, type, title, scope, libraryId, url, ghost flag) per node. Use for cheap large-tree scans.'),
+        include_opened_date:       z.boolean().optional().describe('Include openedDate on tab nodes (Unix ms timestamp). Default true.'),
+        include_tags:              z.boolean().optional().describe('Include the tags array per node. Default true.'),
+        include_memos:             z.boolean().optional().describe('Include memoText per node. Default true.'),
+        include_lineage:           z.boolean().optional().describe('Include parentWindow + parentGroup pointers + collapsed flag. Default true. Useful for understanding tree position and which subtrees the user has folded up.'),
+        include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId + chromeGroupTitle + chromeGroupColor metadata on tab nodes (the colored-strip Chromium Tab Group in Chrome\'s tab bar, mirrored read-only). NOT to be confused with Pinako Group nodes (type="group"), which are always returned as nodes regardless of this flag. Default true.'),
+        include_star_color:        z.boolean().optional().describe('Include per-node starColor when set. Default true (cheap when absent).'),
+        include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set (Pinako Group / Folder background tint). Default true (cheap when absent).'),
+        include_custom_title:      z.boolean().optional().describe('Include the customTitle flag indicating a user-customized title. Default true (cheap when absent).'),
       },
       annotations: TOOL_ANNOTATIONS.get_tree,
     },
-    async ({ mode, include_ghost_tabs = true, include_favicons = false, acknowledge_size = false, after, limit, browser }) => {
+    async (args) => {
+      let { mode, include_ghost_tabs = true, include_favicons = false, acknowledge_size = false, after, limit, browser } = args;
       mode = _normalizeMode(mode);
+      const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const tree = getTree(r.data, include_ghost_tabs);
@@ -2710,7 +2789,7 @@ function createMcpServer() {
       // Bypasses the size guard (pagination itself is the safety mechanism).
       if (_isPaginationRequested(after, limit)) {
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS.tree;
-        const flat = _flattenTreeWithMode(tree, 'tree', null, mode, include_favicons);
+        const flat = _flattenTreeWithMode(tree, 'tree', null, mode, include_favicons, shapeOpts);
         const page = _paginateByCursor(flat, after, effectiveLimit);
         return { content: [{ type: 'text', text: JSON.stringify({
           browser:    r.data.browserBrand,
@@ -2725,7 +2804,7 @@ function createMcpServer() {
         }) }] };
       }
 
-      const out  = shapeTree(tree, 'tree', null, mode, include_favicons);
+      const out  = shapeTree(tree, 'tree', null, mode, include_favicons, shapeOpts);
 
       const nodeCount = _countNodesDeep(out);
       const estTokens = _estimateTreeTokens(nodeCount, mode);
@@ -2943,20 +3022,33 @@ function createMcpServer() {
     'list_libraries',
     {
       description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies. Also returns the panel structure (groups + panel_order) needed as input to reorder_library_panel — always call this before any reorder op to source fresh group ids and panel positions. When include_tabs:true and the combined library payload exceeds the per-tier read budget, returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — drop include_tabs and fetch one library at a time via get_library, or set acknowledge_size:true to bypass. ' +
-        'PAGINATION (Slice S2a): pass `after` (last-seen library id) and/or `limit` (default 50) to chunk through libraries when the user has many. Returns {items:[...libraries...], nextCursor:..., totalItems:N, groups:[...], panel_order:[...]}. Pagination applies to the libraries array only — groups and panel_order are always returned in full (they are small metadata). When include_tabs:true is set alongside pagination, embedded tabs are kept tree-shaped within each library entry (use get_library with pagination if you need to chunk through a single huge library\'s tabs).' + FRESHNESS_HINT,
+        'PAGINATION (Slice S2a): pass `after` (last-seen library id) and/or `limit` (default 50) to chunk through libraries when the user has many. Returns {items:[...libraries...], nextCursor:..., totalItems:N, groups:[...], panel_order:[...]}. Pagination applies to the libraries array only — groups and panel_order are always returned in full (they are small metadata). When include_tabs:true is set alongside pagination, embedded tabs are kept tree-shaped within each library entry (use get_library with pagination if you need to chunk through a single huge library\'s tabs). ' +
+        'SHAPE COMPOSITION (2026-05-19, active only when include_tabs:true and mode is "lite" or unset): per-field opt-ins are available alongside `mode` for the embedded children. Defaults match the prior lite shape plus parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink embedded children to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
       inputSchema: {
         include_tabs: z.boolean().optional().describe('Embed each library\'s tabs in the response. Default false. Use this for cross-library semantic search in one call.'),
-        mode:         z.enum(['minimal', 'lite', 'full']).optional().describe('Mode for embedded tabs (only used when include_tabs:true). Default "minimal".'),
-        include_favicons: z.boolean().optional().describe('Include favIconUrl on embedded tabs. Default false.'),
+        mode:         z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy mode for embedded tabs (only used when include_tabs:true). Default "minimal". Composable opts (minimal + include_*) take precedence when both are passed.'),
+        include_favicons: z.boolean().optional().describe('Include favIconUrl base64 on embedded tabs. Default false. Heavy: 1-3KB per tab.'),
         acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard (only applies when include_tabs:true). Default false.'),
         after:        z.string().optional().describe('Pagination cursor: last-seen library id from a previous paginated call. Omit on the first call.'),
         limit:        z.number().int().min(1).max(500).optional().describe('Max libraries per page. Default 50 when pagination is active.'),
         browser:      z.string().optional().describe(BROWSER_ARG_DESC),
+        // ── Composable shape opt-ins (apply to embedded children when include_tabs:true and mode is "lite" or unset) ──
+        minimal:                   z.boolean().optional().describe('Shape opt (when include_tabs:true): forces every include_* flag to false. Returns basics-only per embedded node (id, type, title, scope, libraryId, url, ghost flag).'),
+        include_opened_date:       z.boolean().optional().describe('Shape opt (when include_tabs:true): include openedDate on tab nodes. Default true.'),
+        include_tags:              z.boolean().optional().describe('Shape opt (when include_tabs:true): include the tags array per node. Default true.'),
+        include_memos:             z.boolean().optional().describe('Shape opt (when include_tabs:true): include memoText per node. Default true.'),
+        include_lineage:           z.boolean().optional().describe('Shape opt (when include_tabs:true): include parentWindow + parentGroup pointers + collapsed flag. Default true.'),
+        include_chrome_tab_groups: z.boolean().optional().describe('Shape opt (when include_tabs:true): include chromeGroupId/Title/Color metadata on tab nodes (Chromium Tab Group, NOT Pinako Group nodes). Default true.'),
+        include_star_color:        z.boolean().optional().describe('Shape opt (when include_tabs:true): include per-node starColor when set. Default true.'),
+        include_row_color:         z.boolean().optional().describe('Shape opt (when include_tabs:true): include per-node rowColor when set. Default true.'),
+        include_custom_title:      z.boolean().optional().describe('Shape opt (when include_tabs:true): include the customTitle flag. Default true.'),
       },
       annotations: TOOL_ANNOTATIONS.list_libraries,
     },
-    async ({ include_tabs = false, mode, include_favicons = false, acknowledge_size = false, after, limit, browser }) => {
+    async (args) => {
+      let { include_tabs = false, mode, include_favicons = false, acknowledge_size = false, after, limit, browser } = args;
       mode = _normalizeMode(mode || 'minimal');
+      const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const libs = (r.data.libraries || []).map(lib => {
@@ -2968,7 +3060,7 @@ function createMcpServer() {
           notes:       liteNotes(lib.notes),
         };
         if (include_tabs) {
-          entry.children = shapeTree(lib.children || [], 'library', lib.id, mode, include_favicons);
+          entry.children = shapeTree(lib.children || [], 'library', lib.id, mode, include_favicons, shapeOpts);
         }
         return entry;
       });
@@ -3042,21 +3134,34 @@ function createMcpServer() {
   srv.registerTool(
     'get_library',
     {
-      description: 'Returns one library\'s contents. Three modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties. When the payload exceeds the per-tier read budget (large library + "full" mode is the typical trigger), returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — switch to mode:"lite" or "minimal", paginate via after/limit, or pass acknowledge_size:true to bypass. ' +
-        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N, library:{id,title,description}, notes:[...]} — the library\'s tabs/windows/groups/folders are paginated; metadata + note titles are returned at the top level. Pagination bypasses the size guard automatically. Cursor is robust to list churn.' + FRESHNESS_HINT,
+      description: 'Returns one library\'s contents. Three legacy modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties. When the payload exceeds the per-tier read budget (large library + "full" mode is the typical trigger), returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — switch to mode:"lite" or "minimal", paginate via after/limit, or pass acknowledge_size:true to bypass. ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N, library:{id,title,description}, notes:[...]} — the library\'s tabs/windows/groups/folders are paginated; metadata + note titles are returned at the top level. Pagination bypasses the size guard automatically. Cursor is robust to list churn. ' +
+        'SHAPE COMPOSITION (2026-05-19, active when mode is "lite" or unset): per-field opt-ins are available alongside `mode` for finer control over the children tree shape. Defaults match the prior lite shape PLUS add parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink children to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
       inputSchema: {
         library_id: z.string().describe('Library id from list_libraries'),
-        mode:       z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "lite".'),
-        include_favicons: z.boolean().optional().describe('Include favIconUrl base64. Default false.'),
+        mode:       z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "lite". Composable opts (minimal + include_*) take precedence when both are passed.'),
+        include_favicons: z.boolean().optional().describe('Include favIconUrl base64. Default false. Heavy: 1-3KB per tab.'),
         acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard. Default false.'),
         after:      z.string().optional().describe('Pagination cursor: last-seen node id from a previous paginated call. Omit on the first call.'),
         limit:      z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active.'),
         browser:    z.string().optional().describe(BROWSER_ARG_DESC),
+        // ── Composable shape opt-ins (active when mode is "lite" or unset) ──
+        minimal:                   z.boolean().optional().describe('Shortcut: when true, forces every include_* flag to false. Returns basics-only per node in the children tree (id, type, title, scope, libraryId, url, ghost flag).'),
+        include_opened_date:       z.boolean().optional().describe('Include openedDate on tab nodes. Default true.'),
+        include_tags:              z.boolean().optional().describe('Include the tags array per node. Default true.'),
+        include_memos:             z.boolean().optional().describe('Include memoText per node. Default true.'),
+        include_lineage:           z.boolean().optional().describe('Include parentWindow + parentGroup pointers + collapsed flag. Default true.'),
+        include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId/Title/Color metadata on tab nodes (Chromium Tab Group, NOT Pinako Group nodes). Default true.'),
+        include_star_color:        z.boolean().optional().describe('Include per-node starColor when set. Default true.'),
+        include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set. Default true.'),
+        include_custom_title:      z.boolean().optional().describe('Include the customTitle flag. Default true.'),
       },
       annotations: TOOL_ANNOTATIONS.get_library,
     },
-    async ({ library_id, mode, include_favicons = false, acknowledge_size = false, after, limit, browser }) => {
+    async (args) => {
+      let { library_id, mode, include_favicons = false, acknowledge_size = false, after, limit, browser } = args;
       mode = _normalizeMode(mode);
+      const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const lib = (r.data.libraries || []).find(l => l.id === library_id);
@@ -3067,7 +3172,7 @@ function createMcpServer() {
       // (notes are few and small at the metadata level).
       if (_isPaginationRequested(after, limit)) {
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS.library;
-        const flat = _flattenTreeWithMode(lib.children || [], 'library', library_id, mode, include_favicons);
+        const flat = _flattenTreeWithMode(lib.children || [], 'library', library_id, mode, include_favicons, shapeOpts);
         const page = _paginateByCursor(flat, after, effectiveLimit);
         return { content: [{ type: 'text', text: JSON.stringify({
           browser:    r.data.browserBrand,
@@ -3098,7 +3203,7 @@ function createMcpServer() {
           id:          sanitized.id,
           title:       sanitized.title,
           description: sanitized.description || '',
-          children:    (sanitized.children || []).map(c => liteNode(c, 'library', library_id)),
+          children:    (sanitized.children || []).map(c => liteNode(c, 'library', library_id, shapeOpts)),
           notes:       liteNotes(sanitized.notes),
         };
       } else { // full
