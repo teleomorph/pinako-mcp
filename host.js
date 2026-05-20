@@ -79,27 +79,6 @@ const STDIN_GRACE_MS = 30_000;
 // stays as defense-in-depth for in-process callers (chat panel in Phase 4).
 const NOTE_CHAR_LIMITS = { 0: 50000, 1: 50000, 2: 150000, 3: 250000, 4: 500000 };
 
-// Slice S1 (2026-05-13): per-tier read-tool size guard. Triggers a structured
-// warning when a single tree/library/bookmarks/notes read would exceed the
-// agent's context budget. Generous thresholds — not a hard cap; the caller
-// can bypass with acknowledge_size:true if they explicitly want the full
-// payload (e.g., model with a much bigger context window than typical).
-// Calibration is TBD via real-tree measurement; initial values map roughly to
-// "comfortable working budget" per tier assuming minimal mode.
-const READ_TOKEN_LIMITS = {
-  0: 30_000,    // free       — ~500 nodes at ~60 tok/node
-  1: 120_000,   // Pro        — ~2000 nodes
-  2: 300_000,   // Pro+       — ~5000 nodes
-  3: 600_000,   // Premium    — ~10k nodes
-  4: Infinity,  // Enterprise — no guard
-};
-
-// Per-mode token-per-node estimate for tree/bookmark/library payloads.
-// Approximate; the size guard uses these to estimate the response weight
-// before serializing it. Higher figures for richer modes (lite carries
-// children/collapsed/ghost; full carries everything except favicons).
-const TOKENS_PER_NODE = { minimal: 60, lite: 120, full: 250 };
-
 // Last-resort handlers so an uncaught error in any async path is at least
 // logged to disk before the process dies. Without these, an async throw in
 // the /edit handler or NM listener would crash the host silently from the
@@ -1158,45 +1137,6 @@ function _countNodesDeep(treeOrNode) {
     walk(treeOrNode);
   }
   return count;
-}
-
-// Token estimate for tree/bookmark/library payload shapes.
-function _estimateTreeTokens(nodeCount, mode) {
-  const perNode = TOKENS_PER_NODE[mode] || TOKENS_PER_NODE.lite;
-  return nodeCount * perNode;
-}
-
-// Token estimate for notes payloads. Notes are content-heavy not node-heavy;
-// estimate from cumulative character length (chars-to-tokens ~4:1).
-function _estimateNotesTokens(notes) {
-  if (!Array.isArray(notes)) return 0;
-  let chars = 0;
-  for (const n of notes) {
-    chars += String((n && n.content) || '').length;
-    chars += String((n && n.title) || '').length;
-  }
-  return Math.ceil(chars / 4);
-}
-
-// Returns a structured warning object when the estimated payload exceeds the
-// per-tier token budget AND acknowledge is falsy. Returns null otherwise (no
-// guard fired; proceed with normal payload). Caller passes estTokens (computed
-// via the appropriate estimator), nodeCount (for the warning shape), the mode
-// label, the scope label, browserData (for tier lookup), the tool-specific
-// suggested_actions array, and the acknowledge_size flag from the caller.
-function _checkReadSizeGuard({ estTokens, nodeCount, mode, scope, browserData, suggestedActions, acknowledge }) {
-  if (acknowledge) return null;
-  const tier = Number.isFinite(browserData?.userTier) ? browserData.userTier : 0;
-  const tokenLimit = READ_TOKEN_LIMITS[tier] != null ? READ_TOKEN_LIMITS[tier] : READ_TOKEN_LIMITS[0];
-  if (!Number.isFinite(tokenLimit) || estTokens <= tokenLimit) return null;
-  return {
-    warning: 'tree_too_large',
-    counts: { nodes: nodeCount, est_tokens: estTokens, mode: mode || null },
-    threshold: { tier, est_tokens_limit: tokenLimit },
-    scope,
-    suggested_actions: suggestedActions,
-    bypass: 'Pass acknowledge_size:true to skip this guard and receive the full payload anyway.',
-  };
 }
 
 // ─── Slice S2 Prep 2: exact-URL duplicate detection ─────────────────────────
@@ -2586,23 +2526,10 @@ Selection rules:
 - Focus-shift exception: if a DIFFERENT browser's updatedAt is newer than the sticky choice's most recent updatedAt, the user has likely shifted attention to that browser. Ask once: "I noticed recent activity in <X>. Apply this to <X>, stay on <Y>, or do both?" Then adopt the answer as the new sticky default. updatedAt advances on any tree mutation (tab open/close, memo edit, note write), not strictly on window focus, so treat this as a heuristic and do NOT fire it again until updatedAt shifts further.
 - Explicit overrides ("in both browsers", "do it in Chrome instead", "across all installs") win for that one call. If the user's phrasing sounds durable ("from now on use Chrome"), update the sticky default too.
 
-LARGE TREE SIZE GUARD
-Read tools (get_tree, get_bookmarks, get_library, get_main_tree_notes, list_libraries with include_tabs:true) check the estimated payload size against a per-tier budget BEFORE returning. When the payload would exceed the budget, the tool returns a structured warning INSTEAD of the data:
+LARGE TREE / LIBRARY / BOOKMARK READS
+Read tools (get_tree, get_bookmarks, get_library, get_main_tree_notes, list_libraries with include_tabs:true) return the full payload by default. Manage response cost via the SHAPE COMPOSITION opts (minimal:true for basics-only; or selectively turn off include_tags / include_memos / include_lineage / include_chrome_tab_groups / include_star_color / include_row_color / include_custom_title / include_opened_date when the user's question doesn't need them) and via pagination (after + limit) when chunking through large surfaces. minimal:true alone roughly halves the per-node token weight on lite shape; pagination is the only way to safely traverse 10K+ bookmark trees.
 
-{
-  "warning": "tree_too_large",
-  "counts": { "nodes": N, "est_tokens": M, "mode": "lite" },
-  "threshold": { "tier": T, "est_tokens_limit": L },
-  "scope": "tree" | "bookmarks" | "library" | "main-tree-notes" | "libraries-with-tabs",
-  "suggested_actions": [ ... tool-specific options ... ],
-  "bypass": "Pass acknowledge_size:true to skip this guard and receive the full payload anyway."
-}
-
-When you receive this response:
-1. Read suggested_actions. Each entry has {type, param, note}. Pick the option that matches the user's intent:
-   - type:'mode', param:'minimal' — call the same tool again with mode:'minimal' (smaller payload, no tree structure / no rich content)
-   - type:'scope', param:'per-library' — drop include_tabs and fetch one library at a time via get_library
-   - type:'workflow', param:'auto_organize' — for organize/reorganize tasks, use the AUTO-ORGANIZE BOOKMARKS WORKFLOW (TEMPORARILY UNAVAILABLE)
+AUTO-ORGANIZE WORKFLOW (MCP UNAVAILABLE)
 The auto-organize MCP tools (auto_organize_bookmarks, apply_heuristic_organize, refine_folder_outliers, summarize_organize_results, resolve_duplicate_landings, complete_organize_sort, propose_subcategories, get_organize_state, record_observation, get_observations, propose_categories) are temporarily disabled and return MCP_AUTO_ORGANIZE_UNAVAILABLE. The full MCP-based workflow is preserved in code for a future revisit but is not active in v1.
 If the user asks to organize / reorganize / clean up / sort / categorize / auto-organize / tidy / structure their bookmarks: direct them to open the Pinako extension popup and use the native AI chat panel (Pro tier 1+), or click the auto-organize button on the bookmarks panel in Pinako. Do NOT attempt to plan a manual organization from get_bookmarks output — large bookmark trees exceed agent context windows and the safety nets (review folder, per-batch confirmation, duplicate reconciliation) only exist in the native chat workflow.
 CONNECTION RECOVERY
@@ -2752,15 +2679,13 @@ function createMcpServer() {
         '"lite" (DEFAULT — tree shape with children/collapsed/ghost, full URLs, keeps openedDate, no favicons); ' +
         '"full" (everything in source data EXCEPT favicons; useful only for visual-field workflows). ' +
         'Favicons are NEVER returned unless include_favicons:true (they\'re 1-3KB base64 blobs of zero agent value). ' +
-        'Returns a structured {warning:"tree_too_large", suggested_actions:[...]} response (instead of the tree) when the estimated payload exceeds the per-tier read budget — call again with mode:"minimal" to shrink, with pagination (after/limit) to chunk through, or with acknowledge_size:true to bypass the guard. ' +
-        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N}. Items lose tree nesting but carry parentId so hierarchy can be reconstructed. Pagination bypasses the size guard automatically. Designed for the auto-organize sift loop — read 500 items, classify, bulk_apply moves, then read the next 500 via nextCursor. Cursor is robust to list churn: if the cursor node was moved between calls, pagination restarts from index 0 (the agent should still progress because moved items no longer appear in the flat list). ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N}. Items lose tree nesting but carry parentId so hierarchy can be reconstructed. Designed for the auto-organize sift loop — read 500 items, classify, bulk_apply moves, then read the next 500 via nextCursor. Cursor is robust to list churn: if the cursor node was moved between calls, pagination restarts from index 0 (the agent should still progress because moved items no longer appear in the flat list). ' +
         'SHAPE COMPOSITION (2026-05-19): per-field opt-ins are now available alongside `mode` for finer control. They apply when mode is "lite" (default) or unset. Defaults match the prior lite shape PLUS add parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present (these were previously emitted only on chat surface; added to MCP for parity). Pass `minimal:true` to shrink lite to basics-only (id/type/title/url/ghost); pass any individual `include_*:false` to opt out of a specific field group, or `include_favicons:true` to opt in to per-tab favIconUrl base64 (heavy: 1-3KB per tab, useful only for color-organize workflows that sample favicon colors). Composable opts take precedence over `mode` when both are passed.' +
         FRESHNESS_HINT,
       inputSchema: {
         mode: z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "lite". Composable opts (minimal + include_*) take precedence when both are passed.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs (chromeId=null). Default true.'),
         include_favicons:   z.boolean().optional().describe('Include favIconUrl base64 data per tab. Default false. Heavy: 1-3KB per tab. Set true only for color-organize workflows that sample favicon colors.'),
-        acknowledge_size:   z.boolean().optional().describe('Bypass the per-tier read-size guard and return the full payload anyway. Default false. Use only when your model has a context window large enough to comfortably absorb the warning\'s reported est_tokens.'),
         after:              z.string().optional().describe('Pagination cursor: last-seen node id from a previous paginated call. Omit on the first call. When present, returns items AFTER this id in DFS pre-order.'),
         limit:              z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active. Triggers paginated response when set even without `after`.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
@@ -2778,7 +2703,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.get_tree,
     },
     async (args) => {
-      let { mode, include_ghost_tabs = true, include_favicons = false, acknowledge_size = false, after, limit, browser } = args;
+      let { mode, include_ghost_tabs = true, include_favicons = false, after, limit, browser } = args;
       mode = _normalizeMode(mode);
       const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
@@ -2805,25 +2730,6 @@ function createMcpServer() {
       }
 
       const out  = shapeTree(tree, 'tree', null, mode, include_favicons, shapeOpts);
-
-      const nodeCount = _countNodesDeep(out);
-      const estTokens = _estimateTreeTokens(nodeCount, mode);
-      const guard = _checkReadSizeGuard({
-        estTokens, nodeCount, mode, scope: 'tree',
-        browserData: r.data, acknowledge: acknowledge_size,
-        suggestedActions: [
-          { type: 'mode', param: 'minimal', note: 'Compact mode reduces tokens per node ~2-4x' },
-          { type: 'pagination', param: 'after+limit', note: 'Pass limit:500 (and after:<lastId> on subsequent calls) for paginated reads — bypasses this guard and chunks the tree' },
-          { type: 'native_chat', param: 'pinako_extension', note: 'If the user wants to reorganize, direct them to the Pinako native AI chat in the extension (auto-organize via MCP is currently unavailable)' },
-        ],
-      });
-      if (guard) {
-        return { content: [{ type: 'text', text: JSON.stringify({
-          browser:   r.data.browserBrand,
-          browserId: r.data.browserId,
-          ...guard,
-        }) }] };
-      }
 
       return { content: [{ type: 'text', text: JSON.stringify({
         browser:   r.data.browserBrand,
@@ -3021,14 +2927,13 @@ function createMcpServer() {
   srv.registerTool(
     'list_libraries',
     {
-      description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies. Also returns the panel structure (groups + panel_order) needed as input to reorder_library_panel — always call this before any reorder op to source fresh group ids and panel positions. When include_tabs:true and the combined library payload exceeds the per-tier read budget, returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — drop include_tabs and fetch one library at a time via get_library, or set acknowledge_size:true to bypass. ' +
+      description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies. Also returns the panel structure (groups + panel_order) needed as input to reorder_library_panel — always call this before any reorder op to source fresh group ids and panel positions. ' +
         'PAGINATION (Slice S2a): pass `after` (last-seen library id) and/or `limit` (default 50) to chunk through libraries when the user has many. Returns {items:[...libraries...], nextCursor:..., totalItems:N, groups:[...], panel_order:[...]}. Pagination applies to the libraries array only — groups and panel_order are always returned in full (they are small metadata). When include_tabs:true is set alongside pagination, embedded tabs are kept tree-shaped within each library entry (use get_library with pagination if you need to chunk through a single huge library\'s tabs). ' +
         'SHAPE COMPOSITION (2026-05-19, active only when include_tabs:true and mode is "lite" or unset): per-field opt-ins are available alongside `mode` for the embedded children. Defaults match the prior lite shape plus parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink embedded children to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
       inputSchema: {
         include_tabs: z.boolean().optional().describe('Embed each library\'s tabs in the response. Default false. Use this for cross-library semantic search in one call.'),
         mode:         z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy mode for embedded tabs (only used when include_tabs:true). Default "minimal". Composable opts (minimal + include_*) take precedence when both are passed.'),
         include_favicons: z.boolean().optional().describe('Include favIconUrl base64 on embedded tabs. Default false. Heavy: 1-3KB per tab.'),
-        acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard (only applies when include_tabs:true). Default false.'),
         after:        z.string().optional().describe('Pagination cursor: last-seen library id from a previous paginated call. Omit on the first call.'),
         limit:        z.number().int().min(1).max(500).optional().describe('Max libraries per page. Default 50 when pagination is active.'),
         browser:      z.string().optional().describe(BROWSER_ARG_DESC),
@@ -3046,7 +2951,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.list_libraries,
     },
     async (args) => {
-      let { include_tabs = false, mode, include_favicons = false, acknowledge_size = false, after, limit, browser } = args;
+      let { include_tabs = false, mode, include_favicons = false, after, limit, browser } = args;
       mode = _normalizeMode(mode || 'minimal');
       const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
@@ -3064,30 +2969,6 @@ function createMcpServer() {
         }
         return entry;
       });
-
-      // Size guard only relevant when include_tabs:true — without tabs the
-      // response is just per-library metadata (small, even for 100+ libraries).
-      if (include_tabs) {
-        let nodeCount = 0;
-        for (const lib of libs) nodeCount += _countNodesDeep(lib.children || []);
-        const estTokens = _estimateTreeTokens(nodeCount, mode);
-        const guard = _checkReadSizeGuard({
-          estTokens, nodeCount, mode, scope: 'libraries-with-tabs',
-          browserData: r.data, acknowledge: acknowledge_size,
-          suggestedActions: [
-            { type: 'mode', param: 'minimal', note: 'Use mode:"minimal" to reduce per-node tokens (~2-4x compression)' },
-            { type: 'scope', param: 'per-library', note: 'Drop include_tabs and fetch one library at a time via get_library' },
-            { type: 'pagination', param: 'after+limit', note: 'Pass limit:50 to chunk through libraries (cross-library tabs still embedded per-library; use get_library pagination for a single huge library)' },
-            { type: 'native_chat', param: 'pinako_extension', note: 'If the user wants to reorganize, direct them to the Pinako native AI chat in the extension (auto-organize via MCP is currently unavailable)' },
-          ],
-        });
-        if (guard) {
-          return { content: [{ type: 'text', text: JSON.stringify({
-            browser: r.data.browserBrand,
-            ...guard,
-          }) }] };
-        }
-      }
 
       // Slice Z (2026-05-12): expose library panel structure so agents can
       // construct a valid reorder_library_panel call. `groups` lists every
@@ -3134,14 +3015,13 @@ function createMcpServer() {
   srv.registerTool(
     'get_library',
     {
-      description: 'Returns one library\'s contents. Three legacy modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties. When the payload exceeds the per-tier read budget (large library + "full" mode is the typical trigger), returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — switch to mode:"lite" or "minimal", paginate via after/limit, or pass acknowledge_size:true to bypass. ' +
-        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N, library:{id,title,description}, notes:[...]} — the library\'s tabs/windows/groups/folders are paginated; metadata + note titles are returned at the top level. Pagination bypasses the size guard automatically. Cursor is robust to list churn. ' +
+      description: 'Returns one library\'s contents. Three legacy modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties. ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N, library:{id,title,description}, notes:[...]} — the library\'s tabs/windows/groups/folders are paginated; metadata + note titles are returned at the top level. Cursor is robust to list churn. ' +
         'SHAPE COMPOSITION (2026-05-19, active when mode is "lite" or unset): per-field opt-ins are available alongside `mode` for finer control over the children tree shape. Defaults match the prior lite shape PLUS add parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink children to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
       inputSchema: {
         library_id: z.string().describe('Library id from list_libraries'),
         mode:       z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "lite". Composable opts (minimal + include_*) take precedence when both are passed.'),
         include_favicons: z.boolean().optional().describe('Include favIconUrl base64. Default false. Heavy: 1-3KB per tab.'),
-        acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard. Default false.'),
         after:      z.string().optional().describe('Pagination cursor: last-seen node id from a previous paginated call. Omit on the first call.'),
         limit:      z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active.'),
         browser:    z.string().optional().describe(BROWSER_ARG_DESC),
@@ -3159,7 +3039,7 @@ function createMcpServer() {
       annotations: TOOL_ANNOTATIONS.get_library,
     },
     async (args) => {
-      let { library_id, mode, include_favicons = false, acknowledge_size = false, after, limit, browser } = args;
+      let { library_id, mode, include_favicons = false, after, limit, browser } = args;
       mode = _normalizeMode(mode);
       const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
@@ -3211,29 +3091,6 @@ function createMcpServer() {
         outLib = include_favicons ? sanitized : stripFavicons(sanitized);
       }
 
-      // Token estimate covers children weight + (in 'full' mode) note bodies.
-      const nodeCount = _countNodesDeep(outLib.children || []);
-      let estTokens   = _estimateTreeTokens(nodeCount, mode);
-      if (mode === 'full' && Array.isArray(outLib.notes)) {
-        estTokens += _estimateNotesTokens(outLib.notes);
-      }
-      const guard = _checkReadSizeGuard({
-        estTokens, nodeCount, mode, scope: 'library',
-        browserData: r.data, acknowledge: acknowledge_size,
-        suggestedActions: [
-          { type: 'mode', param: 'minimal', note: 'Use mode:"minimal" or "lite" to reduce per-node tokens' },
-          { type: 'pagination', param: 'after+limit', note: 'Pass limit:500 (and after:<lastId> on subsequent calls) for paginated reads — bypasses this guard and chunks the library' },
-          { type: 'native_chat', param: 'pinako_extension', note: 'If the user wants to reorganize this library, direct them to the Pinako native AI chat in the extension (auto-organize via MCP is currently unavailable)' },
-        ],
-      });
-      if (guard) {
-        return { content: [{ type: 'text', text: JSON.stringify({
-          browser:   r.data.browserBrand,
-          libraryId: library_id,
-          ...guard,
-        }) }] };
-      }
-
       return { content: [{ type: 'text', text: JSON.stringify({
         browser:   r.data.browserBrand,
         scope:     'library',
@@ -3247,17 +3104,16 @@ function createMcpServer() {
   srv.registerTool(
     'get_main_tree_notes',
     {
-      description: 'Returns the main tree notes — rich text documents attached to the user\'s main tree (the live tab tree), as opposed to notes attached to a specific library. Cloud-synced, identical across browsers. (Legacy codebase name: "global notes". Surface as "main tree notes" in any user-facing language.) When the cumulative note content exceeds the per-tier read budget (this happens with a few very large notes), returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — pass acknowledge_size:true to bypass if your model can absorb the reported est_tokens. ' +
-        'PAGINATION (Slice S2a): pass `after` (last-seen note id) and/or `limit` (default 100) to receive notes one batch at a time: {items:[...notes...], nextCursor:..., totalItems:N}. Pagination returns notes in their stored order with full content bodies; pagination bypasses the size guard automatically. Useful when one or two notes are very large.' + FRESHNESS_HINT,
+      description: 'Returns the main tree notes — rich text documents attached to the user\'s main tree (the live tab tree), as opposed to notes attached to a specific library. Cloud-synced, identical across browsers. (Legacy codebase name: "global notes". Surface as "main tree notes" in any user-facing language.) ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen note id) and/or `limit` (default 100) to receive notes one batch at a time: {items:[...notes...], nextCursor:..., totalItems:N}. Pagination returns notes in their stored order with full content bodies. Useful when one or two notes are very large.' + FRESHNESS_HINT,
       inputSchema: {
-        acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard. Default false.'),
         after:            z.string().optional().describe('Pagination cursor: last-seen note id from a previous paginated call. Omit on the first call.'),
         limit:            z.number().int().min(1).max(1000).optional().describe('Max notes per page. Default 100 when pagination is active.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
       annotations: TOOL_ANNOTATIONS.get_main_tree_notes,
     },
-    async ({ acknowledge_size = false, after, limit, browser }) => {
+    async ({ after, limit, browser }) => {
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const notes = r.data.globalNotes || [];
@@ -3277,21 +3133,6 @@ function createMcpServer() {
         }) }] };
       }
 
-      const estTokens = _estimateNotesTokens(notes);
-      const guard = _checkReadSizeGuard({
-        estTokens, nodeCount: notes.length, mode: null, scope: 'main-tree-notes',
-        browserData: r.data, acknowledge: acknowledge_size,
-        suggestedActions: [
-          { type: 'pagination', param: 'after+limit', note: 'Pass limit:100 (and after:<lastNoteId> on subsequent calls) to read notes one batch at a time — bypasses this guard' },
-          { type: 'acknowledge', param: 'true', note: 'No per-note partial-read tool yet; if the user really needs a specific note read by the agent, pass acknowledge_size:true (the bypass returns the full notes array; ensure your model has enough context budget for the reported est_tokens).' },
-        ],
-      });
-      if (guard) {
-        return { content: [{ type: 'text', text: JSON.stringify({
-          browser: r.data.browserBrand,
-          ...guard,
-        }) }] };
-      }
       return { content: [{ type: 'text', text: JSON.stringify({
         browser: r.data.browserBrand,
         mainTreeNotes: notes,
@@ -3302,17 +3143,16 @@ function createMcpServer() {
   srv.registerTool(
     'get_bookmarks',
     {
-      description: 'Returns the user\'s Chrome bookmark tree (raw chrome.bookmarks.getTree() result). Use this to discover bookmark node ids before calling add_to_library with sourceScope="bookmarks". Each node has: id (stable Chrome bookmark id; persists across the bookmark\'s lifetime), title, url (set for bookmarks, missing for folders), children (array, present for folders), dateAdded (Unix ms timestamp), parentId, index (0-based position within parent). Top-level roots are typically "Bookmarks Bar" (id "1") and "Other Bookmarks" (id "2"). When the bookmark tree exceeds the per-tier read budget (common — bookmark trees can hold 10K+ entries accumulated over years), returns a structured {warning:"tree_too_large", suggested_actions:[...]} response instead — use the AUTO-ORGANIZE BOOKMARKS WORKFLOW workflow to read in cursor-paginated chunks, or pass acknowledge_size:true to bypass. ' +
-        'PAGINATION (Slice S2a): pass `after` (last-seen bookmark id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[{id,title,url?,parentId,dateAdded,index},...], nextCursor:..., totalItems:N}. DFS pre-order across all bookmark nodes (folders included). Pagination bypasses the size guard automatically. Designed for the auto-organize sift loop. Cursor is robust to list churn: if the cursor bookmark was moved between calls, pagination restarts from index 0.' + FRESHNESS_HINT,
+      description: 'Returns the user\'s Chrome bookmark tree (raw chrome.bookmarks.getTree() result). Use this to discover bookmark node ids before calling add_to_library with sourceScope="bookmarks". Each node has: id (stable Chrome bookmark id; persists across the bookmark\'s lifetime), title, url (set for bookmarks, missing for folders), children (array, present for folders), dateAdded (Unix ms timestamp), parentId, index (0-based position within parent). Top-level roots are typically "Bookmarks Bar" (id "1") and "Other Bookmarks" (id "2"). For large bookmark trees (10K+ entries accumulated over years) use pagination (after+limit) rather than reading the whole tree in one call. ' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen bookmark id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[{id,title,url?,parentId,dateAdded,index},...], nextCursor:..., totalItems:N}. DFS pre-order across all bookmark nodes (folders included). Designed for the auto-organize sift loop. Cursor is robust to list churn: if the cursor bookmark was moved between calls, pagination restarts from index 0.' + FRESHNESS_HINT,
       inputSchema: {
-        acknowledge_size: z.boolean().optional().describe('Bypass the per-tier read-size guard. Default false.'),
         after:            z.string().optional().describe('Pagination cursor: last-seen bookmark id from a previous paginated call. Omit on the first call.'),
         limit:            z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active. Triggers paginated response when set even without `after`.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
       annotations: TOOL_ANNOTATIONS.get_bookmarks,
     },
-    async ({ acknowledge_size = false, after, limit, browser }) => {
+    async ({ after, limit, browser }) => {
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const bookmarks = r.data.bookmarks || [];
@@ -3335,26 +3175,6 @@ function createMcpServer() {
         }) }] };
       }
 
-      const nodeCount = _countNodesDeep(bookmarks);
-      // Bookmarks are denser per node than tabs (URL + title + dateAdded + parentId).
-      // Treat as 'lite' equivalent for token estimation.
-      const estTokens = _estimateTreeTokens(nodeCount, 'lite');
-      const guard = _checkReadSizeGuard({
-        estTokens, nodeCount, mode: 'lite', scope: 'bookmarks',
-        browserData: r.data, acknowledge: acknowledge_size,
-        suggestedActions: [
-          { type: 'pagination', param: 'after+limit', note: 'Pass limit:500 (and after:<lastId> on subsequent calls) for paginated reads — bypasses this guard and chunks the tree' },
-          { type: 'native_chat', param: 'pinako_extension', note: 'For organize/reorganize tasks, direct the user to the Pinako native AI chat in the extension (auto-organize via MCP is currently unavailable)' },
-          { type: 'acknowledge', param: 'true', note: 'If you only need a one-shot read and your model has a large context window, pass acknowledge_size:true' },
-        ],
-      });
-      if (guard) {
-        return { content: [{ type: 'text', text: JSON.stringify({
-          browser:   r.data.browserBrand,
-          browserId: r.data.browserId,
-          ...guard,
-        }) }] };
-      }
       return { content: [{ type: 'text', text: JSON.stringify({
         browser:   r.data.browserBrand,
         browserId: r.data.browserId,

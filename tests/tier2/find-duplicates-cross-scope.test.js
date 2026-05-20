@@ -66,7 +66,7 @@ describe.skipIf(!TIER2_RUNNABLE)('Tier 2 agent — find_duplicates cross-scope r
     session = await connectPinakoMcp();
     browser = await resolveTargetBrowser(session.client);
 
-    const tree = await callToolOk(session.client, 'get_tree', { browser, acknowledge_size: true });
+    const tree = await callToolOk(session.client, 'get_tree', { browser });
     const tab = findFirstUrlNode(tree.tree);
     if (!tab) {
       // eslint-disable-next-line no-console

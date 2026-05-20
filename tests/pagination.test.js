@@ -7,7 +7,6 @@ import { testLabel } from './helpers/fixtures.js';
 // get_library, get_tree, get_main_tree_notes, get_bookmarks, list_libraries.
 // Each paginated response has shape:
 //   {items: [...], nextCursor: string|null, totalItems: number, cursorFound?}
-// Pagination bypasses the per-tier read-size guard automatically.
 //
 // For get_library we control the data (5 created groups) so we can test
 // cursor walking strictly. For the user-data-dependent tools we verify

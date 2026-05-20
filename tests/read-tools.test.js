@@ -5,9 +5,6 @@ import { testLabel } from './helpers/fixtures.js';
 
 // Verifies the read-tool response shapes end-to-end.
 // No setup mutations needed — these tools just read cached browser data.
-// Tests pass acknowledge_size:true where the tree might trigger the
-// per-tier read-size guard (bookmarks especially); the guard-warning
-// shape is exercised separately by pagination.test.js.
 
 let session;
 let browser;
@@ -23,7 +20,7 @@ afterAll(async () => {
 
 describe('get_tree', () => {
   it('returns lite mode by default with browser + scope + tree', async () => {
-    const result = await callToolOk(session.client, 'get_tree', { browser, acknowledge_size: true });
+    const result = await callToolOk(session.client, 'get_tree', { browser });
     expect(result.browser).toBeTruthy();
     expect(result.scope).toBe('tree');
     expect(result.mode).toBe('lite');
@@ -34,7 +31,6 @@ describe('get_tree', () => {
     const result = await callToolOk(session.client, 'get_tree', {
       mode: 'minimal',
       browser,
-      acknowledge_size: true,
     });
     expect(result.mode).toBe('minimal');
     // Minimal mode flattens — items don't have `children` arrays
@@ -71,7 +67,6 @@ describe('get_bookmarks', () => {
   it('returns bookmarks tree with bookmarks array', async () => {
     const result = await callToolOk(session.client, 'get_bookmarks', {
       browser,
-      acknowledge_size: true,
     });
     expect(result.browser).toBeTruthy();
     expect(result.browserId).toBeTruthy();
@@ -187,7 +182,7 @@ describe('find_duplicates (cross-scope)', () => {
     // of the two test libraries, so cross-scope dedup must find a set of
     // count >= 3 with two library instances when crossScopes includes
     // "libraries". Skips gracefully if the install has no live tabs.
-    const tree = await callToolOk(session.client, 'get_tree', { browser, acknowledge_size: true });
+    const tree = await callToolOk(session.client, 'get_tree', { browser });
     const tab = findFirstUrlNode(tree.tree);
     if (!tab) {
       // eslint-disable-next-line no-console
