@@ -1119,9 +1119,7 @@ function _resolveExistingNoteContent(browserData, scope, libraryId, noteId) {
   return '';
 }
 
-// ─── Slice S1: read-tool size guard helpers ────────────────────────────────
-// Counts nodes recursively in a tree or array of trees. Used by the size guard
-// to estimate the payload weight of a read tool's response before serializing.
+// Counts nodes recursively in a tree or array of trees.
 function _countNodesDeep(treeOrNode) {
   let count = 0;
   function walk(node) {
@@ -1423,8 +1421,8 @@ function _isPaginationRequested(after, limit) {
 // Lightweight structural summary of a tree/bookmarks/library scope, used by
 // the auto-organize workflow at kickoff to decide WHETHER to proceed and at
 // what scope. Returns counts, depth, top domains, top path-token patterns,
-// and a small sample of titles. Crucially does NOT trigger the size guard —
-// the whole point is "summarize before reading."
+// and a small sample of titles. The whole point is "summarize before reading"
+// — fits in <2KB regardless of tree size.
 
 const _SUMMARY_STOP_TOKENS = new Set([
   'index','html','htm','php','aspx','jsp','main','home','page','default',
@@ -2711,7 +2709,6 @@ function createMcpServer() {
       const tree = getTree(r.data, include_ghost_tabs);
 
       // Slice S2a: paginated path. Returns a flat items[] + nextCursor.
-      // Bypasses the size guard (pagination itself is the safety mechanism).
       if (_isPaginationRequested(after, limit)) {
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS.tree;
         const flat = _flattenTreeWithMode(tree, 'tree', null, mode, include_favicons, shapeOpts);
@@ -2745,22 +2742,35 @@ function createMcpServer() {
   srv.registerTool(
     'search_tabs',
     {
-      description: 'LITERAL substring search across main-tree TAB nodes ONLY (groups, windows, folders, libraries, bookmarks, and notes are NOT searched here). Matches title, URL, memo text, and tags. Kept for backward compatibility — for broader literal search across non-tab nodes, libraries, bookmarks, and notes content, USE search_pinako instead (it is the omnibus version with a scope parameter). Use ONLY when the user names a literal substring ("tabs from stackoverflow.com", "the tab titled exactly X"). For SEMANTIC / categorical intent ("find my exercise tabs", "anything about gardening") do NOT iterate this tool with synonyms — instead call get_tree({mode:"minimal"}) + list_libraries({include_tabs:true, mode:"minimal"}) and match in your own head. See SEARCH SCOPE in server instructions. Mode param: "minimal" (flat, compact URLs — default for this tool since results are already a focused list), "lite" (tree shape), "full" (everything except favicons).' + FRESHNESS_HINT,
+      description: 'LITERAL substring search across main-tree TAB nodes ONLY (groups, windows, folders, libraries, bookmarks, and notes are NOT searched here). Matches title, URL, memo text, and tags. Kept for backward compatibility — for broader literal search across non-tab nodes, libraries, bookmarks, and notes content, USE search_pinako instead (it is the omnibus version with a scope parameter). Use ONLY when the user names a literal substring ("tabs from stackoverflow.com", "the tab titled exactly X"). For SEMANTIC / categorical intent ("find my exercise tabs", "anything about gardening") do NOT iterate this tool with synonyms — instead call get_tree({mode:"minimal"}) + list_libraries({include_tabs:true, mode:"minimal"}) and match in your own head. See SEARCH SCOPE in server instructions. Mode param: "minimal" (flat, compact URLs — default for this tool since results are already a focused list), "lite" (tree shape), "full" (everything except favicons). ' +
+        'SHAPE COMPOSITION (2026-05-20, active when mode is "lite" or unset): per-field opt-ins are available alongside `mode` for finer control over each result node. Defaults match the prior lite shape PLUS parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
       inputSchema: {
         query: z.string().describe('LITERAL substring (case-insensitive). For semantic intent, prefer get_tree.'),
-        mode:  z.enum(['minimal', 'lite', 'full']).optional().describe('Response mode. Default "minimal" since search results are already a focused list.'),
+        mode:  z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "minimal" since search results are already a focused list. Composable opts (minimal + include_*) take precedence when both are passed.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs. Default true.'),
-        include_favicons:   z.boolean().optional().describe('Include favIconUrl base64. Default false.'),
+        include_favicons:   z.boolean().optional().describe('Include favIconUrl base64. Default false. Heavy: 1-3KB per tab.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
+        // ── Composable shape opt-ins (active when mode is "lite" or unset) ──
+        minimal:                   z.boolean().optional().describe('Shortcut: when true, forces every include_* flag to false. Returns basics-only (id, type, title, scope, libraryId, url, ghost flag) per result.'),
+        include_opened_date:       z.boolean().optional().describe('Include openedDate on tab nodes (Unix ms timestamp). Default true.'),
+        include_tags:              z.boolean().optional().describe('Include the tags array per node. Default true.'),
+        include_memos:             z.boolean().optional().describe('Include memoText per node. Default true.'),
+        include_lineage:           z.boolean().optional().describe('Include parentWindow + parentGroup pointers + collapsed flag. Default true.'),
+        include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId + chromeGroupTitle + chromeGroupColor metadata on tab nodes (Chromium Tab Group, NOT Pinako Group nodes type="group"). Default true.'),
+        include_star_color:        z.boolean().optional().describe('Include per-node starColor when set. Default true (cheap when absent).'),
+        include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set. Default true (cheap when absent).'),
+        include_custom_title:      z.boolean().optional().describe('Include the customTitle flag. Default true (cheap when absent).'),
       },
       annotations: TOOL_ANNOTATIONS.search_tabs,
     },
-    async ({ query, mode, include_ghost_tabs = true, include_favicons = false, browser }) => {
+    async (args) => {
+      let { query, mode, include_ghost_tabs = true, include_favicons = false, browser } = args;
       mode = _normalizeMode(mode || 'minimal');
+      const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const results = searchInTree(r.data.tree, query, include_ghost_tabs);
-      const out     = shapeTree(results, 'tree', null, mode, include_favicons);
+      const out     = shapeTree(results, 'tree', null, mode, include_favicons, shapeOpts);
       return { content: [{ type: 'text', text: JSON.stringify({
         browser: r.data.browserBrand,
         mode,
@@ -3119,7 +3129,7 @@ function createMcpServer() {
       const notes = r.data.globalNotes || [];
 
       // Slice S2a: paginated path returns notes in stored order with full
-      // bodies, sliced by cursor. Bypasses the size guard.
+      // bodies, sliced by cursor.
       if (_isPaginationRequested(after, limit)) {
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS['main-tree-notes'];
         const page = _paginateByCursor(notes, after, effectiveLimit);
@@ -3158,7 +3168,7 @@ function createMcpServer() {
       const bookmarks = r.data.bookmarks || [];
 
       // Slice S2a: paginated path. Returns a flat DFS list of all bookmark
-      // nodes (folders + leaves). Bypasses the size guard.
+      // nodes (folders + leaves).
       if (_isPaginationRequested(after, limit)) {
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS.bookmarks;
         const flat = _flattenBookmarksTree(bookmarks);
@@ -3296,7 +3306,7 @@ function createMcpServer() {
   srv.registerTool(
     'get_tree_summary',
     {
-      description: 'Returns a lightweight structural summary of a tree/bookmarks/library WITHOUT returning the actual nodes. Bridge-side; no LLM. Designed for the auto-organize workflow kickoff (and any "should I read this whole tree?" decision the agent faces): the summary fits in <2KB regardless of tree size and lets the agent decide whether to proceed, what scope makes sense, and ballpark the cost. Does NOT trigger the size guard — the whole point is "summarize before reading."\n\n' +
+      description: 'Returns a lightweight structural summary of a tree/bookmarks/library WITHOUT returning the actual nodes. Bridge-side; no LLM. Designed for the auto-organize workflow kickoff (and any "should I read this whole tree?" decision the agent faces): the summary fits in <2KB regardless of tree size and lets the agent decide whether to proceed, what scope makes sense, and ballpark the cost.\n\n' +
         'Response shape: {browser, browserId, scope, libraryId?, counts:{nodes, url_bearing_nodes}, depth:{max, median}, topDomains:[{domain,count},...up to 15], samplePatterns:[{pattern,token,count},...up to 15], sampleTitles:[...up to 20]}. ' +
         'topDomains = highest-frequency hostnames (www-stripped). samplePatterns = path-token frequency across all URLs (stop-words filtered: html, www, login, etc.); token of "recipe" with pattern "*recipe*" means 389 URLs had "recipe" somewhere in their path. sampleTitles = a deterministic stride sample of node titles (stable across calls — safe to cite back to the user).\n\n' +
         'For scope:"library", library_id is required. For scope:"bookmarks", returns the cached browser bookmark tree summary (empty if user hasn\'t opened the bookmarks panel since the bridge started). For scope:"tree", summarizes the live tab tree.',
