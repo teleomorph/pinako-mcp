@@ -2672,7 +2672,7 @@ function createMcpServer() {
     'get_tree',
     {
       description:
-        'Returns the tab tree (Windows → Groups → Tabs) from the Pinako extension. Three legacy modes (will be superseded by composable shape opts next release): ' +
+        'Returns the tab tree (Windows → Groups → Tabs) from the Pinako extension. Three legacy modes (prefer composable shape opts — see SHAPE COMPOSITION below): ' +
         '"minimal" (FLAT list, compact URLs, drops children/collapsed/ghost, keeps openedDate — best for semantic search across 500+ tab trees); ' +
         '"lite" (DEFAULT — tree shape with children/collapsed/ghost, full URLs, keeps openedDate, no favicons); ' +
         '"full" (everything in source data EXCEPT favicons; useful only for visual-field workflows). ' +
