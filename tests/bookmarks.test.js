@@ -182,3 +182,156 @@ describe('add_to_bookmarks', () => {
     expect(result.parsed?.error?.code).toBe('BOOKMARK_FOLDER_NOT_FOUND');
   });
 });
+
+// 2026-05-25 (V3 follow-up): MCP-side parity for the chat surface's
+// round-9 composable shape. Mirrors the chat-side opts shipped 2026-05-21
+// (commit fbcdcb3 in the extension repo). Chrome ids are preserved; the
+// id-system unification vs chat is a separate follow-up (ai-todo #49).
+describe('get_bookmarks composable shape', () => {
+  it('folders_only returns only folders, each with a path breadcrumb', async () => {
+    const result = await callToolOk(session.client, 'get_bookmarks', {
+      folders_only: true,
+      browser,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.scope).toBe('bookmarks');
+    expect(result.filter).toBe('folders_only');
+    expect(Array.isArray(result.items)).toBe(true);
+    // Every item should be folder-shaped (no url) and carry a path.
+    for (const item of result.items) {
+      expect(item.url).toBeUndefined();
+      expect(typeof item.path).toBe('string');
+      expect(item.path.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('leaves_only returns only items with a url field', async () => {
+    const result = await callToolOk(session.client, 'get_bookmarks', {
+      leaves_only: true,
+      limit: 25,
+      browser,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.filter).toBe('leaves_only');
+    expect(Array.isArray(result.items)).toBe(true);
+    for (const item of result.items) {
+      expect(typeof item.url).toBe('string');
+      expect(item.url.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('leaves_only + folders_only returns INVALID_FILTERS', async () => {
+    const result = await callTool(session.client, 'get_bookmarks', {
+      leaves_only: true,
+      folders_only: true,
+      browser,
+    });
+    expect(result.parsed?.ok).toBe(false);
+    expect(result.parsed?.error?.code).toBe('INVALID_FILTERS');
+  });
+
+  it('parent (title) resolves a top-level root case-insensitively', async () => {
+    // Discover a real root title via folders_only first; the cross-browser
+    // root labels ("Bookmarks Bar" / "Bookmarks bar" / "Favorites bar")
+    // vary so we don't hardcode.
+    const all = await callToolOk(session.client, 'get_bookmarks', {
+      folders_only: true,
+      browser,
+    });
+    // The first top-level folder's path == its own title (no parent prefix).
+    const root = (all.items || []).find(f => f.path && !f.path.includes(' / '));
+    if (!root) {
+      console.warn('parent-title test: no clean top-level root found; skipping');
+      return;
+    }
+
+    // Pass with arbitrary capitalization to verify case-insensitivity.
+    const scrambled = root.title.split('').map((ch, i) => i % 2 === 0 ? ch.toUpperCase() : ch.toLowerCase()).join('');
+    const result = await callToolOk(session.client, 'get_bookmarks', {
+      parent: scrambled,
+      browser,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.parent_id).toBe(root.id);
+    expect(result.scope_depth).toBe('direct-children-only');
+    expect(Array.isArray(result.items)).toBe(true);
+    // Direct children should all carry parentId === the resolved root id.
+    for (const item of result.items) {
+      expect(item.parentId).toBe(root.id);
+    }
+  });
+
+  it('parent_id resolves a folder by strict id and returns direct children', async () => {
+    const all = await callToolOk(session.client, 'get_bookmarks', {
+      folders_only: true,
+      browser,
+    });
+    const someFolder = (all.items || [])[0];
+    if (!someFolder) {
+      console.warn('parent_id test: no folders in this browser; skipping');
+      return;
+    }
+    const result = await callToolOk(session.client, 'get_bookmarks', {
+      parent_id: someFolder.id,
+      browser,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.parent_id).toBe(someFolder.id);
+    expect(result.scope_depth).toBe('direct-children-only');
+  });
+
+  it('unresolved parent returns PARENT_NOT_FOUND with availableRoots hint', async () => {
+    const result = await callTool(session.client, 'get_bookmarks', {
+      parent: 'definitely-not-a-real-folder-title-zzzz',
+      browser,
+    });
+    expect(result.parsed?.ok).toBe(false);
+    expect(result.parsed?.error?.code).toBe('PARENT_NOT_FOUND');
+    expect(Array.isArray(result.parsed?.error?.context?.availableRoots)).toBe(true);
+    expect(result.parsed.error.context.availableRoots.length).toBeGreaterThan(0);
+  });
+
+  it('parent + folders_only returns direct-child folders with full-path breadcrumb', async () => {
+    const all = await callToolOk(session.client, 'get_bookmarks', {
+      folders_only: true,
+      browser,
+    });
+    // Find a folder that has at least one child folder (its path is its own
+    // title for a root; nested folders carry slash-joined paths).
+    const root = (all.items || []).find(f => f.path && !f.path.includes(' / '));
+    if (!root) {
+      console.warn('parent + folders_only test: no top-level root; skipping');
+      return;
+    }
+    const result = await callToolOk(session.client, 'get_bookmarks', {
+      parent: root.title,
+      folders_only: true,
+      browser,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.parent_id).toBe(root.id);
+    expect(result.filter).toBe('folders_only');
+    for (const item of result.items) {
+      // Each direct-child folder's path is "<root> / <folder title>".
+      expect(item.path).toBe(`${root.title} / ${item.title}`);
+    }
+  });
+
+  it('minimal:true drops dateAdded + index from flat items', async () => {
+    const result = await callToolOk(session.client, 'get_bookmarks', {
+      leaves_only: true,
+      minimal: true,
+      limit: 10,
+      browser,
+    });
+    expect(result.ok).toBe(true);
+    for (const item of result.items) {
+      expect(item).not.toHaveProperty('dateAdded');
+      expect(item).not.toHaveProperty('index');
+      // id, title, url should still be present.
+      expect(item).toHaveProperty('id');
+      expect(item).toHaveProperty('title');
+      expect(item).toHaveProperty('url');
+    }
+  });
+});

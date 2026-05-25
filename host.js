@@ -1021,7 +1021,15 @@ function _postOrganizeStateToLeader(msg) {
 // only Chrome history retains the URL. delete_live_node remains (closes
 // browser tabs AND removes tree records). delete_library_group with
 // cascadeMembers:true stays conditionally destructive (handled below).
-const _ALWAYS_DESTRUCTIVE_OP_TYPES = new Set(['delete_node', 'delete_live_node']);
+// 2026-05-24: widened to include delete_library + delete_note so the MCP
+// bridge boundary enforces confirmedByUser for the full destructive set.
+// Pre-fix the bridge only gated delete_node / delete_live_node (+ the
+// delete_library_group cascade special-case below); delete_library and
+// delete_note relied solely on the engine schema's z.literal(true).refine()
+// catching them at the popup layer. With this widening the bridge layer
+// becomes the truly canonical bypass-proof guard the surrounding comment
+// claims. Engine layer remains as defense-in-depth.
+const _ALWAYS_DESTRUCTIVE_OP_TYPES = new Set(['delete_node', 'delete_live_node', 'delete_library', 'delete_note']);
 
 function _isDestructiveOp(op) {
   if (!op || typeof op !== 'object') return false;
@@ -1311,24 +1319,156 @@ function _flattenTreeWithMode(nodes, scope, libraryId, mode, includeFavicons, op
 // parentId, dateAdded, index. Folders are included (no url field) so the
 // agent can see structure; the sift loop typically filters to url-bearing
 // nodes itself.
-function _flattenBookmarksTree(nodes, parentId = null, out = []) {
+//
+// 2026-05-25 (V3 follow-up — chat-side composable mirror): accepts a 4th
+// `opts` argument and a 5th `parentPath` recursion-state argument so the
+// composable shape on MCP's get_bookmarks mirrors the chat side. opts:
+//   { leavesOnly, foldersOnly, includePath, minimal }
+// Default behavior (no opts) is unchanged: every node emitted, full field
+// set (id, title, parentId, url, dateAdded, index). Pre-existing callers
+// (pagination-only path; the sift loop) keep their behavior.
+//
+// Folder detection on the Chrome shape: `!node.url && Array.isArray(node.children)`.
+// Chrome's tree doesn't carry an explicit `type` field — folders simply
+// have a `children` array and no `url`. (Chat-side uses `node.type === 'folder'`
+// because convertChromeBookmarks stamps it explicitly; here we infer.)
+function _flattenBookmarksTree(nodes, parentId = null, out = [], opts = {}, parentPath = '') {
   if (!Array.isArray(nodes)) return out;
+  const leavesOnly  = opts.leavesOnly  === true;
+  const foldersOnly = opts.foldersOnly === true;
+  const includePath = opts.includePath === true;
+  const minimal     = opts.minimal     === true;
   for (const node of nodes) {
     if (!node) continue;
-    const item = {
-      id:       node.id,
-      title:    node.title || '',
-      parentId: parentId,
-    };
-    if (typeof node.url === 'string')   item.url       = node.url;
-    if (typeof node.dateAdded === 'number') item.dateAdded = node.dateAdded;
-    if (typeof node.index === 'number') item.index     = node.index;
-    out.push(item);
+    const isLeaf   = typeof node.url === 'string' && node.url.length > 0;
+    const isFolder = !isLeaf && Array.isArray(node.children);
+    const shouldEmit =
+      (leavesOnly  && isLeaf)   ||
+      (foldersOnly && isFolder) ||
+      (!leavesOnly && !foldersOnly);
+    const ownPath = parentPath ? `${parentPath} / ${node.title || ''}` : (node.title || '');
+    if (shouldEmit) {
+      const item = {
+        id:       node.id,
+        title:    node.title || '',
+        parentId: parentId,
+      };
+      if (isLeaf) item.url = node.url;
+      // dateAdded + index always emitted on MCP unless minimal:true was passed.
+      // (Chat-side gates dateAdded behind include_date_added; MCP's pre-V3
+      // behavior was always-emit, preserved here for back-compat with existing
+      // pagination callers + the sift loop.)
+      if (!minimal && typeof node.dateAdded === 'number') item.dateAdded = node.dateAdded;
+      if (!minimal && typeof node.index === 'number')     item.index     = node.index;
+      if (includePath) item.path = ownPath;
+      out.push(item);
+    }
     if (Array.isArray(node.children) && node.children.length > 0) {
-      _flattenBookmarksTree(node.children, node.id, out);
+      // Path inheritance: only folders contribute to the path; leaves don't
+      // accumulate (a leaf's children, if any, would be a weird Chrome shape
+      // — defensive: pass parentPath unchanged when the current node isn't
+      // a folder, matching chat-side behavior).
+      _flattenBookmarksTree(node.children, node.id, out, opts, isFolder ? ownPath : parentPath);
     }
   }
   return out;
+}
+
+// 2026-05-25 (V3 follow-up): MCP-side helpers for the composable shape.
+// Mirror the chat-side _find*ForChat / _buildBookmarkPathForChat helpers
+// (Pinako/pinako.js:~18938-19016) but operate on the raw chrome.bookmarks
+// tree shape rather than the Pinako-converted tree. Folder detection
+// uses the same `!url && Array.isArray(children)` rule as the extended
+// _flattenBookmarksTree above.
+
+// Depth-first walk to find a node by Chrome bookmark id. Returns the
+// node or null.
+function _findBookmarkNodeById(nodes, targetId) {
+  if (!Array.isArray(nodes)) return null;
+  for (const n of nodes) {
+    if (!n) continue;
+    if (n.id === targetId) return n;
+    if (Array.isArray(n.children) && n.children.length > 0) {
+      const hit = _findBookmarkNodeById(n.children, targetId);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+// Case-insensitive top-level root lookup ("Bookmarks Bar" / "Bookmarks bar"
+// / "Favorites bar" / localized variants). First step of the `parent`
+// title-shorthand resolution cascade. Some Chrome variants wrap real roots
+// in a virtual empty-titled container at the top; this function looks at
+// the top level FIRST, then walks one level into empty-titled wrappers if
+// needed.
+function _findBookmarkRootByTitle(rootNodes, title) {
+  if (!Array.isArray(rootNodes) || typeof title !== 'string') return null;
+  const target = title.toLowerCase().trim();
+  if (!target) return null;
+  for (const n of rootNodes) {
+    if (n && typeof n.title === 'string' && n.title.toLowerCase().trim() === target) {
+      return n;
+    }
+  }
+  // Empty-titled wrapper case: walk one level deeper.
+  for (const n of rootNodes) {
+    if (n && (!n.title || n.title.trim() === '') && Array.isArray(n.children)) {
+      for (const c of n.children) {
+        if (c && typeof c.title === 'string' && c.title.toLowerCase().trim() === target) {
+          return c;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// DFS walk for any folder with a matching (case-insensitive) title at any
+// depth. First-match-wins on collisions — the caller is expected to
+// disambiguate via folders_only's `path` field if two folders share a
+// title in different subtrees.
+function _findBookmarkFolderByTitle(rootNodes, title) {
+  const target = String(title || '').toLowerCase().trim();
+  if (!target) return null;
+  function walk(nodes) {
+    if (!Array.isArray(nodes)) return null;
+    for (const n of nodes) {
+      if (!n) continue;
+      const isLeaf   = typeof n.url === 'string' && n.url.length > 0;
+      const isFolder = !isLeaf && Array.isArray(n.children);
+      if (isFolder && (n.title || '').toLowerCase().trim() === target) {
+        return n;
+      }
+      if (Array.isArray(n.children) && n.children.length > 0) {
+        const hit = walk(n.children);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  }
+  return walk(rootNodes);
+}
+
+// Build the breadcrumb path ("Bookmarks Bar / Travel / 2024") to a given
+// node by walking the tree. Returns the slash-joined path string or null
+// if the node isn't found. Used to seed `parentResolvedPath` when emitting
+// `path` on a parent-scoped folders_only response.
+function _buildBookmarkPath(rootNodes, targetId) {
+  function walk(nodes, breadcrumb) {
+    if (!Array.isArray(nodes)) return null;
+    for (const n of nodes) {
+      if (!n) continue;
+      const myPath = breadcrumb ? `${breadcrumb} / ${n.title || ''}` : (n.title || '');
+      if (n.id === targetId) return myPath;
+      if (Array.isArray(n.children) && n.children.length > 0) {
+        const hit = walk(n.children, myPath);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  }
+  return walk(rootNodes, '');
 }
 
 // Slice a flat list by cursor + limit. Returns { items, nextCursor,
@@ -2150,7 +2290,7 @@ Write tools fall into four categories:
 - TREE STRUCTURE: move_node, indent_node, outdent_node, create_group, delete_node, ghost_node, delete_live_node, create_folder.
 - BOOKMARKS WRITE: add_to_bookmarks (clones tree or library content INTO Chrome bookmarks; type=window/group source nodes auto-convert to bookmark folders). Reorder/delete bookmark nodes via move_node / delete_node with scope:"bookmarks". For the inverse direction (clone FROM bookmarks INTO a library), use add_to_library with sourceScope:"bookmarks". The "MOVE to bookmarks" verb is a two-step pattern: call add_to_bookmarks first, then delete_node on the source after success (there is no atomic move_to_bookmarks for v1).
 - LIBRARY SYSTEM: create_library, delete_library, add_to_library, set_library_title, set_library_description, set_note_content, create_note, delete_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group. Rename rules: set_library_title for the library itself, set_library_group_title for the umbrella group. set_title does NOT work on library-folder nodes (it returns INVALID_TARGET) — MUST route library renames through set_library_title. Delete rules: delete_library removes a single library; delete_library_group removes the group (and with cascadeMembers:true, also its member libraries). To detach a library from a group without deleting content, use remove_library_from_group. For panel reordering, call list_libraries first to get the current groups + panel_order, then pass the modified panel_order to reorder_library_panel. Never construct the panel array blindly — group ids and panel positions must come from a fresh list_libraries call.
-- COMPOSITE: bulk_apply (up to 100 sub-ops, atomic, undoable as a single unit).
+- COMPOSITE: bulk_apply (up to 250 sub-ops, atomic, undoable as a single unit).
 
 DESTRUCTIVE OPS need explicit user approval. Set confirmedByUser:true on these tools ONLY after the user has confirmed THIS specific action (not as a default, not on retry after a failure):
 - delete_node (removes a ghost tree record permanently; only Chrome history retains the URL)
@@ -2895,30 +3035,160 @@ function createMcpServer() {
   srv.registerTool(
     'get_bookmarks',
     {
-      description: 'Returns the user\'s Chrome bookmark tree (raw chrome.bookmarks.getTree() result). Use this to discover bookmark node ids before calling add_to_library with sourceScope="bookmarks". Each node has: id (stable Chrome bookmark id; persists across the bookmark\'s lifetime), title, url (set for bookmarks, missing for folders), children (array, present for folders), dateAdded (Unix ms timestamp), parentId, index (0-based position within parent). Top-level roots are typically "Bookmarks Bar" (id "1") and "Other Bookmarks" (id "2"). For large bookmark trees (10K+ entries accumulated over years) use pagination (after+limit) rather than reading the whole tree in one call. ' +
-        'PAGINATION (Slice S2a): pass `after` (last-seen bookmark id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[{id,title,url?,parentId,dateAdded,index},...], nextCursor:..., totalItems:N}. DFS pre-order across all bookmark nodes (folders included). Designed for the auto-organize sift loop. Cursor is robust to list churn: if the cursor bookmark was moved between calls, pagination restarts from index 0.' + FRESHNESS_HINT,
+      description: 'Returns the user\'s Chrome bookmark tree (raw chrome.bookmarks.getTree() result). Use this to discover bookmark node ids before calling add_to_library with sourceScope="bookmarks". Each node has: id (stable Chrome bookmark id; persists across the bookmark\'s lifetime), title, url (set for bookmarks, missing for folders), children (array, present for folders), dateAdded (Unix ms timestamp), parentId, index (0-based position within parent). Top-level roots are typically "Bookmarks Bar" (id "1") and "Other Bookmarks" (id "2"). For large bookmark trees (10K+ entries accumulated over years) use pagination (after+limit) or the composable opts below rather than reading the whole tree in one call.\n\n' +
+        'PAGINATION (Slice S2a): pass `after` (last-seen bookmark id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[{id,title,url?,parentId,dateAdded,index},...], nextCursor:..., totalItems:N}. DFS pre-order across all bookmark nodes (folders included). Designed for the auto-organize sift loop. Cursor is robust to list churn: if the cursor bookmark was moved between calls, pagination restarts from index 0.\n\n' +
+        'COMPOSABLE OPTS (mirrors the chat surface\'s round-9 ergonomic shape):\n' +
+        '  - `parent` (string): bookmark folder id OR a folder title. Resolution cascade: (1) id lookup first, (2) case-insensitive top-level root title (handles "Bookmarks Bar" / "Favorites bar" / localized names + empty-titled wrapper roots), (3) case-insensitive nested-folder-title DFS. Returns ONLY direct children of the resolved folder (depth-1; no recursion). On unresolved input returns {ok:false, error:{code:"PARENT_NOT_FOUND", message, context:{availableRoots:[<titles>]}}}.\n' +
+        '  - `parent_id` (string): legacy strict-id alias for `parent` (no title fallback). Kept so pre-rename schemas still resolve.\n' +
+        '  - `leaves_only: true`: emit only bookmark URL leaves; recursion still descends through folders. Pairs naturally with `parent` for "loose items in folder X".\n' +
+        '  - `folders_only: true`: emit only folders. ALWAYS includes a `path` field (slash-joined breadcrumb like "Bookmarks Bar / Travel / 2024") so the agent can disambiguate same-titled folders nested in different subtrees. With no `parent` set, returns every folder in the tree (typically 10-100 items even on huge bookmark trees — cheap structural overview).\n' +
+        '  - `leaves_only` + `folders_only` are mutually exclusive; passing both returns {ok:false, error:{code:"INVALID_FILTERS"}}.\n' +
+        '  - `include_date_added: true`: on MCP this is a no-op (dateAdded is always emitted unless `minimal:true`). Accepted for cross-surface schema symmetry with the chat tool.\n' +
+        '  - `minimal: true`: drops `dateAdded` + `index` from emitted items (forward-compat shape minimizer; lighter payloads).\n\n' +
+        'RESPONSE SHAPES:\n' +
+        '  - Default (no params): full nested chrome.bookmarks tree under `bookmarks`.\n' +
+        '  - Pagination-only (`after`/`limit`): flat items via DFS pre-order across the whole tree.\n' +
+        '  - Composable (`parent`/`parent_id`/`leaves_only`/`folders_only`): flat items with optional `parent_id` + `scope_depth:"direct-children-only"` (when `parent` resolved) + optional `filter:"leaves_only"|"folders_only"`.\n\n' +
+        'IDs returned here are Chrome bookmark ids ("1", "54", etc.) which write tools (add_to_bookmarks, move_node, etc.) accept. The id system divergence vs the chat surface (which returns Pinako-internal UUIDs) is documented at ai-todo.md #49.' + FRESHNESS_HINT,
       inputSchema: {
-        after:            z.string().optional().describe('Pagination cursor: last-seen bookmark id from a previous paginated call. Omit on the first call.'),
-        limit:            z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active. Triggers paginated response when set even without `after`.'),
-        browser: z.string().optional().describe(BROWSER_ARG_DESC),
+        after:               z.string().optional().describe('Pagination cursor: last-seen bookmark id from a previous paginated call. Omit on the first call.'),
+        limit:               z.number().int().min(1).max(5000).optional().describe('Max items per page. Default 500 when pagination is active. Triggers paginated response when set even without `after`.'),
+        parent:              z.string().optional().describe('Bookmark folder id OR title (case-insensitive). Returns direct children only. Resolution cascade: id → top-level root title → nested folder title DFS.'),
+        parent_id:           z.string().optional().describe('Strict-id alias for `parent` (no title fallback). Use this when you have a known id and want to fail fast on a typo rather than letting it fall through to title matching.'),
+        leaves_only:         z.boolean().optional().describe('Emit only bookmark URL leaves. Mutually exclusive with folders_only.'),
+        folders_only:        z.boolean().optional().describe('Emit only folders. Mutually exclusive with leaves_only. ALWAYS includes a path field on each item.'),
+        include_date_added:  z.boolean().optional().describe('No-op on MCP (dateAdded always emitted). Kept for cross-surface symmetry.'),
+        minimal:             z.boolean().optional().describe('Drop dateAdded + index from emitted items.'),
+        browser:             z.string().optional().describe(BROWSER_ARG_DESC),
       },
       annotations: TOOL_ANNOTATIONS.get_bookmarks,
     },
-    async ({ after, limit, browser }) => {
+    async ({ after, limit, parent, parent_id, leaves_only, folders_only, include_date_added: _include_date_added, minimal, browser }) => {
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const bookmarks = r.data.bookmarks || [];
 
-      // Slice S2a: paginated path. Returns a flat DFS list of all bookmark
-      // nodes (folders + leaves).
-      if (_isPaginationRequested(after, limit)) {
+      const parentInput   = typeof parent    === 'string' && parent.length    > 0 ? parent    : null;
+      const parentIdInput = typeof parent_id === 'string' && parent_id.length > 0 ? parent_id : null;
+      const parentRequested = parentInput || parentIdInput;
+
+      const leavesOnly  = leaves_only  === true;
+      const foldersOnly = folders_only === true;
+      if (leavesOnly && foldersOnly) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          ok: false,
+          error: {
+            code: 'INVALID_FILTERS',
+            message: 'leaves_only and folders_only are mutually exclusive. Pass one, the other, or neither.',
+          },
+        }) }] };
+      }
+
+      const minimalFlag = minimal === true;
+      const includePath = foldersOnly; // always emit `path` for folders_only responses
+      const shapeOpts   = { leavesOnly, foldersOnly, includePath, minimal: minimalFlag };
+
+      // Resolve parent (id-first, then title cascade). `parent_id` is strict-id only.
+      let scopedRoots        = bookmarks;
+      let parentResolved     = null;
+      let parentResolvedPath = '';
+      if (parentRequested) {
+        let parentNode = _findBookmarkNodeById(bookmarks, parentRequested);
+        if (!parentNode && parentInput) {
+          parentNode = _findBookmarkRootByTitle(bookmarks, parentInput);
+          if (!parentNode) {
+            parentNode = _findBookmarkFolderByTitle(bookmarks, parentInput);
+          }
+        }
+        if (!parentNode) {
+          // Build a useful availableRoots hint. Some Chrome variants wrap the
+          // real roots in a virtual empty-titled container at the top — walk
+          // one level deeper if the top is all empty-titled so availableRoots
+          // surfaces real titles like "Bookmarks Bar" / "Other Bookmarks".
+          let rootTitles = bookmarks
+            .filter(n => n && typeof n.title === 'string' && n.title.length > 0 && Array.isArray(n.children))
+            .map(n => n.title);
+          if (rootTitles.length === 0 && bookmarks.length > 0) {
+            for (const n of bookmarks) {
+              if (n && Array.isArray(n.children)) {
+                for (const c of n.children) {
+                  if (c && typeof c.title === 'string' && c.title.length > 0 && Array.isArray(c.children)) {
+                    rootTitles.push(c.title);
+                  }
+                }
+              }
+            }
+          }
+          const usedField = parentInput ? 'parent' : 'parent_id';
+          return { content: [{ type: 'text', text: JSON.stringify({
+            ok: false,
+            error: {
+              code: 'PARENT_NOT_FOUND',
+              message: `${usedField} ${JSON.stringify(parentRequested)} did not resolve. ` +
+                       `Available top-level roots in this browser: ${JSON.stringify(rootTitles)}. ` +
+                       `For \`parent\` you can pass a top-level root title, any folder title, OR a Chrome bookmark folder id. ` +
+                       `Re-list with get_bookmarks({folders_only: true}) to discover folder titles and ids with paths.`,
+              context: { availableRoots: rootTitles },
+            },
+          }) }] };
+        }
+        if (Array.isArray(parentNode.children)) {
+          scopedRoots = parentNode.children;
+        } else {
+          // The id resolved but the node is a leaf bookmark with no children.
+          // Return an empty direct-children list rather than throwing.
+          scopedRoots = [];
+        }
+        parentResolved = parentNode.id;
+        if (includePath) {
+          parentResolvedPath = _buildBookmarkPath(bookmarks, parentNode.id) || '';
+        }
+      }
+
+      // FLAT PATH — triggers when ANY of:
+      //   • Existing pagination opts (`after`/`limit`)
+      //   • New composable opts (`parent`/`parent_id`/`leaves_only`/`folders_only`)
+      // Filtered responses are naturally flat, so we use the items[] shape
+      // rather than the nested `bookmarks` tree.
+      const flatPathTrigger = parentRequested || _isPaginationRequested(after, limit) || leavesOnly || foldersOnly;
+      if (flatPathTrigger) {
         const effectiveLimit = Number.isFinite(limit) && limit > 0 ? limit : PAGINATION_DEFAULT_LIMITS.bookmarks;
-        const flat = _flattenBookmarksTree(bookmarks);
+        let flat;
+        if (parentRequested) {
+          // Depth-1 read: walk ONLY direct children of the resolved parent,
+          // apply filters inline. Matches the chat-side parent-scoped path.
+          flat = scopedRoots.map(n => {
+            if (!n) return null;
+            const isLeaf   = typeof n.url === 'string' && n.url.length > 0;
+            const isFolder = !isLeaf && Array.isArray(n.children);
+            if (leavesOnly  && !isLeaf)   return null;
+            if (foldersOnly && !isFolder) return null;
+            const item = { id: n.id, title: n.title || '', parentId: parentResolved };
+            if (isLeaf) item.url = n.url;
+            if (!minimalFlag && typeof n.dateAdded === 'number') item.dateAdded = n.dateAdded;
+            if (!minimalFlag && typeof n.index === 'number')     item.index     = n.index;
+            if (includePath) {
+              item.path = parentResolvedPath
+                ? `${parentResolvedPath} / ${n.title || ''}`
+                : (n.title || '');
+            }
+            return item;
+          }).filter(Boolean);
+        } else {
+          // Full-tree walk with filters + optional path tracking. Pre-V3 callers
+          // (no opts, just `after`/`limit`) hit this branch with opts={} and
+          // get the original shape unchanged.
+          flat = _flattenBookmarksTree(bookmarks, null, [], shapeOpts);
+        }
         const page = _paginateByCursor(flat, after, effectiveLimit);
         return { content: [{ type: 'text', text: JSON.stringify({
+          ok:         true,
           browser:    r.data.browserBrand,
           browserId:  r.data.browserId,
           scope:      'bookmarks',
+          ...(parentResolved ? { parent_id: parentResolved, scope_depth: 'direct-children-only' } : {}),
+          ...(leavesOnly     ? { filter: 'leaves_only'  } : {}),
+          ...(foldersOnly    ? { filter: 'folders_only' } : {}),
           items:      page.items,
           nextCursor: page.nextCursor,
           totalItems: page.totalItems,
@@ -2927,6 +3197,7 @@ function createMcpServer() {
         }) }] };
       }
 
+      // DEFAULT PATH — no params at all. Full nested chrome.bookmarks tree.
       return { content: [{ type: 'text', text: JSON.stringify({
         browser:   r.data.browserBrand,
         browserId: r.data.browserId,
@@ -3369,6 +3640,12 @@ function createMcpServer() {
   // ═════════════════════════════════════════════════════════════════════════
 
   const SCOPE_TREE_OR_LIBRARY = "Scope: 'tree' (default), 'library' (libraryId required), or 'bookmarks'. Most node-targeted ops only need scope when working outside the main tree.";
+  // 2026-05-24: narrower variant for ops that don't apply to bookmark scope.
+  // delete_live_node + ghost_node have no meaning on bookmarks (no live tabs);
+  // create_group fails because bookmark tree shape has no Pinako Group node type.
+  // Engine returns INVALID_NODE_TYPE / INVALID_PARENT for these on bookmarks
+  // scope; this narrower describe spares the agent the trial-and-error.
+  const SCOPE_TREE_OR_LIBRARY_ONLY = "Scope: 'tree' (default) or 'library' (libraryId required). NOT applicable to 'bookmarks' — this op operates on Pinako tree/library structures that don't exist in the Chrome bookmark tree.";
   const SCOPE_NOTES = "Required: 'library-notes' (notes attached to a specific library; libraryId required) or 'main-tree-notes' (notes attached to the main tree). NOTE: when wrapped in bulk_apply, you must set scope on EACH sub-op individually — bulk's outer scope is NOT inherited by create_note / set_note_content sub-ops because their schemas accept two scopes.";
   const POSITION_DESC = "Optional 0-indexed insertion position; omit to append. Negative or out-of-range values clamp to ends.";
 
@@ -3460,7 +3737,7 @@ function createMcpServer() {
 
   // ─── Tree-structure ops ─────────────────────────────────────────────────────
   srv.registerTool('move_node', {
-    description: 'Moves a node (and its full subtree) under newParentId at an optional position. SUBTREE SEMANTICS: all descendants come along. To move ONLY the node WITHOUT its children (e.g., "move tab X but leave the nested tabs"), use the outdent-first-child pattern: outdent the node\'s first child first (sibling-adoption pulls the rest under it), then move the now-empty target. Or wrap both ops in a single bulk_apply for atomicity. Pass newParentId=null to move to root (auto-wraps tabs into a new window). CHROME TAB GROUP behavior (Pinako has no direct ops for Chrome Tab Group membership — it\'s controlled implicitly by tree position): a tab JOINS a Chrome Tab Group only when moved INTO a position BETWEEN two existing group members. Moving a tab to the position immediately BEFORE the first group member or immediately AFTER the last member does NOT auto-join — it stays adjacent but outside the group. A grouped tab moved AWAY from its siblings forcibly leaves the group. So to add tabs to a Chrome Tab Group: move them between any two members. To position a tab next to a group without joining: move it before the first member or after the last. BOOKMARK-SCOPE NOTE: scope:"bookmarks" moves go through chrome.bookmarks.move and are NOT Pinako-undoable (the bookmark tree has no Ctrl+Z coverage). Less severe than delete (data isn\'t lost, just relocated), but for batch reorganization (more than a few items) suggest the user back up bookmarks first via the import/export button on the Bookmarks panel.',
+    description: 'Moves a node (and its full subtree) under newParentId at an optional position. SUBTREE SEMANTICS: all descendants come along. To move ONLY the node WITHOUT its children (e.g., "move tab X but leave the nested tabs"), use the outdent-first-child pattern: outdent the node\'s first child first (sibling-adoption pulls the rest under it), then move the now-empty target. Or wrap both ops in a single bulk_apply for atomicity. Pass newParentId=null to move to root (auto-wraps tabs into a new window). VALID PARENT BY MOVED-NODE TYPE (engine rejects others with INVALID_PARENT): tabs → ROOT or window or folder; windows → ROOT or group or folder; groups → ROOT or group; folders → ROOT or group or folder. Critically: a tab CANNOT be moved directly under a Pinako Group node — create or move into a window first if you want tabs gathered under a Group row. (Tab-under-tab nesting is a designed Pinako shape but is reachable only via indent_node, not move_node — move_node\'s DND-semantic rules intentionally exclude it.) CHROME TAB GROUP behavior (Pinako has no direct ops for Chrome Tab Group membership — it\'s controlled implicitly by tree position): a tab JOINS a Chrome Tab Group only when moved INTO a position BETWEEN two existing group members. Moving a tab to the position immediately BEFORE the first group member or immediately AFTER the last member does NOT auto-join — it stays adjacent but outside the group. A grouped tab moved AWAY from its siblings forcibly leaves the group. So to add tabs to a Chrome Tab Group: move them between any two members. To position a tab next to a group without joining: move it before the first member or after the last. BOOKMARK-SCOPE NOTE: scope:"bookmarks" moves go through chrome.bookmarks.move and are NOT Pinako-undoable (the bookmark tree has no Ctrl+Z coverage). Less severe than delete (data isn\'t lost, just relocated), but for batch reorganization (more than a few items) suggest the user back up bookmarks first via the import/export button on the Bookmarks panel.',
     inputSchema: {
       nodeId:      z.string().describe('Node to move (with its subtree).'),
       newParentId: z.union([z.string(), z.null()]).optional().describe('Destination parent id, or null for root.'),
@@ -3479,7 +3756,7 @@ function createMcpServer() {
       rowColor:  z.string().optional().describe('Optional row background color: a named color, hex string, or "accent2" (default, theme-tracking).'),
       parentId:  z.union([z.string(), z.null()]).optional().describe('Parent node id (must be another group or null for root).'),
       position:  z.number().optional().describe(POSITION_DESC + ' Default TOP if omitted.'),
-      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY_ONLY),
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
@@ -3502,7 +3779,7 @@ function createMcpServer() {
     description: 'Closes the live browser tab(s) for this node and all live descendants, while preserving the tree node with chromeId=null on every ghosted node. Mirrors the manual "X" button. REVERSIBLE: the user can re-open from the tree later (URLs and metadata stay in the tree). Use this for "close these tabs but keep them saved" intents — end-of-day cleanup, freeing memory, archiving research. No confirmedByUser required (2026-05-11): the tree record is preserved so an erroneous ghost is undoable by re-opening. The browser-tab close is still visible, so narrate the intent before invoking ("I\'ll close these but they\'ll stay saved in your tree"). Returns NODE_NOT_LIVE if nothing in the subtree is live. Idempotent-on-retry: NODE_NOT_LIVE on retry typically means the previous call already ghosted everything; treat as success.',
     inputSchema: {
       nodeId:    z.string().describe('Target node id (tab, window, group, or folder). The node and all live descendants will be ghosted.'),
-      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY_ONLY),
       libraryId: z.string().optional().describe('Required when scope=library.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
@@ -3514,7 +3791,7 @@ function createMcpServer() {
     inputSchema: {
       nodeId:          z.string().describe('Target node id. The node, all descendants, and any live browser tabs in the subtree will be removed.'),
       confirmedByUser: z.literal(true).describe('Must be exactly TRUE. Set ONLY after explicit user approval of this specific destructive action.'),
-      scope:           z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      scope:           z.string().optional().describe(SCOPE_TREE_OR_LIBRARY_ONLY),
       libraryId:       z.string().optional().describe('Required when scope=library.'),
       browser:         z.string().optional().describe(BROWSER_ARG_DESC),
     },
@@ -3570,7 +3847,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('add_to_library', args));
 
   srv.registerTool('add_to_bookmarks', {
-    description: 'Inverse direction of add_to_library: clones tree or library nodes INTO the browser\'s native bookmark tree (chrome.bookmarks). VERB MAPPING: "save tab X as a bookmark", "back up these tabs to bookmarks", "add library Y to bookmarks folder Z" → use this tool. "MOVE to bookmarks" → call this tool first, then delete_node on the source after success (two-step, agent-managed; there is no atomic move_to_bookmarks for v1). SOURCESCOPE: "tree" (default — main tab tree) or "library" (sourceLibraryId required). TYPE CONVERSION (automatic): tab source → bookmark leaf (preserves url/title), window/group/folder source → bookmark folder (the bookmark tree has no concept of window or group; conversion mirrors the manual drag-to-bookmarks behavior). PARENT: pass parentBookmarkFolderId pointing at a folder node id from get_bookmarks; omit to default to the first root ("Bookmarks Bar"). Returns addedBookmarkNodeIds (Pinako internal ids of the inserted bookmark nodes). NOT IDEMPOTENT — each call creates new Chrome bookmarks. On transient failures, DO NOT auto-retry; call get_bookmarks first to check whether the previous attempt succeeded. BOOKMARK-SCOPE RECOVERY NOTE: chrome.bookmarks.create has no Pinako undo coverage; an erroneous add cannot be rolled back via Ctrl+Z. For batch operations (more than a few items), suggest the user back up bookmarks first via the import/export button on the Bookmarks panel. Max 100 source ids per call.',
+    description: 'Inverse direction of add_to_library: clones tree or library nodes INTO the browser\'s native bookmark tree (chrome.bookmarks). VERB MAPPING: "save tab X as a bookmark", "back up these tabs to bookmarks", "add library Y to bookmarks folder Z" → use this tool. "MOVE to bookmarks" → call this tool first, then delete_node on the source after success (two-step, agent-managed; there is no atomic move_to_bookmarks for v1). SOURCESCOPE: "tree" (default — main tab tree) or "library" (sourceLibraryId required). TYPE CONVERSION (automatic): tab source → bookmark leaf (preserves url/title), window/group/folder source → bookmark folder (the bookmark tree has no concept of window or group; conversion mirrors the manual drag-to-bookmarks behavior). PARENT: pass parentBookmarkFolderId pointing at a folder node id from get_bookmarks; omit to default to the first root ("Bookmarks Bar"). Returns addedBookmarkNodeIds (Pinako internal ids of the inserted bookmark nodes). NOT IDEMPOTENT — each call creates new Chrome bookmarks. On transient failures, DO NOT auto-retry; call get_bookmarks first to check whether the previous attempt succeeded. UNDO COVERAGE (2026-05-24): Ctrl+Z now fully reverses add_to_bookmarks — removes both the Pinako bookmark tree entries AND the Chrome bookmarks created. Redo recreates them. Earlier versions left Chrome bookmarks orphaned on undo; that limitation is fixed. For LARGE bulk add operations (50+ items), still suggest the user back up bookmarks first via the import/export button on the Bookmarks panel — the recovery path is now built in but a manual backup is cheap insurance against unexpected Chrome API errors mid-batch. Max 100 source ids per call.',
     inputSchema: {
       nodeIds:                 z.array(z.string()).min(1).describe('Source TREE node ids (max 100). MUST be ids from the source\'s tree (windows/tabs/groups/folders).'),
       sourceScope:             z.string().optional().describe('"tree" (default) or "library". Bookmarks→bookmarks is not supported here (use move_node for in-bookmark reorder).'),
@@ -3584,20 +3861,21 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('add_to_bookmarks', args));
 
   srv.registerTool('set_note_content', {
-    description: 'Updates an existing note\'s content. MODE GUIDANCE: "replace" (default) overwrites — use for "update note X with Y", "replace note X". "append" concatenates after existing content — use for "add Y to note X", "note down that ...". For prepend, read existing content first then call replace with the combined string. Note char limit is tier-gated (50K Pro / 150K Pro+ / 250K Premium / 500K Enterprise); for append mode the FINAL length is what\'s gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. Idempotent on retry for replace mode; append mode on retry would double-append, so DO NOT auto-retry append on transient failures — re-read first.',
+    description: 'Updates an existing note\'s content. MODE GUIDANCE: "replace" (default) overwrites — use for "update note X with Y", "replace note X". "append" concatenates after existing content — use for "add Y to note X", "note down that ...". For prepend, read existing content first then call replace with the combined string. Note char limit is tier-gated (50K Pro / 150K Pro+ / 250K Premium / 500K Enterprise); for append mode the FINAL length is what\'s gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. PASS HTML RAW: the `content` value is a JSON string the engine stores literally then renders; do NOT entity-escape `<` `>` `&` (they are valid unescaped inside a JSON string). Writing `&lt;p&gt;...&lt;/p&gt;` stores literal entity text that renders as visible `&lt;p&gt;` rather than a `<p>` element. Idempotent on retry for replace mode; append mode on retry would double-append, so DO NOT auto-retry append on transient failures — re-read first. CONCURRENCY (LWW): notes carry an optional last_modified millisecond timestamp. For read-then-write flows (read note → reason about content → edit), capture note.last_modified from the get_tree response and pass it as expected_last_modified to guard against another path (portal collaboration session, another agent round, another device) modifying the note between your read and your write. If the engine sees a newer note.last_modified than your expected token, it rejects with NOTE_STALE — re-read the note and retry. Omit expected_last_modified for blind overwrites (e.g. user says "replace the whole note with X").',
     inputSchema: {
       noteId:    z.string().describe('Note id within the target notes array.'),
       content:   z.string().describe('Note content (max varies by tier; see description).'),
       mode:      z.string().optional().describe('"replace" (default) or "append".'),
       scope:     z.string().describe(SCOPE_NOTES),
       libraryId: z.string().optional().describe('Required when scope=library-notes.'),
+      expected_last_modified: z.number().int().nonnegative().optional().describe('Optional last-write-wins guard. Pass the note.last_modified value you read with get_tree. Engine rejects with NOTE_STALE if the note has been modified since. Omit for blind overwrites.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
     annotations: TOOL_ANNOTATIONS.set_note_content,
   }, async (args) => writeToolHandler('set_note_content', args));
 
   srv.registerTool('create_note', {
-    description: 'Creates a new note in a library or in the main tree notes. Use this when the user says "create a note about X", "save these findings as a new note", etc. For UPDATING an existing note, use set_note_content. Returns createdNoteId. Char limit is tier-gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. NOT IDEMPOTENT: each call creates a new note. On transient failures, DO NOT auto-retry — call get_library or get_main_tree_notes to check whether the previous attempt succeeded before retrying.',
+    description: 'Creates a new note in a library or in the main tree notes. Use this when the user says "create a note about X", "save these findings as a new note", etc. For UPDATING an existing note, use set_note_content. Returns createdNoteId. Char limit is tier-gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. PASS HTML RAW: the `content` value is a JSON string the engine stores literally then renders; do NOT entity-escape `<` `>` `&` (they are valid unescaped inside a JSON string). Writing `&lt;p&gt;...&lt;/p&gt;` stores literal entity text that renders as visible `&lt;p&gt;` rather than a `<p>` element. NOT IDEMPOTENT: each call creates a new note. On transient failures, DO NOT auto-retry — call get_library or get_main_tree_notes to check whether the previous attempt succeeded before retrying.',
     inputSchema: {
       title:     z.string().describe('Note title (trimmed, non-empty, max 200 chars).'),
       content:   z.string().optional().describe('Initial content (default empty). Char limit varies by tier.'),
@@ -3614,7 +3892,8 @@ function createMcpServer() {
       noteId:           z.string().describe('Note id within the target notes array (note-* format, from get_library / get_main_tree_notes).'),
       scope:            z.string().describe(SCOPE_NOTES),
       libraryId:        z.string().optional().describe('Required when scope=library-notes.'),
-      confirmedByUser:  z.boolean().describe('Must be true. Represents explicit user authorization for THIS specific destructive op — not a default and not satisfied by an earlier in-session confirmation.'),
+      // 2026-05-24: tightened z.boolean() → z.literal(true) to match delete_library + delete_node and the engine schema. See delete_library above for rationale.
+      confirmedByUser:  z.literal(true).describe('Must be exactly TRUE. Set ONLY after explicit user approval of this specific destructive action.'),
       browser:          z.string().optional().describe(BROWSER_ARG_DESC),
     },
     annotations: TOOL_ANNOTATIONS.delete_note,
@@ -3707,7 +3986,12 @@ function createMcpServer() {
     description: 'Permanently deletes a single library and ALL its content (tabs, notes, tags, memos, child windows/groups/folders). Removes the library from any group it belongs to AND from the panel order. DESTRUCTIVE: cannot be fully undone — Ctrl+Z restores the libraryData entry but does NOT restore the group/panelOrder cleanup and does NOT recreate the cloud row. Use this instead of the hack of wrapping the library in a temporary group and cascade-deleting the group; that workaround required two MCP roundtrips and a visible UI artifact. confirmedByUser:true is REQUIRED — obtain explicit user approval for THIS specific library deletion (not as a default, not on retry). Returns LIBRARY_NOT_FOUND for unknown ids. To remove a library from a group without deleting its content, use remove_library_from_group instead.',
     inputSchema: {
       libraryId:        z.string().describe('Target library id (folder-* format, from list_libraries / get_library).'),
-      confirmedByUser:  z.boolean().describe('Must be true. Represents explicit user authorization for THIS specific destructive op — not a default and not satisfied by an earlier in-session confirmation.'),
+      // 2026-05-24: tightened from z.boolean() to z.literal(true). Pre-fix
+      // the bridge layer accepted confirmedByUser:false (Zod passed; engine
+      // schema's z.literal(true).refine() at mutation-engine.js was the only
+      // catch). Now both layers reject the same shape, restoring the
+      // defense-in-depth the host.js comment at _checkConfirmedByUser claims.
+      confirmedByUser:  z.literal(true).describe('Must be exactly TRUE. Set ONLY after explicit user approval of this specific destructive action.'),
       browser:          z.string().optional().describe(BROWSER_ARG_DESC),
     },
     annotations: TOOL_ANNOTATIONS.delete_library,
@@ -3756,11 +4040,11 @@ function createMcpServer() {
 
   // ─── Composite ─────────────────────────────────────────────────────────────
   srv.registerTool('bulk_apply', {
-    description: 'Atomically applies up to 100 sub-ops as a SINGLE undoable unit. TWO USE CASES: (1) multi-step reorganizations — "move these 12 tabs into a new library called Research"; (2) batch-applying the same op to many targets — "tag these 8 nodes \'archived\'", "rename each of these tabs", "set the same memo on these 5 items". COST/LATENCY GUIDE — FOLLOW EXACTLY: at 1, 2, or 3 targets you MUST use the underlying tool directly (individually), not bulk_apply — composing an ops array for so few items has reasoning overhead that is not worth the atomic-undo benefit at that size. **Use bulk_apply ONLY when applying the same op to 4 OR MORE targets, OR for any heterogeneous multi-step reorganization (regardless of count) where the user explicitly wants one-click atomic undo.** This 4-target threshold is not a soft preference; it is the rule. SUB-OP SCOPE INHERITANCE: sub-ops without explicit scope/libraryId inherit the bulk\'s; explicitly setting a different value is rejected (BULK_SCOPE_MISMATCH / BULK_LIBRARY_MISMATCH). EXCEPTION for create_note and set_note_content: their schemas accept two valid scopes (library-notes, main-tree-notes), so EVERY sub-op of those types must include its own explicit scope field — bulk\'s outer scope is NOT auto-filled in. NESTING: bulk_apply cannot contain another bulk_apply. PER-SUB-OP CONFIRMATION: each destructive sub-op (delete_node, delete_live_node, delete_library_group with cascadeMembers:true) requires its OWN confirmedByUser:true field — the bulk_apply wrapper does NOT confer confirmation to sub-ops; obtain user approval for each destructive action individually. ERROR LOCATION: on failure, error.context.subOpIndex (and a "Sub-op N:" prefix in the message) identifies the failing sub-op — correct and resubmit just that one in a new bulk_apply, or fix and resubmit the whole batch.',
+    description: 'Atomically applies up to 250 sub-ops as a SINGLE undoable unit. TWO USE CASES: (1) multi-step reorganizations — "move these 12 tabs into a new library called Research"; (2) batch-applying the same op to many targets — "tag these 8 nodes \'archived\'", "rename each of these tabs", "set the same memo on these 5 items". COST/LATENCY GUIDE — FOLLOW EXACTLY: at 1, 2, or 3 targets you MUST use the underlying tool directly (individually), not bulk_apply — composing an ops array for so few items has reasoning overhead that is not worth the atomic-undo benefit at that size. **Use bulk_apply ONLY when applying the same op to 4 OR MORE targets, OR for any heterogeneous multi-step reorganization (regardless of count) where the user explicitly wants one-click atomic undo.** This 4-target threshold is not a soft preference; it is the rule. ENVELOPE SCOPE — STRICT MATCH: every sub-op\'s `scope` must equal the bulk\'s envelope `scope` (omitting sub-op scope makes it inherit). ENVELOPE LIBRARYID — SCOPE-DEPENDENT: for in-library scopes (`library` tree mutations, `library-notes` note ops) the envelope libraryId picks WHICH library\'s state the bulk operates on, and every sub-op libraryId must match it. For collection scopes (`library-list`, `library-groups`) the envelope holds the whole collection as the draft and each sub-op\'s libraryId / groupId is an independent TARGET — cross-library / cross-group batches are SUPPORTED. CONCRETE ENVELOPE SHAPES: for tree mutations set envelope `scope:\'tree\'` (default), no libraryId. For library-list ops (delete_library, set_library_title, set_library_description, add_to_library) set envelope `scope:\'library-list\'`, no envelope libraryId; each sub-op carries its own target libraryId — batch as many DIFFERENT libraries as you want. For library-internal tree mutations (move_node within one library, set_tags on library children) set envelope `scope:\'library\' + libraryId:<that library>` and sub-ops share that one library. For note ops (delete_note, set_note_content): EVERY sub-op must carry its own explicit `scope` (`library-notes` or `main-tree-notes`); envelope scope is NOT auto-filled — set envelope `scope` to match. For library-group ops set envelope `scope:\'library-groups\'`. For bookmark ops set envelope `scope:\'bookmarks\'`. CROSS-LIBRARY WORKFLOWS — USE scope:\'library-list\': "delete N libraries", "rename N libraries", "describe N libraries" all express as ONE bulk_apply with `scope:\'library-list\'` and sub-op libraryIds as the per-target ids. Whole batch is one Ctrl+Z. NOT supported as one bulk: cross-library tree-internal moves (one library is source, another is destination — split into separate add_to_library calls). NESTING: bulk_apply cannot contain another bulk_apply. PER-SUB-OP CONFIRMATION: each destructive sub-op (delete_node, delete_live_node, delete_note, delete_library, delete_library_group with cascadeMembers:true) requires its OWN confirmedByUser:true field — the bulk_apply wrapper does NOT confer confirmation to sub-ops; obtain user approval for each destructive action individually. ERROR LOCATION: on failure, error.context.subOpIndex (and a "Sub-op N:" prefix in the message) identifies the failing sub-op — correct and resubmit just that one in a new bulk_apply, or fix and resubmit the whole batch.',
     inputSchema: {
-      ops:       z.array(z.object({}).passthrough()).min(1).describe('Array of agent ops (each with type + fields). Max 100.'),
-      scope:     z.string().optional().describe('Default scope for sub-ops that omit it. NOT applied to create_note / set_note_content sub-ops (must specify per sub-op).'),
-      libraryId: z.string().optional().describe('Default libraryId for sub-ops that omit it.'),
+      ops:       z.array(z.object({}).passthrough()).min(1).describe('Array of agent ops (each with type + fields). Max 250 per call (raised from 100 on 2026-05-22). Engine returns BULK_OPS_OVER_LIMIT with context.batchesRequired + context.recommendedNextBatchSize when exceeded — plan ceil(N/250) sequential calls upfront, contiguous slices.'),
+      scope:     z.string().optional().describe('Envelope scope. MUST equal every sub-op scope (or sub-op inherits when omitted). Valid values: tree (default), library-list, library, library-notes, main-tree-notes, library-groups, bookmarks. NOT auto-filled into create_note / set_note_content sub-ops — those must specify scope per sub-op. See main description for the concrete envelope shape per sub-op type.'),
+      libraryId: z.string().optional().describe('Envelope libraryId. Required when scope is `library` or `library-notes` (in-library scopes — envelope picks which library, every sub-op libraryId must match). For `library-list` and `library-groups` (collection scopes) OMIT the envelope libraryId — each sub-op carries its own target libraryId / groupId and cross-library batches are supported. Omit for `tree`, `main-tree-notes`, `bookmarks` scopes. NOTE: envelope libraryId is NOT auto-injected into sub-ops. For sub-op types whose schema requires libraryId (delete_library, set_library_title, set_library_description, add_to_library), include the libraryId field on each sub-op (under `library-list` scope it is the per-sub-op TARGET; under `library` scope it must equal the envelope). Sub-op types that only operate on the bulk\'s draft (set_tags, move_node, set_memo, etc. under scope:\'library\') do NOT need to repeat libraryId.'),
       browser:   z.string().optional().describe(BROWSER_ARG_DESC),
     },
     annotations: TOOL_ANNOTATIONS.bulk_apply,
