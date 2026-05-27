@@ -1,7 +1,7 @@
 {
   "name": "pinako-mcp",
-  "version": "1.2.0",
-  "description": "MCP server bridge for Pinako browser extension (read-only)",
+  "version": "1.3.0",
+  "description": "MCP server bridge for Pinako browser extension",
   "type": "module",
   "scripts": {
     "install-host": "node install.js",
