@@ -9,14 +9,23 @@ const HOST_NAME: &str = "com.pinako.mcp";
 
 // Read-only MCP tools — pre-populated into Cline / Roo Code `autoApprove`
 // arrays so the AI client doesn't prompt the user before each call. Limited
-// to tools that DO NOT modify user data: data reads + UI-only side effects
-// + bridge-side ephemeral writes (record_observation). Mirrors the
+// to tools that DO NOT modify user data (reads only). Mirrors the
 // readOnlyHint=true set on each tool in pinako-mcp/host.js TOOL_ANNOTATIONS,
 // and the READ_ONLY_TOOLS list in pinako-mcp/setup/configure.js. Keep these
 // three lists in sync when adding/removing tools.
+//
+// 2026-05-25 (security review): removed 11 Phase 4.5-F auto-organize tool
+// names (auto_organize_bookmarks, apply_heuristic_organize, propose_*,
+// refine_folder_outliers, resolve_duplicate_landings, get_organize_state,
+// get_observations, record_observation, summarize_organize_results,
+// complete_organize_sort). Those MCP tools were deleted when auto-organize
+// moved to the extension popup; pre-approving deleted-then-recycled names
+// would be a latent privesc surface if any name is ever reused with write
+// semantics. Also added search_pinako (was always read-only in host.js).
 const READ_ONLY_TOOLS: &[&str] = &[
     "get_tree",
     "search_tabs",
+    "search_pinako",
     "list_libraries",
     "get_library",
     "get_main_tree_notes",
@@ -24,17 +33,6 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "list_browsers",
     "find_duplicates",
     "get_tree_summary",
-    "propose_categories",
-    "propose_subcategories",
-    "apply_heuristic_organize",
-    "refine_folder_outliers",
-    "summarize_organize_results",
-    "resolve_duplicate_landings",
-    "get_organize_state",
-    "get_observations",
-    "record_observation",
-    "auto_organize_bookmarks",
-    "complete_organize_sort",
     "search_docs",
 ];
 

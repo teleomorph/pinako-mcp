@@ -78,6 +78,50 @@ const STDIN_GRACE_MS = 30_000;
 // stays as defense-in-depth for in-process callers (chat panel in Phase 4).
 const NOTE_CHAR_LIMITS = { 0: 50000, 1: 50000, 2: 150000, 3: 250000, 4: 500000 };
 
+// ─── Canonical bulk_apply sub-op-type list (MIRROR) ──────────────────────────
+// MIRROR — keep in sync with Pinako/mutation-engine.js BULK_APPLY_SUB_OP_TYPES
+// and supabase/functions/chat-completion/index.ts BULK_APPLY_SUB_OP_TYPES.
+// The mutation-engine.js copy is the source of truth; smoke tests at
+// Pinako/tests/mutation-engine.smoke.js fail loudly if these three arrays
+// drift. The constant is unused at runtime today (the engine's per-op schemas
+// reject unknown types via validate()); it exists so a drift-detection smoke
+// test can parse the list out of each surface's source text.
+// eslint-disable-next-line no-unused-vars
+const BULK_APPLY_SUB_OP_TYPES = [
+  'set_tags',
+  'add_tags',
+  'remove_tags',
+  'set_memo',
+  'set_star_color',
+  'set_row_color',
+  'set_title',
+  'create_group',
+  'create_folder',
+  'delete_node',
+  'ghost_node',
+  'delete_live_node',
+  'move_node',
+  'indent_node',
+  'outdent_node',
+  'create_library',
+  'add_to_library',
+  'add_to_bookmarks',
+  'set_note_content',
+  'create_note',
+  'delete_note',
+  'create_library_group',
+  'delete_library_group',
+  'add_library_to_group',
+  'remove_library_from_group',
+  'set_library_group_title',
+  'set_library_group_description',
+  'set_library_title',
+  'set_library_description',
+  'delete_library',
+  'reorder_library_panel',
+  'reorder_libraries_in_group',
+];
+
 // Last-resort handlers so an uncaught error in any async path is at least
 // logged to disk before the process dies. Without these, an async throw in
 // the /edit handler or NM listener would crash the host silently from the
@@ -2347,7 +2391,7 @@ The tab tree is hierarchical: Windows → Groups → Tabs.
 - Ghost tabs (chromeId = null) are tabs the user closed in the browser but chose to preserve in the Pinako tree. They can be reopened on demand. Treat them as saved/bookmarked tabs — they are NOT currently open in Chrome.
 - Groups have a title and color. Windows have a title.
 - Libraries are user-created collections of saved tabs organized into folders — like bookmarks but richer, with notes, tags, and memos.
-- Main tree notes are rich text documents attached to the user's main tree (the live tab tree) rather than to a library or an individual tab. Refer to them as "main tree notes" in any user-facing language. ("global notes" is a legacy codebase term you may still encounter in older docs and internal field names; treat it as a synonym, but do not surface it to the user.)
+- Main Notes are rich text documents attached to the user's main tree (the live tab tree) rather than to a library or an individual tab. Refer to them as "Main Notes" in any user-facing language. (Internal field names like `globalNotes` / `owner_type:'global'` are legacy and being renamed; treat them as synonyms but never surface them to the user.)
 
 CHRONOLOGY
 openedDate (Unix ms) records when each tab was opened or saved. Use this for time-based queries like "tabs I opened today", "recent tabs", "what was I looking at last week". Compare against the current date.
@@ -2418,7 +2462,7 @@ WRITES across multi-source results:
 For "tag/memo all my X tabs as Y": issue ONE bulk_apply per scope (one for scope:'tree' main-tree nodes, one per affected library with scope:'library'+libraryId). Each bulk_apply is one undo step for the user — acceptable for now (cross-scope single-undo is on the roadmap).
 
 MULTI-BROWSER
-The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the same time. Each install's tree, libraries, main tree notes, bookmarks, tags, and memos are independent data sources. Some may stay in step when both installs are signed into the same Pinako Pro account and cloud sync is current, but do not assume cross-install identity for any domain. Different accounts, signed-out installs, or in-flight sync can diverge them. Tools accept an optional 'browser' parameter (e.g., browser="Brave") to pick a specific install. Use list_browsers to discover what's connected and to see each install's updatedAt.
+The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the same time. Each install's tree, libraries, Main Notes, bookmarks, tags, and memos are independent data sources. Some may stay in step when both installs are signed into the same Pinako Pro account and cloud sync is current, but do not assume cross-install identity for any domain. Different accounts, signed-out installs, or in-flight sync can diverge them. Tools accept an optional 'browser' parameter (e.g., browser="Brave") to pick a specific install. Use list_browsers to discover what's connected and to see each install's updatedAt.
 
 Selection rules:
 - One browser connected: omit 'browser'; tools resolve automatically.
@@ -2671,7 +2715,7 @@ function createMcpServer() {
         '  - "library" — one specific library (requires library_id). Default match_fields: title, url, tags, memo.\n' +
         '  - "libraries-all" — UNION across every library in the install. Default match_fields: title, url, tags, memo. The right scope for "find tabs tagged X across all my libraries". Each hit is tagged with sourceLibraryId.\n' +
         '  - "bookmarks" — Chrome\'s bookmark tree. Default match_fields: title, url (Chrome bookmark items don\'t carry tags or memos; if either is passed in match_fields it simply yields zero hits for that field).\n' +
-        '  - "notes" — Pinako notes (BOTH library-notes AND main-tree global notes in one pass). Default match_fields: title, content (Tiptap HTML is server-side stripped of tags before matching). Each hit returns a 200-char snippet centered on the first content match.\n' +
+        '  - "notes" — Pinako notes (BOTH library notes AND Main Notes in one pass). Default match_fields: title, content (Tiptap HTML is server-side stripped of tags before matching). Each hit returns a 200-char snippet centered on the first content match.\n' +
         '  - "all" — union of tree + every library + bookmarks + notes. Use sparingly; for "is this thing anywhere in my Pinako" questions. Limit param applies to the combined result count.\n\n' +
         'TAG MATCHING: by default tag matching is SUBSTRING (matches "foo" against "food", "footnote", etc.). Pass exact_tag:true to require the tag value to EQUAL the query exactly (case-insensitive). When the user names a specific tag ("show me items tagged exactly \'food\'") MUST set exact_tag:true; substring matching otherwise leaks false positives.\n\n' +
         'LIMIT: default 200 results. Pass limit (max 2000) to widen. Response includes truncated:true when the limit was hit so the agent knows results were cut off (in which case narrow the scope/query or raise limit).\n\n' +
@@ -2996,7 +3040,7 @@ function createMcpServer() {
   srv.registerTool(
     'get_main_tree_notes',
     {
-      description: 'Returns the main tree notes — rich text documents attached to the user\'s main tree (the live tab tree), as opposed to notes attached to a specific library. Cloud-synced, identical across browsers. (Legacy codebase name: "global notes". Surface as "main tree notes" in any user-facing language.) ' +
+      description: 'Returns the Main Notes — rich text documents attached to the user\'s main tree (the live tab tree), as opposed to notes attached to a specific library. Cloud-synced, identical across browsers. (Internal field name `globalNotes` is legacy; always surface as "Main Notes" to the user.) ' +
         'PAGINATION (Slice S2a): pass `after` (last-seen note id) and/or `limit` (default 100) to receive notes one batch at a time: {items:[...notes...], nextCursor:..., totalItems:N}. Pagination returns notes in their stored order with full content bodies. Useful when one or two notes are very large.' + FRESHNESS_HINT,
       inputSchema: {
         after:            z.string().optional().describe('Pagination cursor: last-seen note id from a previous paginated call. Omit on the first call.'),
@@ -3577,8 +3621,8 @@ function createMcpServer() {
     'mainTreeNotes',
     RESOURCE_URIS.mainTreeNotes,
     {
-      title:       'Pinako main tree notes',
-      description: 'Rich-text notes attached to the user\'s main tree (as opposed to library notes or per-tab memos). Cloud-synced across the user\'s browsers. Subscribe to receive notifications/resources/updated when main tree notes mutate. (Legacy codebase name: "global notes".)',
+      title:       'Pinako Main Notes',
+      description: 'Rich-text notes attached to the user\'s main tree (as opposed to library notes or per-tab memos). Cloud-synced across the user\'s browsers. Subscribe to receive notifications/resources/updated when Main Notes mutate. (Internal field name `globalNotes` is legacy.)',
       mimeType:    'application/json',
     },
     async (uri) => {
@@ -3688,7 +3732,7 @@ function createMcpServer() {
 
   // ─── Metadata ops ───────────────────────────────────────────────────────────
   srv.registerTool('set_memo', {
-    description: 'Sets the memo (short plain-text annotation, max 2500 chars) on a node. Pass empty string to clear. Memos are per-node and concise; for richer rich-text documents use create_note / set_note_content (which target a library or the main tree notes, not individual nodes). The memo content field is named "text" in this tool; "memo" is also accepted as an alias for resilience (if both are present, "text" wins).',
+    description: 'Sets the memo (short plain-text annotation, max 2500 chars) on a node. Pass empty string to clear. Memos are per-node and concise; for richer rich-text documents use create_note / set_note_content (which target a library or the Main Notes, not individual nodes). The memo content field is named "text" in this tool; "memo" is also accepted as an alias for resilience (if both are present, "text" wins).',
     inputSchema: {
       nodeId:    z.string().describe('Target node id.'),
       text:      z.string().describe('Memo text (max 2500 chars). Empty string clears the memo. Alias: "memo".'),
@@ -3875,7 +3919,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_note_content', args));
 
   srv.registerTool('create_note', {
-    description: 'Creates a new note in a library or in the main tree notes. Use this when the user says "create a note about X", "save these findings as a new note", etc. For UPDATING an existing note, use set_note_content. Returns createdNoteId. Char limit is tier-gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. PASS HTML RAW: the `content` value is a JSON string the engine stores literally then renders; do NOT entity-escape `<` `>` `&` (they are valid unescaped inside a JSON string). Writing `&lt;p&gt;...&lt;/p&gt;` stores literal entity text that renders as visible `&lt;p&gt;` rather than a `<p>` element. NOT IDEMPOTENT: each call creates a new note. On transient failures, DO NOT auto-retry — call get_library or get_main_tree_notes to check whether the previous attempt succeeded before retrying.',
+    description: 'Creates a new note in a library or in the Main Notes. Use this when the user says "create a note about X", "save these findings as a new note", etc. For UPDATING an existing note, use set_note_content. Returns createdNoteId. Char limit is tier-gated. Note content is sanitized at write time (HTML allowlist; <script>, on* event handlers, javascript: URLs are stripped) — write valid Tiptap-compatible HTML or plain text. PASS HTML RAW: the `content` value is a JSON string the engine stores literally then renders; do NOT entity-escape `<` `>` `&` (they are valid unescaped inside a JSON string). Writing `&lt;p&gt;...&lt;/p&gt;` stores literal entity text that renders as visible `&lt;p&gt;` rather than a `<p>` element. NOT IDEMPOTENT: each call creates a new note. On transient failures, DO NOT auto-retry — call get_library or get_main_tree_notes to check whether the previous attempt succeeded before retrying.',
     inputSchema: {
       title:     z.string().describe('Note title (trimmed, non-empty, max 200 chars).'),
       content:   z.string().optional().describe('Initial content (default empty). Char limit varies by tier.'),

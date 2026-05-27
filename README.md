@@ -2,7 +2,7 @@
 
 The Model Context Protocol (MCP) bridge that connects [Pinako](https://pinako.pro) — a Chromium extension for tab tree management — to local AI clients including Claude Code, Claude Desktop, Cursor, Windsurf, Cline, Roo Code, Continue.dev, and any HTTP MCP client.
 
-The bridge runs as a small native messaging host on your computer, exposing your Pinako tab tree, libraries, and main tree notes as **read-only** MCP tools your AI assistant can query.
+The bridge runs as a small native messaging host on your computer, exposing your Pinako tab tree, libraries, and Main Notes as **read-only** MCP tools your AI assistant can query.
 
 ## Tools exposed
 
@@ -10,7 +10,7 @@ The bridge runs as a small native messaging host on your computer, exposing your
 - `search_tabs` — search tabs by URL, title, tags, or memos
 - `list_libraries` — names of saved libraries
 - `get_library` — contents of a specific library
-- `get_main_tree_notes` — your main tree notes
+- `get_main_tree_notes` — your Main Notes
 
 All read-only. The bridge cannot create, modify, or delete anything in your Pinako data.
 

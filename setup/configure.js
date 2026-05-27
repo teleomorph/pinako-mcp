@@ -16,16 +16,29 @@ const MCP_URL = 'http://127.0.0.1:37421/mcp';
 // Cline / Roo Code / Continue.dev each support an `autoApprove: [...]` array
 // in their MCP server config. Tools listed here are pre-approved on install
 // — the AI client won't prompt the user before each call. Limited to tools
-// that DO NOT modify user data: data reads + UI-only side effects + bridge-
-// side ephemeral writes (record_observation). Any tool that touches the
-// tab tree, libraries, bookmarks, or notes is OMITTED so the user keeps
-// per-call confirmation on writes.
+// that DO NOT modify user data (reads only). Any tool that touches the tab
+// tree, libraries, bookmarks, or notes is OMITTED so the user keeps per-call
+// confirmation on writes.
 //
 // User can edit the array post-install to widen or tighten the policy.
 // Mirrors the readOnlyHint=true set in pinako-mcp/host.js TOOL_ANNOTATIONS.
+//
+// Keep in sync with:
+//   - pinako-mcp/host.js TOOL_ANNOTATIONS (readOnlyHint=true entries)
+//   - pinako-mcp/installer/src-tauri/src/main.rs READ_ONLY_TOOLS
+//
+// 2026-05-25 (security review): removed 11 Phase 4.5-F auto-organize tool
+// names (auto_organize_bookmarks, apply_heuristic_organize, propose_*,
+// refine_folder_outliers, resolve_duplicate_landings, get_organize_state,
+// get_observations, record_observation, summarize_organize_results,
+// complete_organize_sort). Those MCP tools were deleted when auto-organize
+// moved to the extension popup; pre-approving deleted-then-recycled names
+// would be a latent privesc surface if any name is ever reused with write
+// semantics. Also added search_pinako (was always read-only in host.js).
 const READ_ONLY_TOOLS = [
   'get_tree',
   'search_tabs',
+  'search_pinako',
   'list_libraries',
   'get_library',
   'get_main_tree_notes',
@@ -33,17 +46,6 @@ const READ_ONLY_TOOLS = [
   'list_browsers',
   'find_duplicates',
   'get_tree_summary',
-  'propose_categories',
-  'propose_subcategories',
-  'apply_heuristic_organize',
-  'refine_folder_outliers',
-  'summarize_organize_results',
-  'resolve_duplicate_landings',
-  'get_organize_state',
-  'get_observations',
-  'record_observation',
-  'auto_organize_bookmarks',
-  'complete_organize_sort',
   'search_docs',
 ];
 

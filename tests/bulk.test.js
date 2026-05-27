@@ -136,7 +136,7 @@ describe('bulk_apply composition', () => {
     // NB: sub-op runtime failures use `error.context.index` (not `subOpIndex`,
     // which is used only by the bridge-boundary CONFIRMATION_REQUIRED check).
     // SERVER_INSTRUCTIONS doc says `subOpIndex` for both — API inconsistency
-    // tracked in agentic-ai-followups.md.
+    // tracked in ai-todo.md.
     expect(result.parsed?.error?.context?.index).toBe(1);
     expect(result.parsed?.error?.context?.subError?.code).toBe('NODE_NOT_FOUND');
     expect(result.parsed?.error?.message).toContain('Sub-op 1');

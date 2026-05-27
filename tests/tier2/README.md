@@ -168,7 +168,8 @@ Tier 1 helpers are reused from `../helpers/`:
 - No LLM-judge eval — assertions are deterministic (tool name + final
   state). Quality grading of agent reasoning is out of scope.
 - Tool-cap / tier-aware tests deferred until `list_browsers` exposes
-  `subscriptionTier` (see `agentic-ai-pre-ship-fixes.md` #5).
+  `subscriptionTier` (see `docs-archive/agentic-ai-pre-ship-fixes.md` #5
+  — now shipped; summary in `ai-resolved.md`).
 
 ## Cost / quota
 

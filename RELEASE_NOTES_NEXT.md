@@ -15,8 +15,8 @@ The MCP server instructions now teach AI clients to behave like a human collabor
 
 Previously the AI would either silently merge across browsers or re-ask which browser every single call. Both were wrong — this matches what you'd expect from a teammate.
 
-### Terminology: "main tree notes" replaces "global notes" (breaking)
-The MCP-facing terminology for the user's top-level notebook (notes attached to the main tab tree, not to a library) is now **main tree notes**. "Global notes" was internal codebase jargon that leaked into the agent surface; this rename keeps the AI's user-facing language aligned with the rest of the product.
+### Terminology: "Main Notes" replaces "global notes" (breaking)
+The MCP-facing terminology for the user's top-level notebook (notes attached to the main tab tree, not to a library) is now **Main Notes**. "Global notes" was internal codebase jargon that leaked into the agent surface; this rename keeps the AI's user-facing language aligned with the rest of the product.
 
 What changed at the MCP boundary:
 
