@@ -2391,7 +2391,7 @@ The tab tree is hierarchical: Windows → Groups → Tabs.
 - Ghost tabs (chromeId = null) are tabs the user closed in the browser but chose to preserve in the Pinako tree. They can be reopened on demand. Treat them as saved/bookmarked tabs — they are NOT currently open in Chrome.
 - Groups have a title and color. Windows have a title.
 - Libraries are user-created collections of saved tabs organized into folders — like bookmarks but richer, with notes, tags, and memos.
-- Main Notes are rich text documents attached to the user's main tree (the live tab tree) rather than to a library or an individual tab. Refer to them as "Main Notes" in any user-facing language. (Internal field names like `globalNotes` / `owner_type:'global'` are legacy and being renamed; treat them as synonyms but never surface them to the user.)
+- Main Notes are rich text documents attached to the user's main tree (the live tab tree) rather than to a library or an individual tab. Refer to them as "Main Notes" in any user-facing language. (Internal field names like 'globalNotes' / "owner_type:'global'" are legacy and being renamed; treat them as synonyms but never surface them to the user.)
 
 CHRONOLOGY
 openedDate (Unix ms) records when each tab was opened or saved. Use this for time-based queries like "tabs I opened today", "recent tabs", "what was I looking at last week". Compare against the current date.
