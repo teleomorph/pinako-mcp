@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, randomBytes } from 'node:crypto';
+import pkg from './package.json' with { type: 'json' };
 
 // ─── Debug log file ───────────────────────────────────────────────────────────
 // Cross-platform log path (host.js is bundled independently — no import from setup/paths.js)
@@ -2496,7 +2497,7 @@ For complete documentation, see: https://pinako.pro/docs/ai-connect`;
 
 function createMcpServer() {
   const srv = new McpServer(
-    { name: 'pinako', version: '1.1.2' },
+    { name: 'pinako', version: pkg.version },
     { instructions: SERVER_INSTRUCTIONS }
   );
 
