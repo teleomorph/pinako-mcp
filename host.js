@@ -2496,7 +2496,7 @@ For complete documentation, see: https://pinako.pro/docs/ai-connect`;
 
 function createMcpServer() {
   const srv = new McpServer(
-    { name: 'pinako', version: '1.2.0' },
+    { name: 'pinako', version: '1.1.2' },
     { instructions: SERVER_INSTRUCTIONS }
   );
 
