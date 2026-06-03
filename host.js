@@ -2301,6 +2301,15 @@ function countBookmarksRecursive(node) {
   return n;
 }
 
+// A broad scope:"all" search auto-includes the bookmark tree only when it has
+// at most this many links; above it, search_pinako skips bookmarks and returns
+// a bookmarksSkipped notice so the agent asks the user before searching them.
+// Bookmark trees run to 10K+ links and would dominate the result budget and
+// burn tokens without adding signal. Explicit scope:"bookmarks" is never gated
+// (the user directed that one). Mirrored on the chat side in Pinako/pinako.js
+// (_executeChatToolSearchPinako).
+const BOOKMARK_SEARCH_CONFIRM_THRESHOLD = 600;
+
 // ─── MCP Server factory ────────────────────────────────────────────────────────
 // Each HTTP session gets its own McpServer + transport instance.
 // Tool handlers read from the global cachedData (no per-session state needed).
@@ -2446,7 +2455,7 @@ SEMANTIC / categorical intent — the user named a topic, theme, or concept:
 
 DO NOT call search_tabs multiple times with synonyms ("exercise", then "workout", then "fitness", then "stretch"...) — you will miss things (titles like "10-min Transform" with no obvious keyword) AND burn round-trips. Two well-chosen reads beat ten literal searches.
 
-Both patterns cover tree + libraries by default. Skip bookmarks unless the user explicitly references them ("in my bookmarks", "across everything", "including bookmarks") — bookmark trees are often 10K+ entries and would dominate without adding signal.
+Both patterns cover tree + libraries by default. ONLY search bookmarks when the user uses the word "bookmark"/"bookmarks" ("in my bookmarks", "search my bookmarks", "including bookmarks"). Broad words alone — "everywhere", "all", "across everything" — do NOT pull in bookmarks: bookmark trees are often 10K+ links and would dominate the results and burn tokens without adding signal. Exception for a broad "everywhere"/"all" query: if the bookmark collection is small (≤600 links) it's fine to include; if larger, search tree + libraries (+ notes) first, then ASK the user whether to also search their browser bookmarks before doing so. search_pinako enforces this on scope:"all" automatically — it returns a bookmarksSkipped notice (with the count) when the bookmark tree is too large and unconfirmed; honor it by asking, then re-call with include_bookmarks:true on confirmation.
 
 When the query is about TABS / LINKS / WINDOWS / TREE structure, DO NOT include note content in the search. Notes are a separate surface — rich-text docs attached to a tree or library, not to individual tabs. Conflating "I have a tab about gardening" with "I wrote a note mentioning gardening" misleads the user. list_libraries and get_library return note metadata (id+title) but not content by default; that's intentional. Include note content only when the user explicitly says "notes" ("search my notes for X", "find the note about Y") — use get_main_tree_notes or get_library({lite:false}) then.
 
@@ -2456,10 +2465,14 @@ Override phrases that change scope:
 - "in the main tree only" / "in the live tree" → skip libraries.
 - "in my libraries only" → skip main tree.
 - "in library X" → constrain to that one library.
-- "everywhere" / "including bookmarks" → add bookmarks.
+- any phrase with the word "bookmark"/"bookmarks" ("in my bookmarks", "including bookmarks", "search my bookmarks") → add bookmarks (scope:"bookmarks", or include_bookmarks:true on an "all" query).
+- "everywhere" / "all" / "across everything" → broad search of tree + libraries (+ notes). These words alone are NOT a bookmark trigger; bookmarks follow the gate above (auto-included only when ≤600 links, otherwise ask first).
 
 WRITES across multi-source results:
 For "tag/memo all my X tabs as Y": issue ONE bulk_apply per scope (one for scope:'tree' main-tree nodes, one per affected library with scope:'library'+libraryId). Each bulk_apply is one undo step for the user — acceptable for now (cross-scope single-undo is on the roadmap).
+
+REPORTING WHAT YOU DID — summarize, don't enumerate.
+When you describe a write op you're about to perform OR have just performed (create / add / move / tag / memo / delete / ghost / rename / reorder) that affects MORE THAN 5 items, report a COUNT plus the destination — do NOT list the individual items. "Added 20 recipe links to the Recipes library" / "Tagged 14 tabs 'work'" / "Moved 30 bookmarks into 'Review'", NOT "Added the following 20 links:" followed by the list. Enumerating long lists wastes the user's context tokens and is rarely what they asked for. For 5 or fewer affected items a short list is fine. If the user then asks to see them ("which ones?", "list them"), enumerate then. This is a hard rule across every item type (tabs, bookmarks, libraries, notes, memos, folders, groups, tags), not a soft preference. (A search the user explicitly asked you to SHOW is different — there the list is the answer; still lead with a count and the by-source breakdown above for large result sets.)
 
 MULTI-BROWSER
 The user may have Pinako open in multiple browsers (Chrome + Brave, etc.) at the same time. Each install's tree, libraries, Main Notes, bookmarks, tags, and memos are independent data sources. Some may stay in step when both installs are signed into the same Pinako Pro account and cloud sync is current, but do not assume cross-install identity for any domain. Different accounts, signed-out installs, or in-flight sync can diverge them. Tools accept an optional 'browser' parameter (e.g., browser="Brave") to pick a specific install. Use list_browsers to discover what's connected and to see each install's updatedAt.
@@ -2716,7 +2729,7 @@ function createMcpServer() {
         '  - "libraries-all" — UNION across every library in the install. Default match_fields: title, url, tags, memo. The right scope for "find tabs tagged X across all my libraries". Each hit is tagged with sourceLibraryId.\n' +
         '  - "bookmarks" — Chrome\'s bookmark tree. Default match_fields: title, url (Chrome bookmark items don\'t carry tags or memos; if either is passed in match_fields it simply yields zero hits for that field).\n' +
         '  - "notes" — Pinako notes (BOTH library notes AND Main Notes in one pass). Default match_fields: title, content (Tiptap HTML is server-side stripped of tags before matching). Each hit returns a 200-char snippet centered on the first content match.\n' +
-        '  - "all" — union of tree + every library + bookmarks + notes. Use sparingly; for "is this thing anywhere in my Pinako" questions. Limit param applies to the combined result count.\n\n' +
+        '  - "all" — union of tree + every library + notes, plus bookmarks ONLY when the bookmark tree is small (≤600 links) or include_bookmarks:true is passed. On a larger bookmark tree, "all" skips the bookmark surface and the response carries a bookmarksSkipped notice with the count — surface it to the user and ask before including them. Use for "is this thing anywhere in my Pinako" questions. Limit param applies to the combined result count.\n\n' +
         'TAG MATCHING: by default tag matching is SUBSTRING (matches "foo" against "food", "footnote", etc.). Pass exact_tag:true to require the tag value to EQUAL the query exactly (case-insensitive). When the user names a specific tag ("show me items tagged exactly \'food\'") MUST set exact_tag:true; substring matching otherwise leaks false positives.\n\n' +
         'LIMIT: default 200 results. Pass limit (max 2000) to widen. Response includes truncated:true when the limit was hit so the agent knows results were cut off (in which case narrow the scope/query or raise limit).\n\n' +
         'RESPONSE: results[] is a flat array sorted in discovery order (depth-first walk). Each entry: {type ("tab" | "group" | "window" | "folder" | "library-folder" | "note" | "bookmark"), scope, nodeId or noteId, sourceLibraryId? (present for library scopes), matchedFields (subset of the requested match_fields that actually matched), title, url? (when present), tags? (when present), memoText? (when present), parentPath (slash-joined ancestor breadcrumb; tree/library/bookmarks scopes), snippet? (notes only, 200-char window centered on the first content hit), ghost? (true when a tree-scope tab is a ghost tab AND include_ghost_tabs was true)}.' + FRESHNESS_HINT,
@@ -2727,12 +2740,13 @@ function createMcpServer() {
         match_fields:       z.array(z.enum(['title', 'url', 'tags', 'memo', 'content'])).optional().describe('Which fields to match. Defaults are scope-aware: tree/library/libraries-all default to ["title","url","tags","memo"]; bookmarks defaults to ["title","url"]; notes defaults to ["title","content"]; "all" scope uses the scope-appropriate default per surface. "content" only applies to notes scope; for other scopes it is ignored.'),
         exact_tag:          z.boolean().optional().describe('When true, tag matches must equal the query exactly (case-insensitive). When false (default), tag matches use substring semantics. Use exact_tag:true whenever the user names a specific tag.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs in tree scope. Default true.'),
+        include_bookmarks:  z.boolean().optional().describe('Set true ONLY after the user confirms they want their browser bookmarks searched in a broad scope:"all" query. Bypasses the >600-link confirmation gate. No effect on other scopes (scope:"bookmarks" always searches them; tree/library/notes never do).'),
         limit:              z.number().int().min(1).max(2000).optional().describe('Max results across all surfaces in this call. Default 200.'),
         browser:            z.string().optional().describe(BROWSER_ARG_DESC),
       },
       annotations: TOOL_ANNOTATIONS.search_pinako,
     },
-    async ({ query, scope = 'tree', library_id, match_fields, exact_tag = false, include_ghost_tabs = true, limit, browser }) => {
+    async ({ query, scope = 'tree', library_id, match_fields, exact_tag = false, include_ghost_tabs = true, include_bookmarks = false, limit, browser }) => {
       if (typeof query !== 'string' || query.length === 0) {
         return { content: [{ type: 'text', text: JSON.stringify({
           error: { code: 'EMPTY_QUERY', message: 'query must be a non-empty string' },
@@ -2747,6 +2761,7 @@ function createMcpServer() {
       const noteFields     = (Array.isArray(match_fields) && match_fields.length > 0) ? match_fields : ['title', 'content'];
 
       const results = [];
+      let bookmarksSkipped = null;
 
       function runTree() {
         _searchInTreeOmni({
@@ -2840,7 +2855,21 @@ function createMcpServer() {
             runLibrary(lib);
           }
         }
-        if (results.length < effectiveLimit) runBookmarks();
+        // Bookmark gate: a broad "all" search includes the bookmark tree only
+        // when it's small (≤ threshold links) or the user confirmed via
+        // include_bookmarks. Large bookmark collections dominate the result
+        // budget and burn tokens without adding signal, so skip them and
+        // surface a bookmarksSkipped notice for the agent to act on.
+        const bookmarkLeafCount = (r.data.bookmarks || []).reduce((acc, root) => acc + countBookmarksRecursive(root), 0);
+        if (include_bookmarks || bookmarkLeafCount <= BOOKMARK_SEARCH_CONFIRM_THRESHOLD) {
+          if (results.length < effectiveLimit) runBookmarks();
+        } else {
+          bookmarksSkipped = {
+            bookmarkCount: bookmarkLeafCount,
+            threshold:     BOOKMARK_SEARCH_CONFIRM_THRESHOLD,
+            message:       `Broad search skipped your browser bookmarks because there are ${bookmarkLeafCount} of them (above the ${BOOKMARK_SEARCH_CONFIRM_THRESHOLD}-link threshold where they add cost and noise without signal). Tell the user their browser bookmarks were not searched and ask whether to include them; if they confirm, re-call with include_bookmarks:true (or scope:"bookmarks" to search only that surface).`,
+          };
+        }
         if (results.length < effectiveLimit) runNotes();
       }
 
@@ -2856,6 +2885,7 @@ function createMcpServer() {
         results,
         count:              results.length,
         truncated:          results.length >= effectiveLimit,
+        ...(bookmarksSkipped ? { bookmarksSkipped } : {}),
       }) }] };
     }
   );
