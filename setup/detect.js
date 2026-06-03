@@ -78,6 +78,18 @@ export const CLIENTS = [
     detectType: 'dir',
     note: 'HTTP transport support requires Continue.dev v0.9.210+',
   },
+  {
+    id: 'codex',
+    label: 'Codex (CLI / IDE / app)',
+    configPath: path.join(HOME, '.codex', 'config.toml'),
+    detectPath: path.join(HOME, '.codex'),
+    detectType: 'dir',
+    // One shared config drives the Codex CLI, the IDE extension, and the
+    // desktop app. On Windows the desktop app may clear third-party MCP
+    // entries when it launches (OpenAI issue #24718) — the CLI and IDE keep
+    // the entry, so re-run this installer if the desktop app drops it.
+    note: 'Shared by Codex CLI, IDE, and desktop app. Windows desktop app may clear the entry on launch (OpenAI bug #24718) — re-run to restore.',
+  },
 ];
 
 // ─── Detection ────────────────────────────────────────────────────────────────

@@ -54,12 +54,13 @@ These have well-documented, stable config paths and a simple JSON merge operatio
 | **Cline** | `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json` | `mcpServers.pinako` | file exists |
 | **Roo Code** | `%APPDATA%\Code\User\globalStorage\rooveterinaryinc.roo-cline\settings\mcp_settings.json` | `mcpServers.pinako` | file exists |
 | **Continue.dev** | `%USERPROFILE%\.continue\config.json` | nested under `experimental.modelContextProtocolServers` | `.continue` dir exists |
+| **Codex** (CLI/IDE/app) | `%USERPROFILE%\.codex\config.toml` | `[mcp_servers.pinako]` with `url` (TOML, format-preserving edit) | `.codex` dir exists |
 
 **Not auto-configured in Phase 1 (see docs instead):**
 - Claude Desktop — config is stdio-only; HTTP requires mcp-remote bridge or manual setup
 - VS Code native Copilot — merging into settings.json is risky; needs careful handling
 - Zed — different schema (`context_servers`)
-- Amazon Q, Codex CLI, Gemini — needs further research
+- Amazon Q, Gemini — needs further research
 
 ---
 
@@ -142,6 +143,15 @@ Merge strategy: same. These files may not exist yet if user hasn't opened MCP se
 ```
 Merge strategy: append to the array if URL not already present; create `experimental.modelContextProtocolServers` path if absent.
 ⚠️ Continue.dev may use YAML (`config.yaml`) in newer versions — detect which exists and prefer JSON. HTTP transport support needs verification against latest Continue.dev release.
+
+### Codex (`~/.codex/config.toml`)
+```toml
+[mcp_servers.pinako]
+url = "http://127.0.0.1:37421/mcp"
+startup_timeout_sec = 20
+```
+Merge strategy: **TOML, not JSON.** One config file is shared by the Codex CLI, IDE extension, and desktop app. The file is hand-maintained (model prefs, plugins, other MCP servers, comments), so do a **format-preserving targeted edit**: strip any existing `[mcp_servers.pinako]` table (and `[mcp_servers.pinako.*]` sub-tables), then append a fresh block — never parse-and-restringify the whole file. A `url` field makes Codex treat it as streamable-HTTP automatically; **do NOT write `experimental_use_rmcp_client`** (verified unnecessary on Codex 0.136+, and an unrecognized key breaks `--strict-config`). Verified end-to-end 2026-06-03: full MCP handshake + all 43 tools discovered.
+⚠️ Windows: the Codex desktop app may wipe third-party MCP entries on launch ([openai/codex#24718](https://github.com/openai/codex/issues/24718)); CLI/IDE persist. Re-run to restore.
 
 ---
 
@@ -257,7 +267,7 @@ Target triples to support in future:
 - [ ] Auto-updater (check `pinako.pro/version.json` on startup)
 - [ ] VS Code native Copilot auto-config (careful settings.json merge)
 - [ ] Zed auto-config
-- [ ] Amazon Q, Codex CLI after their MCP config paths are confirmed
+- [ ] Amazon Q after its MCP config path is confirmed
 - [ ] Uninstaller (remove registry keys, config entries, files)
 - [ ] Code-signing the exe (required for no SmartScreen warning on download)
 

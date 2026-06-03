@@ -77,6 +77,48 @@ function mergeConfig(dst, src) {
   return dst;
 }
 
+// ─── TOML helpers (Codex) ───────────────────────────────────────────────────
+// Codex stores MCP servers in ~/.codex/config.toml, not JSON. That file is
+// usually hand-maintained (model prefs, plugins, other MCP servers, comments),
+// so we do a FORMAT-PRESERVING targeted edit rather than parsing the whole
+// file and re-serializing it (which would strip comments and reflow every
+// line). We rewrite ONLY the [mcp_servers.pinako] table — and any of its
+// sub-tables — leaving every other byte of the user's config untouched.
+//
+// Codex classifies a server with a `url` field as streamable-HTTP transport
+// automatically; no experimental flag is needed (and writing an unrecognized
+// flag would break `--strict-config`), so the block is intentionally minimal.
+
+const CODEX_TABLE = 'mcp_servers.pinako';
+const TOML_HEADER_RE = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*$/;
+
+// Remove the [mcp_servers.pinako] table and any [mcp_servers.pinako.<sub>]
+// sub-tables from a TOML string, preserving all other content verbatim.
+function stripTomlTable(toml, table) {
+  const nl = /\r\n/.test(toml) ? '\r\n' : '\n';
+  const out = [];
+  let skipping = false;
+  for (const line of toml.split(/\r?\n/)) {
+    const m = line.match(TOML_HEADER_RE);
+    if (m) {
+      const name = m[1].trim();
+      skipping = name === table || name.startsWith(table + '.');
+      if (skipping) continue; // drop the table header itself
+    }
+    if (skipping) continue;   // drop lines belonging to the skipped table
+    out.push(line);
+  }
+  return out.join(nl);
+}
+
+function buildPinakoTomlBlock(nl) {
+  return [
+    `[${CODEX_TABLE}]`,
+    `url = "${MCP_URL}"`,
+    'startup_timeout_sec = 20',
+  ].join(nl);
+}
+
 // ─── Per-client config writers ────────────────────────────────────────────────
 
 const writers = {
@@ -150,6 +192,21 @@ const writers = {
     filtered.push({ transport: { type: 'streamableHttp', url: MCP_URL } });
     config.experimental.modelContextProtocolServers = filtered;
     writeJson(configPath, config);
+  },
+
+  'codex'(configPath) {
+    let existing = '';
+    try { existing = fs.readFileSync(configPath, 'utf8'); } catch { existing = ''; }
+    const nl = /\r\n/.test(existing) ? '\r\n' : '\n';
+    // Drop any prior pinako block (idempotent re-install / localhost→127.0.0.1
+    // normalization), then append a fresh canonical block at the end.
+    const stripped = stripTomlTable(existing, CODEX_TABLE).replace(/\s+$/, '');
+    const block = buildPinakoTomlBlock(nl);
+    const next = stripped
+      ? stripped + nl + nl + block + nl
+      : block + nl;
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, next, 'utf8');
   },
 
 };

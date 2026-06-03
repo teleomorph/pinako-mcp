@@ -198,6 +198,9 @@ fn detect_clients() -> Vec<ClientInfo> {
         client("continue", "Continue.dev",
             h.join(".continue"),
             Some("HTTP transport requires Continue.dev v0.9.210+")),
+        client("codex", "Codex (CLI / IDE / app)",
+            h.join(".codex"),
+            Some("Shared by Codex CLI, IDE, and desktop app. Windows desktop app may clear the entry on launch (OpenAI bug #24718) — re-run to restore.")),
     ]
 }
 
@@ -423,6 +426,7 @@ fn client_label(id: &str) -> &str {
         "cline"          => "Cline",
         "roo-code"       => "Roo Code",
         "continue"       => "Continue.dev",
+        "codex"          => "Codex",
         other            => other,
     }
 }
@@ -543,8 +547,61 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                 serde_json::Value::Array(servers);
             write_json(&path, &cfg)
         }
+        "codex" => {
+            let path = home.join(".codex").join("config.toml");
+            write_codex_config(&path)
+        }
         other => Err(format!("Unknown client id: {other}")),
     }
+}
+
+// ── Codex TOML config ──────────────────────────────────────────────────────────
+// Codex stores MCP servers in ~/.codex/config.toml, shared by the CLI, the IDE
+// extension, and the desktop app. The file is usually hand-maintained (model
+// prefs, plugins, other MCP servers, comments), so we do a format-preserving
+// targeted edit — rewrite ONLY the [mcp_servers.pinako] table (and any of its
+// sub-tables) and leave every other byte untouched. Mirrors the JS writer in
+// pinako-mcp/setup/configure.js. A `url` field makes Codex treat it as a
+// streamable-HTTP server automatically; no experimental flag is written (an
+// unrecognized key would break Codex's --strict-config).
+
+const CODEX_TABLE: &str = "mcp_servers.pinako";
+
+fn strip_toml_table(toml: &str, table: &str) -> String {
+    let nl = if toml.contains("\r\n") { "\r\n" } else { "\n" };
+    let sub_prefix = format!("{table}.");
+    let mut out: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let name = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
+            skipping = name == table || name.starts_with(&sub_prefix);
+            if skipping { continue; } // drop the table header itself
+        }
+        if skipping { continue; }     // drop lines belonging to the skipped table
+        out.push(line);
+    }
+    out.join(nl)
+}
+
+fn write_codex_config(path: &Path) -> Result<(), String> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let nl = if existing.contains("\r\n") { "\r\n" } else { "\n" };
+    let stripped = strip_toml_table(&existing, CODEX_TABLE);
+    let stripped = stripped.trim_end();
+    let block = format!(
+        "[{CODEX_TABLE}]{nl}url = \"{MCP_URL}\"{nl}startup_timeout_sec = 20"
+    );
+    let next = if stripped.is_empty() {
+        format!("{block}{nl}")
+    } else {
+        format!("{stripped}{nl}{nl}{block}{nl}")
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, next).map_err(|e| e.to_string())
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
