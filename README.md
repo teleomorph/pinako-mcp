@@ -18,33 +18,33 @@ Because the bridge runs inside desktop AI clients like Claude Desktop, Cursor, a
 
 ## Tools
 
-44 MCP tools across read and write. Full per-tool reference with parameters: [pinako.pro/docs/ai-connect](https://pinako.pro/docs/ai-connect).
+Read and write MCP tools. Full per-tool reference with parameters: [pinako.pro/docs/ai-connect](https://pinako.pro/docs/ai-connect).
 
-**Read (11)** — query the tree, libraries, notes, and bookmarks, and search
+**Read** — query the tree, libraries, notes, and bookmarks, and search
 
 `get_tree`, `get_tree_summary`, `search_tabs`, `search_pinako`, `search_docs`, `list_libraries`, `get_library`, `get_main_tree_notes`, `get_bookmarks`, `list_browsers`, `find_duplicates`
 
-**Tree structure (9)** — move, nest, group, and remove nodes
+**Tree structure** — move, nest, group, and remove nodes
 
 `move_node`, `indent_node`, `outdent_node`, `create_group`, `create_folder`, `ghost_node`, `delete_node`, `delete_live_node`, `bulk_apply` (up to 250 atomic sub-ops, undoable as one step)
 
-**Node metadata (7)** — titles, tags, memos, colors
+**Node metadata** — titles, tags, memos, colors
 
 `set_title`, `set_tags`, `add_tags`, `remove_tags`, `set_memo`, `set_star_color`, `set_row_color`
 
-**Libraries and library groups (13)** — create, edit, delete, and arrange
+**Libraries and library groups** — create, edit, delete, and arrange
 
 `create_library`, `add_to_library`, `set_library_title`, `set_library_description`, `delete_library`, `create_library_group`, `set_library_group_title`, `set_library_group_description`, `delete_library_group`, `add_library_to_group`, `remove_library_from_group`, `reorder_library_panel`, `reorder_libraries_in_group`
 
-**Notes (3)** — create and edit Main Notes and library notes
+**Notes** — create and edit Main Notes and library notes
 
 `create_note`, `set_note_content`, `delete_note`
 
-**Bookmarks (1)** — write to the browser bookmark tree
+**Bookmarks** — write to the browser bookmark tree
 
 `add_to_bookmarks` (bookmark reads use `get_bookmarks`; dedup uses `find_duplicates`)
 
-The 11 read tools are safe to auto-approve. Write tools are individually annotated (idempotent, non-idempotent, or destructive) so MCP clients can gate them appropriately.
+The read tools are safe to auto-approve. Write tools are individually annotated (idempotent, non-idempotent, or destructive) so MCP clients can gate them appropriately.
 
 ## Install
 
