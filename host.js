@@ -364,6 +364,39 @@ function nmWrite(obj) {
   }
 }
 
+// ─── Local host extensions ────────────────────────────────────────────────────
+// Optional developer extension point: a host-ext.js placed next to host.js, or
+// at ../bridge-ext/host-ext.js relative to it, is loaded at startup and may
+// register handlers for additional NM message types. Absent in normal installs;
+// load failures are non-fatal and logged. Handlers receive the raw NM message
+// and reply via the provided nmWrite.
+const _extNmHandlers = new Map();
+(function loadHostExtensions() {
+  const _fs = require('fs');
+  const _path = require('path');
+  const candidates = [
+    _path.join(__dirname, 'host-ext.js'),
+    _path.join(__dirname, '..', 'bridge-ext', 'host-ext.js'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (!_fs.existsSync(p)) continue;
+      const ext = require(p);
+      if (typeof ext === 'function') {
+        ext({
+          onNmMessage: (type, fn) => { if (type && typeof fn === 'function') _extNmHandlers.set(type, fn); },
+          nmWrite,
+          log: (m) => { try { log(`[host-ext] ${m}`); } catch (_) {} },
+          getLocalBrowserId: () => { try { return localBrowserId; } catch (_) { return null; } },
+        });
+        try { log(`Host extension loaded: ${p}`); } catch (_) {}
+      }
+    } catch (e) {
+      try { log(`Host extension load failed (${p}): ${e && e.message ? e.message : e}`); } catch (_) {}
+    }
+  }
+})();
+
 // ─── Native Messaging async read ─────────────────────────────────────────────
 // Reads Chrome NM messages from stdin asynchronously so the event loop
 // (and HTTP server) stays responsive between messages.
@@ -608,6 +641,10 @@ function handleNmMessage(msg) {
     // no MCP tool reads from it. The auto-organize workflow now runs
     // entirely in the popup; if a future MCP-side surface needs the data,
     // it's already cached.
+  } else if (_extNmHandlers.has(msg.type)) {
+    // Local host extension handler (see loadHostExtensions above).
+    try { _extNmHandlers.get(msg.type)(msg); }
+    catch (e) { try { log(`host-ext handler error (${msg.type}): ${e && e.message ? e.message : e}`); } catch (_) {} }
   }
 }
 
