@@ -189,6 +189,8 @@ fn detect_clients() -> Vec<ClientInfo> {
             h.join(".cursor"), None),
         client("windsurf", "Windsurf",
             h.join(".codeium").join("windsurf"), None),
+        client("antigravity", "Antigravity",
+            h.join(".gemini").join("antigravity"), None),
         client("cline", "Cline (VS Code extension)",
             a.join("Code").join("User").join("globalStorage")
              .join("saoudrizwan.claude-dev"), None),
@@ -423,6 +425,7 @@ fn client_label(id: &str) -> &str {
         "claude-desktop" => "Claude Desktop",
         "cursor"         => "Cursor",
         "windsurf"       => "Windsurf",
+        "antigravity"    => "Antigravity",
         "cline"          => "Cline",
         "roo-code"       => "Roo Code",
         "continue"       => "Continue.dev",
@@ -495,6 +498,14 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
             cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": MCP_URL });
+            write_json(&path, &cfg)
+        }
+        "antigravity" => {
+            // Antigravity uses `serverUrl` (not `url`) for HTTP MCP servers.
+            let path = home.join(".gemini").join("antigravity").join("mcp_config.json");
+            let mut cfg = read_json(&path);
+            ensure_obj(&mut cfg, "mcpServers");
+            cfg["mcpServers"]["pinako"] = serde_json::json!({ "serverUrl": MCP_URL });
             write_json(&path, &cfg)
         }
         "cline" => {

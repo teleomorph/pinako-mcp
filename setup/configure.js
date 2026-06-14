@@ -158,6 +158,15 @@ const writers = {
     writeJson(configPath, config);
   },
 
+  'antigravity'(configPath) {
+    const config = readJson(configPath);
+    config.mcpServers = config.mcpServers || {};
+    // Antigravity (Google's agent IDE, built by the former Windsurf team) uses
+    // `serverUrl` — NOT `url` — for HTTP MCP servers. Same mcpServers shape.
+    config.mcpServers.pinako = { serverUrl: MCP_URL };
+    writeJson(configPath, config);
+  },
+
   'cline'(configPath) {
     const config = readJson(configPath);
     config.mcpServers = config.mcpServers || {};

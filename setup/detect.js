@@ -45,6 +45,17 @@ export const CLIENTS = [
     note: null,
   },
   {
+    id: 'antigravity',
+    label: 'Antigravity',
+    // Google's agent IDE, built by the former Windsurf team. Config lives at
+    // ~/.gemini/antigravity/mcp_config.json (NOT .codeium). HTTP entries use the
+    // `serverUrl` key, not `url` — see the writer in configure.js.
+    configPath: path.join(HOME, '.gemini', 'antigravity', 'mcp_config.json'),
+    detectPath: path.join(HOME, '.gemini', 'antigravity'),
+    detectType: 'dir',
+    note: null,
+  },
+  {
     id: 'cline',
     label: 'Cline (VS Code extension)',
     configPath: path.join(
