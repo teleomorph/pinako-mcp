@@ -22,6 +22,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID, randomBytes } from 'node:crypto';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import pkg from './package.json' with { type: 'json' };
 
 // ─── Debug log file ───────────────────────────────────────────────────────────
@@ -40,8 +42,11 @@ function getLogPath() {
   }
 }
 const LOG_PATH = getLogPath();
+const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate active log past 5 MB (was unbounded; a crash loop once grew it to 27 MB)
 const recentRequests = []; // last 10 /mcp requests for /debug endpoint
 let logDirCreated = false;
+let logBytesWritten = 0;
+let logSizeSeeded = false;
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
@@ -51,7 +56,24 @@ function log(msg) {
       fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
       logDirCreated = true;
     }
+    // Seed the running size from the existing file once, then track in-process
+    // to avoid stat()ing on every write.
+    if (!logSizeSeeded) {
+      try { logBytesWritten = fs.statSync(LOG_PATH).size; } catch (_) { logBytesWritten = 0; }
+      logSizeSeeded = true;
+    }
+    const len = Buffer.byteLength(line);
+    // Size-capped rotation: keep exactly one previous log (.old). Bounds disk
+    // use at ~2×LOG_MAX_BYTES so a future crash loop can't fill the disk.
+    if (logBytesWritten + len > LOG_MAX_BYTES) {
+      try {
+        fs.rmSync(LOG_PATH + '.old', { force: true });
+        fs.renameSync(LOG_PATH, LOG_PATH + '.old');
+      } catch (_) {}
+      logBytesWritten = 0;
+    }
     fs.appendFileSync(LOG_PATH, line);
+    logBytesWritten += len;
   } catch (_) {}
 }
 
@@ -371,17 +393,32 @@ function nmWrite(obj) {
 // load failures are non-fatal and logged. Handlers receive the raw NM message
 // and reply via the provided nmWrite.
 const _extNmHandlers = new Map();
+// host.js runs in TWO module systems and must resolve its directory + a
+// require() against whichever primitives the current context provides:
+//   • Dev: raw ES module (`node host.js`, since package.json sets
+//     "type":"module") — exposes import.meta.url, but NOT require/__dirname.
+//   • Prod: CommonJS bundle (esbuild --format=cjs → pkg) — exposes
+//     require/__dirname, but esbuild EMPTIES import.meta.url to undefined.
+// Using the wrong one crashes at startup (this bug, in both directions).
+// `typeof` on an absent identifier is safe (yields "undefined", never throws).
+// fs/path are already imported at the top of the file.
+let _hostDir, _hostRequire;
+if (typeof __dirname !== 'undefined') {
+  _hostDir     = __dirname;   // CommonJS bundle (prod)
+  _hostRequire = require;
+} else {
+  _hostDir     = path.dirname(fileURLToPath(import.meta.url));   // ES module (dev)
+  _hostRequire = createRequire(import.meta.url);
+}
 (function loadHostExtensions() {
-  const _fs = require('fs');
-  const _path = require('path');
   const candidates = [
-    _path.join(__dirname, 'host-ext.js'),
-    _path.join(__dirname, '..', 'bridge-ext', 'host-ext.js'),
+    path.join(_hostDir, 'host-ext.js'),
+    path.join(_hostDir, '..', 'bridge-ext', 'host-ext.js'),
   ];
   for (const p of candidates) {
     try {
-      if (!_fs.existsSync(p)) continue;
-      const ext = require(p);
+      if (!fs.existsSync(p)) continue;
+      const ext = _hostRequire(p);
       if (typeof ext === 'function') {
         ext({
           onNmMessage: (type, fn) => { if (type && typeof fn === 'function') _extNmHandlers.set(type, fn); },
