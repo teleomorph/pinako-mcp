@@ -2519,7 +2519,7 @@ SEMANTIC / categorical intent — the user named a topic, theme, or concept:
   Approach (faster AND more accurate than synonym iteration):
   1. Call get_tree({mode:"minimal"}) — flat list of every main-tree tab in compact form (~100 bytes/tab; fits 2000+ tab trees comfortably).
   2. Call list_libraries({include_tabs:true, mode:"minimal"}) — flat list of every library tab in compact form, one call across all libraries.
-  3. Read the title+url+openedDate of every tab in those two responses and identify matches USING YOUR OWN UNDERSTANDING. You know "exercise" extends to squats, pushups, stretches, mobility, ancestral movement, primal patterns, strength training, etc. Match in-head; do not iterate search_tabs with keyword after keyword.
+  3. Read the title+url+openedDate of every tab in those two responses and identify matches USING YOUR OWN UNDERSTANDING. You know "exercise" extends to squats, pushups, stretches, mobility, ancestral movement, primal patterns, strength training, etc. Match in-head; do not iterate search_tabs with keyword after keyword. WEIGHT CONTAINER ANCESTORS: a tab's enclosing Pinako Group, Folder, Window, or Library title is deliberate categorization — treat every tab inside a group named "Recipes" as a recipe unless its own title/url clearly says otherwise. Do NOT treat an ancestor TAB's title as a category signal (Pinako lets tabs nest under unrelated tabs, so a parent tab carries no categorization intent for its children). When container context is part of the signal, read in "lite" mode (tree shape preserves lineage) rather than "minimal" (flat list drops it).
   4. Apply writes via per-scope bulk_apply (one per scope/libraryId — see WRITES below).
 
   Mode tiers (read tools):
