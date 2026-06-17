@@ -119,6 +119,7 @@ const BULK_APPLY_SUB_OP_TYPES = [
   'set_row_color',
   'set_title',
   'create_group',
+  'create_window',
   'create_folder',
   'delete_node',
   'ghost_node',
@@ -2213,7 +2214,18 @@ function searchInTree(nodes, query, includeGhost, results = []) {
         (node.url      || '').toLowerCase().includes(q) ||
         (node.memoText || '').toLowerCase().includes(q) ||
         (Array.isArray(node.tags) && node.tags.some(t => t.toLowerCase().includes(q)));
-      if (hit) results.push(sanitizeNode(node));
+      if (hit) {
+        // Flat result list: strip children before pushing. searchInTree already
+        // recurses into node.children below and pushes every matching nested tab
+        // as its OWN top-level entry, so retaining children here would let the
+        // downstream shapeTree('minimal') -> flattenForMinimal re-descend and
+        // re-emit those same nested tabs, double-counting tab-under-tab nesting
+        // (inflated `count`, duplicate result rows). The copy is independent of
+        // node.children, so the recursion below still finds nested matches.
+        const flat = sanitizeNode(node);
+        delete flat.children;
+        results.push(flat);
+      }
     }
     if (node.children?.length) searchInTree(node.children, query, includeGhost, results);
   }
@@ -2404,6 +2416,9 @@ ROUTING — when the user expresses one of these intents, CALL THE LISTED TOOL F
   "find all my items tagged X" / "show me everything tagged exactly Y" / "anything with memo containing Z" / "any note that mentions W" / "search my bookmarks/libraries/notes for ..."
     → search_pinako  (literal substring search; picks the right scope via the scope param: "libraries-all" for cross-library tag/title/memo lookup, "bookmarks" for bookmark search, "notes" for note-content search, "all" for everything). For exact-tag lookups (user names a specific tag and false-positives on substrings like "food" matching "football" would be wrong) MUST pass exact_tag:true. Do NOT call list_libraries({include_tabs:true}) and grep in your head when search_pinako will do it bridge-side in one call.
 
+  "how many tabs / windows / items do I have" / "how big is my tree / library / bookmarks" / any pure COUNT or size question
+    → get_tree_summary({scope})  FIRST. Returns exact counts (counts.nodes = every node; counts.url_bearing_nodes ≈ tabs/links) plus a cheap structural overview WITHOUT reading individual nodes. Do NOT count by searching (search_tabs / search_pinako are substring finders, not counters; an empty query is rejected), and do NOT pull the whole tree with get_tree just to tally it.
+
   Questions about Pinako features / terminology / "how does X work"
     → search_docs  FIRST.  Pinako has product-specific meanings for "group", "folder", "memo", "ghost tab", "library group", "snapshot" etc. that differ from generic tab-manager intuition. Cheap local lookup; never guess from the term alone.
 
@@ -2415,10 +2430,16 @@ Read tools (get_tree, search_tabs, search_pinako, list_libraries, get_library, g
 
 Write tools fall into four categories:
 - METADATA: set_tags, add_tags, remove_tags, set_memo, set_star_color, set_row_color, set_title.
-- TREE STRUCTURE: move_node, indent_node, outdent_node, create_group, delete_node, ghost_node, delete_live_node, create_folder.
+- TREE STRUCTURE: move_node, indent_node, outdent_node, create_group, create_window (bundle existing tabs into ONE new window — pass tabIds; in the main tree, relocating live tabs opens a real background window), delete_node, ghost_node, delete_live_node, create_folder.
 - BOOKMARKS WRITE: add_to_bookmarks (clones tree or library content INTO Chrome bookmarks; type=window/group source nodes auto-convert to bookmark folders). Reorder/delete bookmark nodes via move_node / delete_node with scope:"bookmarks". For the inverse direction (clone FROM bookmarks INTO a library), use add_to_library with sourceScope:"bookmarks". The "MOVE to bookmarks" verb is a two-step pattern: call add_to_bookmarks first, then delete_node on the source after success (there is no atomic move_to_bookmarks for v1).
 - LIBRARY SYSTEM: create_library, delete_library, add_to_library, set_library_title, set_library_description, set_note_content, create_note, delete_note, create_library_group, delete_library_group, add_library_to_group, remove_library_from_group, set_library_group_title, set_library_group_description, reorder_library_panel, reorder_libraries_in_group. Rename rules: set_library_title for the library itself, set_library_group_title for the umbrella group. set_title does NOT work on the library container (type 'library') — it returns INVALID_TARGET, so MUST route library renames through set_library_title. (In-library FOLDER nodes, type 'library-folder', ARE renamable via set_title.) Delete rules: delete_library removes a single library; delete_library_group removes the group (and with cascadeMembers:true, also its member libraries). To detach a library from a group without deleting content, use remove_library_from_group. For panel reordering, call list_libraries first to get the current groups + panel_order, then pass the modified panel_order to reorder_library_panel. Never construct the panel array blindly — group ids and panel positions must come from a fresh list_libraries call.
 - COMPOSITE: bulk_apply (up to 250 sub-ops, atomic, undoable as a single unit).
+
+STRUCTURE RULES (tree + library organization):
+- "Folder" is ONE concept — never reason about folder vs library-folder; pass scope and the engine picks the type. Valid parents: tab → window / folder / ROOT (root auto-wraps it into a window; NEVER directly under a group); window → group / folder / ROOT; group → group / ROOT (groups hold only windows + groups, never loose tabs or folders); folder → folder / ROOT (folders hold mixed tabs/windows/folders; library + bookmark scopes only — the main tree has no folders).
+- Prefer the SIMPLEST container: for "organize by X", one window-per-bucket (main tree) or one folder-per-bucket (library) is usually enough; don't stack group+window+folder unless asked.
+- To gather loose tabs into a bucket, use create_window (one atomic call) instead of moving tabs to ROOT one at a time (which scatters them into singleton windows).
+- POST-REORG CLEANUP: after a reorganization (especially with failed attempts / intermediate moves), re-read (get_tree_summary / get_library) and remove containers you created or emptied. Empty WINDOWS are auto-pruned by the engine; empty GROUPS and FOLDERS persist, so delete those yourself (delete_node) unless the user wants placeholders.
 
 DESTRUCTIVE OPS need explicit user approval. Set confirmedByUser:true on these tools ONLY after the user has confirmed THIS specific action (not as a default, not on retry after a failure):
 - delete_node (removes a ghost tree record permanently; only Chrome history retains the URL)
@@ -2508,7 +2529,7 @@ Cost of search_docs is negligible (local read, no LLM call). When in doubt, call
 Skip search_docs when the request is direct and the tool is obvious ("tag this 'history'" → set_tags), or you've already established the vocabulary earlier in this conversation.
 
 SEARCH SCOPE
-When the user asks "find / list / count / tag / memo X", first distinguish two patterns:
+When the user asks "find / list / tag / memo X", first distinguish two patterns (for a pure COUNT or size question — "how many tabs", "how big is my tree" — do NOT search; call get_tree_summary, per ROUTING above):
 
 LITERAL match — the user named an exact substring (URL, domain, specific tag value, exact title fragment):
   Examples: "tabs from stackoverflow.com", "tabs tagged 'urgent'", "the tab titled 'Inbox'".
@@ -2659,6 +2680,7 @@ function createMcpServer() {
     // Edit, NOT idempotent (9) — create_* duplicates on retry per
     // SERVER_INSTRUCTIONS "CREATE-* OPS ARE NOT IDEMPOTENT" rule.
     create_group:                   EDIT_NID,
+    create_window:                  EDIT_NID,
     create_folder:                  EDIT_NID,
     create_library:                 EDIT_NID,
     create_note:                    EDIT_NID,
@@ -2777,6 +2799,11 @@ function createMcpServer() {
     },
     async (args) => {
       let { query, mode, include_ghost_tabs = true, include_favicons = false, browser } = args;
+      if (typeof query !== 'string' || query.trim().length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'EMPTY_QUERY', message: 'query must be a non-empty substring. search_tabs is a literal substring finder, not a counter — an empty query is not a valid "match everything". To COUNT tabs or get a structural overview, call get_tree_summary; to ENUMERATE every tab, call get_tree.' },
+        }) }], isError: true };
+      }
       mode = _normalizeMode(mode || 'minimal');
       const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
@@ -3466,7 +3493,7 @@ function createMcpServer() {
   srv.registerTool(
     'get_tree_summary',
     {
-      description: 'Returns a lightweight structural summary of a tree/bookmarks/library WITHOUT returning the actual nodes. Bridge-side; no LLM. Designed for the "should I read this whole tree?" decision the agent faces before any large read: the summary fits in <2KB regardless of tree size and lets the agent decide whether to proceed, what scope makes sense, and ballpark the cost.\n\n' +
+      description: 'Returns a lightweight structural summary of a tree/bookmarks/library WITHOUT returning the actual nodes. Bridge-side; no LLM. THIS IS THE RIGHT TOOL FOR "how many tabs / windows / items" and "how big is X" questions: counts.nodes is the total node count and counts.url_bearing_nodes is the tab/link count — never count by searching (an empty/broad search is not a counter) or by pulling the whole tree. Also designed for the "should I read this whole tree?" decision the agent faces before any large read: the summary fits in <2KB regardless of tree size and lets the agent decide whether to proceed, what scope makes sense, and ballpark the cost.\n\n' +
         'Response shape: {browser, browserId, scope, libraryId?, counts:{nodes, url_bearing_nodes}, depth:{max, median}, topDomains:[{domain,count},...up to 15], samplePatterns:[{pattern,token,count},...up to 15], sampleTitles:[...up to 20]}. ' +
         'topDomains = highest-frequency hostnames (www-stripped). samplePatterns = path-token frequency across all URLs (stop-words filtered: html, www, login, etc.); token of "recipe" with pattern "*recipe*" means 389 URLs had "recipe" somewhere in their path. sampleTitles = a deterministic stride sample of node titles (stable across calls — safe to cite back to the user).\n\n' +
         'For scope:"library", library_id is required. For scope:"bookmarks", returns the cached browser bookmark tree summary (empty if user hasn\'t opened the bookmarks panel since the bridge started). For scope:"tree", summarizes the live tab tree.',
@@ -3909,6 +3936,20 @@ function createMcpServer() {
     },
     annotations: TOOL_ANNOTATIONS.create_group,
   }, async (args) => writeToolHandler('create_group', args));
+
+  srv.registerTool('create_window', {
+    description: 'Creates a new window node by RELOCATING one or more existing tabs into it (tabIds, at least one; an empty window is invalid). Bundles loose tabs into a window in ONE atomic step instead of moving tabs to root one at a time. Scope "tree" (default) or "library" (libraryId required); NOT bookmarks. parentId may be a group, folder, or library-folder, or omitted/null for the scope root. In the main tree, relocating LIVE tabs opens a real browser window containing them (created in the background, so focus is not stolen); ghost/saved and library tabs stay saved-only. Default position appends to the destination. Tabs are MOVED, not copied.',
+    inputSchema: {
+      tabIds:    z.array(z.string()).min(1).describe('Existing tab node ids to relocate into the new window (at least one; moved, not copied; placed in the given order).'),
+      title:     z.string().optional().describe('Optional window title (trimmed, non-empty, max 200 chars). Defaults to "Window".'),
+      parentId:  z.union([z.string(), z.null()]).optional().describe('Parent container id (a group, folder, or library-folder), or null for the scope root.'),
+      position:  z.number().optional().describe(POSITION_DESC + ' Default append if omitted.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY_ONLY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+    annotations: TOOL_ANNOTATIONS.create_window,
+  }, async (args) => writeToolHandler('create_window', args));
 
   srv.registerTool('delete_node', {
     description: 'DESTRUCTIVE — permanently removes a GHOST node (chromeId=null) and its metadata (tags, memos, star color, custom title). For scope="bookmarks", removes the bookmark from the browser via chrome.bookmarks.remove. REJECTS subtrees that contain any live tab (chromeId set) with LIVE_NODE_REFUSED — for live tabs, use ghost_node first (closes the browser tab, preserves the tree record) then delete_node, OR use delete_live_node which does both in one shot. REQUIRES EXPLICIT USER APPROVAL: set confirmedByUser:true ONLY after the user has confirmed THIS specific deletion. Once deleted, only Chrome history retains the URL — Pinako-specific metadata is gone permanently. Idempotent-on-retry: NODE_NOT_FOUND on a retry typically means the previous call succeeded but the response was lost; treat as success rather than re-asking the user. BOOKMARK-SCOPE RECOVERY ASYMMETRY (IMPORTANT): scope:"tree" and scope:"library" deletes ARE recoverable via Pinako\'s Ctrl+Z undo stack. scope:"bookmarks" deletes are NOT — chrome.bookmarks.remove has no Pinako undo coverage; recovery requires the user\'s pre-edit backup. BEFORE the FIRST bookmark-scope delete in a session AND before any non-trivial batch (any time more than ~3 bookmarks are affected), you MUST surface this warning to the user verbatim and obtain explicit fresh confirmation: "Unlike deletions in your main tree or Pinako Libraries, deletions of bookmarks cannot be undone. Out of precaution, you can use the import/export button on the Bookmarks panel to create a backup before allowing AI to edit them." This warning is NOT optional and is NOT satisfied by an earlier in-session confirmation of a different scope. After the warning + user confirmation, proceed without re-warning for subsequent contiguous bookmark deletes in the same workflow.',
