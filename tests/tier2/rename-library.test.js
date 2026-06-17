@@ -5,11 +5,12 @@ import { resolveTargetBrowser } from '../helpers/browser.js';
 import { testLabel } from '../helpers/fixtures.js';
 
 // Tier 2: probes the agent's ability to pick `set_library_title` (not
-// `set_title`) when asked to rename a LIBRARY. set_title rejects
-// library-folder nodes with INVALID_TARGET — the only correct path for
-// library renames is set_library_title. The test gives the agent BOTH
-// tools so it must actually discriminate; calling set_title here would
-// surface as an errored tool call.
+// `set_title`) when asked to rename a LIBRARY. set_title rejects the library
+// CONTAINER (type 'library') with INVALID_TARGET — the only correct path for
+// library renames is set_library_title. (In-library FOLDER nodes, type
+// 'library-folder', ARE renamable via set_title; this test is about the
+// container.) The test gives the agent BOTH tools so it must actually
+// discriminate; calling set_title here would surface as an errored tool call.
 //
 // Regression guard for the gap Sonnet flagged in the Tier 2 Haiku-vs-
 // Sonnet comparison ("vague-cleanup" scenario): Sonnet correctly
@@ -101,7 +102,7 @@ describe.skipIf(!TIER2_RUNNABLE)('Tier 2 agent — rename library (set_library_t
     expect(libRenames.length, 'set_library_title called').toBeGreaterThanOrEqual(1);
 
     // Stronger: agent should not have leaned on set_title at all. set_title
-    // on a library-folder fails with INVALID_TARGET; routing through it
+    // on the library container fails with INVALID_TARGET; routing through it
     // would either error or hit the wrong target. Either is a regression.
     const wrongToolCalls = toolCallsByName(run.toolCalls, 'mcp__pinako__set_title');
     expect(wrongToolCalls.length, 'set_title NOT called (use set_library_title instead)').toBe(0);
