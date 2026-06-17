@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { connectPinakoMcp, callToolOk, waitFor } from './helpers/mcp-client.js';
+import { connectPinakoMcp, callTool, callToolOk, waitFor } from './helpers/mcp-client.js';
 import { resolveTargetBrowser } from './helpers/browser.js';
 import { testLabel } from './helpers/fixtures.js';
 
@@ -60,6 +60,36 @@ describe('search_tabs', () => {
     });
     expect(result.count).toBe(0);
     expect(result.results).toEqual([]);
+  });
+
+  it('rejects an empty query with EMPTY_QUERY (counting is not search)', async () => {
+    const result = await callTool(session.client, 'search_tabs', {
+      query: '',
+      browser,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.parsed?.error?.code).toBe('EMPTY_QUERY');
+  });
+
+  it('rejects a whitespace-only query with EMPTY_QUERY', async () => {
+    const result = await callTool(session.client, 'search_tabs', {
+      query: '   ',
+      browser,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.parsed?.error?.code).toBe('EMPTY_QUERY');
+  });
+
+  // Regression: search_tabs used to flatten its already-flat result list a
+  // second time (shapeTree -> flattenForMinimal re-descending into retained
+  // children), double-counting tab-under-tab nesting. A broad query then
+  // reported a `count` larger than the entire tree. count is tab-only, a
+  // subset of all nodes, so it must never exceed get_tree_summary's node count.
+  it('count never exceeds the total node count (no double-flatten of nested tabs)', async () => {
+    const summary = await callToolOk(session.client, 'get_tree_summary', { browser });
+    const search  = await callToolOk(session.client, 'search_tabs', { query: 'http', browser });
+    expect(search.count).toBe(search.results.length);
+    expect(search.count).toBeLessThanOrEqual(summary.counts.nodes);
   });
 });
 
