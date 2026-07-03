@@ -390,10 +390,12 @@ function nmWrite(obj) {
 // ─── Local host extensions ────────────────────────────────────────────────────
 // Optional developer extension point: a host-ext.js placed next to host.js, or
 // at ../bridge-ext/host-ext.js relative to it, is loaded at startup and may
-// register handlers for additional NM message types. Absent in normal installs;
-// load failures are non-fatal and logged. Handlers receive the raw NM message
-// and reply via the provided nmWrite.
+// register handlers for additional NM message types, plus additional MCP tools
+// (via onMcpTools — registrars run once per McpServer instance, i.e. per MCP
+// session). Absent in normal installs; load failures are non-fatal and logged.
+// Handlers receive the raw NM message and reply via the provided nmWrite.
 const _extNmHandlers = new Map();
+const _extMcpToolRegistrars = [];
 // host.js runs in TWO module systems and must resolve its directory + a
 // require() against whichever primitives the current context provides:
 //   • Dev: raw ES module (`node host.js`, since package.json sets
@@ -426,6 +428,13 @@ if (typeof __dirname !== 'undefined') {
           nmWrite,
           log: (m) => { try { log(`[host-ext] ${m}`); } catch (_) {} },
           getLocalBrowserId: () => { try { return localBrowserId; } catch (_) { return null; } },
+          // Register extra MCP tools: fn(srv, { z }) is invoked for every server
+          // instance createMcpServer() builds (one per MCP session).
+          onMcpTools: (fn) => { if (typeof fn === 'function') _extMcpToolRegistrars.push(fn); },
+          // Dispatch an agent edit op through the same pipeline the built-in
+          // write tools use (browser resolution, confirmation/tier gates, local
+          // NM or SSE-forwarder routing). Returns the executeEdit result object.
+          executeEdit: (op, browserArg) => executeEdit(op, browserArg),
         });
         try { log(`Host extension loaded: ${p}`); } catch (_) {}
       }
@@ -4237,6 +4246,14 @@ function createMcpServer() {
     },
     annotations: TOOL_ANNOTATIONS.bulk_apply,
   }, async (args) => writeToolHandler('bulk_apply', args));
+
+  // Local host extensions (see loadHostExtensions) may contribute additional
+  // MCP tools. Run per server instance so every MCP session sees them; a
+  // throwing registrar is logged and never breaks the built-in surface.
+  for (const fn of _extMcpToolRegistrars) {
+    try { fn(srv, { z }); }
+    catch (e) { try { log(`host-ext tool registration failed: ${e && e.message ? e.message : e}`); } catch (_) {} }
+  }
 
   return srv;
 }
