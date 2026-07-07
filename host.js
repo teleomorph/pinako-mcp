@@ -413,6 +413,27 @@ if (typeof __dirname !== 'undefined') {
   _hostDir     = path.dirname(fileURLToPath(import.meta.url));   // ES module (dev)
   _hostRequire = createRequire(import.meta.url);
 }
+// ─── --diag: runtime diagnostics ──────────────────────────────────────────────
+// Prints the embedded runtime's version and core-module availability, then
+// exits. A packaged build runs a bundled Node that is NOT the dev machine's
+// node — after a runtime/target bump, `pinako-mcp-service --diag` proves what
+// actually ships (version, snapshot mode, node:sqlite presence).
+if (process.argv.includes('--diag')) {
+  let sqliteState = 'unavailable';
+  try {
+    const sq = _hostRequire('node:sqlite');
+    if (sq && typeof sq.DatabaseSync === 'function') sqliteState = 'available';
+  } catch (e) {
+    sqliteState = `unavailable (${e && e.message ? e.message : e})`;
+  }
+  process.stdout.write(
+    `node: ${process.version} (${process.platform}-${process.arch})\n` +
+    `packaged: ${process.pkg ? 'yes' : 'no'}\n` +
+    `node:sqlite: ${sqliteState}\n`
+  );
+  process.exit(0);
+}
+
 (function loadHostExtensions() {
   const candidates = [
     path.join(_hostDir, 'host-ext.js'),

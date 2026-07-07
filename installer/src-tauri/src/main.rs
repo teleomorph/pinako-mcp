@@ -42,14 +42,16 @@ const PROD_EXT_ID: Option<&str> = Some("clakbccnkfpmpfooiiffomhknnfcodgd");
 
 // The MCP service binary is embedded at compile time.
 // build.js runs esbuild+pkg first, so the binary exists before cargo runs.
+// `static` (not `const`): the payload is ~90 MB and a `const`'s value may be
+// re-materialized during codegen — at opt-level 3 that exhausts LLVM memory.
 #[cfg(target_os = "windows")]
-const SERVICE_BINARY: &[u8] = include_bytes!("../../../dist/pinako-mcp-service.exe");
+static SERVICE_BINARY: &[u8] = include_bytes!("../../../dist/pinako-mcp-service.exe");
 
 #[cfg(target_os = "linux")]
-const SERVICE_BINARY: &[u8] = include_bytes!("../../../dist/pinako-mcp-service-linux-x64");
+static SERVICE_BINARY: &[u8] = include_bytes!("../../../dist/pinako-mcp-service-linux-x64");
 
 #[cfg(target_os = "macos")]
-const SERVICE_BINARY: &[u8] = include_bytes!("../../../dist/pinako-mcp-service-mac-arm64");
+static SERVICE_BINARY: &[u8] = include_bytes!("../../../dist/pinako-mcp-service-mac-arm64");
 
 // ── Platform paths ────────────────────────────────────────────────────────────
 

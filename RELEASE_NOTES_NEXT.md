@@ -6,4 +6,5 @@
 
 ## What's new
 
-_(nothing yet)_
+- **Modernized the packaged runtime.** The service binary, CLI installers, and GUI installer now embed **Node 24 LTS** (previously Node 18). The build pipeline moved from the archived `vercel/pkg` to its maintained fork **`@yao-pkg/pkg`** — the old packager is no longer maintained and is capped at Node 18. No feature changes; all five platform targets (Windows x64, macOS x64/arm64, Linux x64/arm64) build as before.
+- **New `--diag` flag** on the service binary: prints runtime diagnostics (embedded Node version, packaged mode, core-module availability) and exits. Useful for verifying an installed build.

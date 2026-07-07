@@ -1,6 +1,6 @@
 [package]
 name = "pinako-installer"
-version = "1.1.2"
+version = "1.1.3"
 edition = "2021"
 
 [build-dependencies]
@@ -14,3 +14,12 @@ dirs       = "5"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+
+# The embedded service binary is ~90 MB; codegen of a payload that size makes
+# rustc/LLVM memory-hungry (observed OOM at opt-level 3 always, and at 1 under
+# ambient memory pressure). codegen-units = 1 keeps it to a single LLVM
+# instance instead of up to 16 in parallel. The installer is I/O-bound —
+# neither optimization level nor compile parallelism matters for it.
+[profile.release]
+opt-level = 1
+codegen-units = 1

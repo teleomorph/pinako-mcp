@@ -41,30 +41,31 @@ const buildAll        = process.argv.includes('--all');
 const skipTauri       = process.argv.includes('--no-tauri');
 const skipCliInstaller = process.argv.includes('--no-cli');
 
-const TARGETS_DEFAULT = ['node18-win-x64'];
+// Node 24 LTS via @yao-pkg/pkg (vercel/pkg is archived and capped at node18).
+const TARGETS_DEFAULT = ['node24-win-x64'];
 const TARGETS_ALL = [
-  'node18-win-x64',
-  'node18-macos-x64',
-  'node18-macos-arm64',
-  'node18-linux-x64',
-  'node18-linux-arm64',
+  'node24-win-x64',
+  'node24-macos-x64',
+  'node24-macos-arm64',
+  'node24-linux-x64',
+  'node24-linux-arm64',
 ];
 const TARGETS = buildAll ? TARGETS_ALL : TARGETS_DEFAULT;
 
 const EXE_SUFFIX = {
-  'node18-win-x64':       'pinako-mcp-service.exe',
-  'node18-macos-x64':     'pinako-mcp-service-mac-x64',
-  'node18-macos-arm64':   'pinako-mcp-service-mac-arm64',
-  'node18-linux-x64':     'pinako-mcp-service-linux-x64',
-  'node18-linux-arm64':   'pinako-mcp-service-linux-arm64',
+  'node24-win-x64':       'pinako-mcp-service.exe',
+  'node24-macos-x64':     'pinako-mcp-service-mac-x64',
+  'node24-macos-arm64':   'pinako-mcp-service-mac-arm64',
+  'node24-linux-x64':     'pinako-mcp-service-linux-x64',
+  'node24-linux-arm64':   'pinako-mcp-service-linux-arm64',
 };
 
 const CLI_INSTALLER_SUFFIX = {
-  'node18-win-x64':       'pinako-ai-bridge-cli-win-x64.exe',
-  'node18-macos-x64':     'pinako-ai-bridge-cli-mac-x64',
-  'node18-macos-arm64':   'pinako-ai-bridge-cli-mac-arm64',
-  'node18-linux-x64':     'pinako-ai-bridge-cli-linux-x64',
-  'node18-linux-arm64':   'pinako-ai-bridge-cli-linux-arm64',
+  'node24-win-x64':       'pinako-ai-bridge-cli-win-x64.exe',
+  'node24-macos-x64':     'pinako-ai-bridge-cli-mac-x64',
+  'node24-macos-arm64':   'pinako-ai-bridge-cli-mac-arm64',
+  'node24-linux-x64':     'pinako-ai-bridge-cli-linux-x64',
+  'node24-linux-arm64':   'pinako-ai-bridge-cli-linux-arm64',
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -72,6 +73,20 @@ const CLI_INSTALLER_SUFFIX = {
 function run(cmd, opts = {}) {
   console.log(`  \x1b[2m$ ${cmd}\x1b[0m`);
   execSync(cmd, { stdio: 'inherit', cwd: ROOT, ...opts });
+}
+
+// Retry-once wrapper for the two stages that can flake on Windows: AV/indexer
+// briefly locks large freshly-written artifacts (pkg hits EBUSY rewriting
+// them), and the Tauri compile of the ~90 MB embedded payload can OOM under
+// ambient memory pressure. One retry after a pause clears both in practice.
+function runWithRetry(cmd, opts = {}) {
+  try {
+    run(cmd, opts);
+  } catch (e) {
+    console.log(`  \x1b[33m⚠\x1b[0m  Command failed (${e.message.split('\n')[0]}); retrying once in 15s...`);
+    execSync(process.platform === 'win32' ? 'timeout /t 15 /nobreak >nul' : 'sleep 15', { stdio: 'ignore', shell: true });
+    run(cmd, opts);
+  }
 }
 
 function step(msg) {
@@ -99,13 +114,12 @@ function esbuildBundle(entryPoint, outFile) {
 // ─── Stage 2: pkg ─────────────────────────────────────────────────────────────
 
 function pkgWrap(bundleFile, target, outFile) {
-  run(
+  runWithRetry(
     `npx pkg "${bundleFile}"` +
     ` --target ${target}` +
     ` --output "${outFile}"` +
     ` --no-bytecode` +
-    ` --public` +
-    ` --no-warnings`
+    ` --public`
   );
 }
 
@@ -130,7 +144,7 @@ function buildTauriInstaller() {
   }
 
   step('Stage 3: building Tauri installer...');
-  run('npx tauri build', { cwd: INSTALLER });
+  runWithRetry('npx tauri build', { cwd: INSTALLER });
 
   // Copy the release binary to dist/
   const targetDir = path.join(INSTALLER, 'src-tauri', 'target', 'release');
