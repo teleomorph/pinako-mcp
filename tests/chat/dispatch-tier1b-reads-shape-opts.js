@@ -14,7 +14,8 @@
 //     include_opened_date:  default true; openedDate
 //     include_tags:         default true; tags[]
 //     include_memos:        default true; memoText
-//     include_lineage:      default true; parentWindow/parentGroup/collapsed
+//     include_lineage:      default true; collapsed (parentWindow/parentGroup
+//                           reads removed 2026-07-16 — were never populated)
 //     include_chrome_tab_groups: default true; chromeGroupId/Title/Color on tab nodes
 //     include_star_color:   default true; starColor
 //     include_row_color:    default true; rowColor
@@ -148,7 +149,9 @@ async function runTier1bReadsShapeOpts() {
         return { memoId: memoNode.id };
     });
 
-    // ─── 4. include_lineage:false strips collapsed / parentWindow / parentGroup
+    // ─── 4. include_lineage:false strips collapsed. parentWindow/parentGroup
+    // stay in the absence sweep as tripwires: since 2026-07-16 the serializer
+    // never emits them under ANY flags (the reads were dead — never populated).
     await check('get_tree({include_lineage:false}): collapsed/parentWindow/parentGroup absent everywhere', async () => {
         const def = await dispatch('get_tree', {});
         const collapsedNode = findFirst(def.tree, n => 'collapsed' in n);

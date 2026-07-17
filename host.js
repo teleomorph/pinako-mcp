@@ -2026,7 +2026,7 @@ function stripFavicons(node) {
 // the lite shape per field. Field-level defaults match the pre-2026-05-19
 // MCP lite shape for fields MCP already returned (openedDate, tags, memoText,
 // collapsed all default-true) PLUS adds the chat-side fields for parity
-// (parentWindow, parentGroup, chromeGroupId/Title/Color, starColor, rowColor,
+// (chromeGroupId/Title/Color, starColor, rowColor,
 // customTitle all default-true; only emitted when present, so cheap-when-
 // absent — most existing MCP callers see no behavior change since these
 // fields are typically unset on tab nodes). The mutation engine + audit log
@@ -2069,14 +2069,22 @@ function liteNode(node, scope, libraryId, opts) {
   if (wantMemos && node.memoText) out.memoText = node.memoText;
 
   if (wantLineage) {
-    if (node.parentWindow) out.parentWindow = node.parentWindow;
-    if (node.parentGroup) out.parentGroup = node.parentGroup;
+    // Collapsed flag only. parentWindow/parentGroup reads removed 2026-07-16:
+    // nothing ever assigns those fields on tree nodes (they exist only on the
+    // flat entries the extension's semantic-search context builders create,
+    // so the reads were dead since 2026-05-19). Ancestry is conveyed
+    // structurally by nested `children`; flat search_pinako hits carry
+    // parentPath; minimal mode carries parentId.
     if (node.collapsed) out.collapsed = true;
   }
-  if (wantChromeGroups) {
-    if (node.chromeGroupId != null) out.chromeGroupId = node.chromeGroupId;
-    if (node.chromeGroupTitle) out.chromeGroupTitle = node.chromeGroupTitle;
-    if (node.chromeGroupColor) out.chromeGroupColor = node.chromeGroupColor;
+  if (wantChromeGroups && node.type === 'tab' && node.groupSnapshot) {
+    // Sourced from groupSnapshot {groupId, title, color}. Live groupId is
+    // suppressed on ghosts (chromeId === null) and absent on library clones
+    // (stored as null) — title/color are the durable group identity.
+    const gs = node.groupSnapshot;
+    if (gs.groupId != null && node.chromeId !== null) out.chromeGroupId = gs.groupId;
+    if (gs.title) out.chromeGroupTitle = gs.title;
+    if (gs.color) out.chromeGroupColor = gs.color;
   }
   if (wantStarColor && node.starColor) out.starColor = node.starColor;
   if (wantRowColor && node.rowColor) out.rowColor = node.rowColor;
@@ -2742,7 +2750,7 @@ function createMcpServer() {
         '"full" (everything in source data EXCEPT favicons; useful only for visual-field workflows). ' +
         'Favicons are NEVER returned unless include_favicons:true (they\'re 1-3KB base64 blobs of zero agent value). ' +
         'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N}. Items lose tree nesting but carry parentId so hierarchy can be reconstructed. Designed for paginating large trees — read 500 items, act on them (e.g. tag or move via bulk_apply), then read the next 500 via nextCursor. Cursor is robust to list churn: if the cursor node was moved between calls, pagination restarts from index 0 (the agent should still progress because moved items no longer appear in the flat list). ' +
-        'SHAPE COMPOSITION (2026-05-19): per-field opt-ins are now available alongside `mode` for finer control. They apply when mode is "lite" (default) or unset. Defaults match the prior lite shape PLUS add parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present (these were previously emitted only on chat surface; added to MCP for parity). Pass `minimal:true` to shrink lite to basics-only (id/type/title/url/ghost); pass any individual `include_*:false` to opt out of a specific field group, or `include_favicons:true` to opt in to per-tab favIconUrl base64 (heavy: 1-3KB per tab, useful only for color-organize workflows that sample favicon colors). Composable opts take precedence over `mode` when both are passed.' +
+        'SHAPE COMPOSITION (2026-05-19): per-field opt-ins are now available alongside `mode` for finer control. They apply when mode is "lite" (default) or unset. Defaults match the prior lite shape PLUS add chromeGroupId/Title/Color/starColor/rowColor/customTitle when present (added to MCP for parity with the chat surface). Pass `minimal:true` to shrink lite to basics-only (id/type/title/url/ghost); pass any individual `include_*:false` to opt out of a specific field group, or `include_favicons:true` to opt in to per-tab favIconUrl base64 (heavy: 1-3KB per tab, useful only for color-organize workflows that sample favicon colors). Composable opts take precedence over `mode` when both are passed.' +
         FRESHNESS_HINT,
       inputSchema: {
         mode: z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "lite". Composable opts (minimal + include_*) take precedence when both are passed.'),
@@ -2756,7 +2764,7 @@ function createMcpServer() {
         include_opened_date:       z.boolean().optional().describe('Include openedDate on tab nodes (Unix ms timestamp). Default true.'),
         include_tags:              z.boolean().optional().describe('Include the tags array per node. Default true.'),
         include_memos:             z.boolean().optional().describe('Include memoText per node. Default true.'),
-        include_lineage:           z.boolean().optional().describe('Include parentWindow + parentGroup pointers + collapsed flag. Default true. Useful for understanding tree position and which subtrees the user has folded up.'),
+        include_lineage:           z.boolean().optional().describe('Include the collapsed flag (which subtrees the user has folded up). Default true. Tree position/ancestry needs no flag — the nested children structure conveys it (or parentId in minimal/paginated mode).'),
         include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId + chromeGroupTitle + chromeGroupColor metadata on tab nodes (the colored-strip Chromium Tab Group in Chrome\'s tab bar, mirrored read-only). NOT to be confused with Pinako Group nodes (type="group"), which are always returned as nodes regardless of this flag. Default true.'),
         include_star_color:        z.boolean().optional().describe('Include per-node starColor when set. Default true (cheap when absent).'),
         include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set (Pinako Group / Folder background tint). Default true (cheap when absent).'),
@@ -2807,7 +2815,7 @@ function createMcpServer() {
     'search_tabs',
     {
       description: 'LITERAL substring search across main-tree TAB nodes ONLY (groups, windows, folders, libraries, bookmarks, and notes are NOT searched here). Matches title, URL, memo text, and tags. Kept for backward compatibility — for broader literal search across non-tab nodes, libraries, bookmarks, and notes content, USE search_pinako instead (it is the omnibus version with a scope parameter). Use ONLY when the user names a literal substring ("tabs from stackoverflow.com", "the tab titled exactly X"). For SEMANTIC / categorical intent ("find my exercise tabs", "anything about gardening") do NOT iterate this tool with synonyms — instead call get_tree({mode:"minimal"}) + list_libraries({include_tabs:true, mode:"minimal"}) and match in your own head. See SEARCH SCOPE in server instructions. Mode param: "minimal" (flat, compact URLs — default for this tool since results are already a focused list), "lite" (tree shape), "full" (everything except favicons). ' +
-        'SHAPE COMPOSITION (2026-05-20, active when mode is "lite" or unset): per-field opt-ins are available alongside `mode` for finer control over each result node. Defaults match the prior lite shape PLUS parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
+        'SHAPE COMPOSITION (2026-05-20, active when mode is "lite" or unset): per-field opt-ins are available alongside `mode` for finer control over each result node. Defaults match the prior lite shape PLUS chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
       inputSchema: {
         query: z.string().describe('LITERAL substring (case-insensitive). For semantic intent, prefer get_tree.'),
         mode:  z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "minimal" since search results are already a focused list. Composable opts (minimal + include_*) take precedence when both are passed.'),
@@ -2819,7 +2827,7 @@ function createMcpServer() {
         include_opened_date:       z.boolean().optional().describe('Include openedDate on tab nodes (Unix ms timestamp). Default true.'),
         include_tags:              z.boolean().optional().describe('Include the tags array per node. Default true.'),
         include_memos:             z.boolean().optional().describe('Include memoText per node. Default true.'),
-        include_lineage:           z.boolean().optional().describe('Include parentWindow + parentGroup pointers + collapsed flag. Default true.'),
+        include_lineage:           z.boolean().optional().describe('Include the collapsed flag. Default true.'),
         include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId + chromeGroupTitle + chromeGroupColor metadata on tab nodes (Chromium Tab Group, NOT Pinako Group nodes type="group"). Default true.'),
         include_star_color:        z.boolean().optional().describe('Include per-node starColor when set. Default true (cheap when absent).'),
         include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set. Default true (cheap when absent).'),
@@ -3025,7 +3033,7 @@ function createMcpServer() {
     {
       description: 'Lists all Pinako libraries. Default: returns id, title, description, tabCount, and note metadata (id+title only, NO note content). Pass include_tabs:true to ALSO embed every library\'s tabs — the right call for cross-library searches ("find exercise tabs across all my libraries"), avoiding N separate get_library round-trips. With include_tabs, default mode is "minimal" (flat, compact URLs). Note CONTENT is never returned here; use get_library({mode:"full"}) if you need actual rich-text note bodies. Also returns the panel structure (groups + panel_order) needed as input to reorder_library_panel — always call this before any reorder op to source fresh group ids and panel positions. ' +
         'PAGINATION (Slice S2a): pass `after` (last-seen library id) and/or `limit` (default 50) to chunk through libraries when the user has many. Returns {items:[...libraries...], nextCursor:..., totalItems:N, groups:[...], panel_order:[...]}. Pagination applies to the libraries array only — groups and panel_order are always returned in full (they are small metadata). When include_tabs:true is set alongside pagination, embedded tabs are kept tree-shaped within each library entry (use get_library with pagination if you need to chunk through a single huge library\'s tabs). ' +
-        'SHAPE COMPOSITION (2026-05-19, active only when include_tabs:true and mode is "lite" or unset): per-field opt-ins are available alongside `mode` for the embedded children. Defaults match the prior lite shape plus parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink embedded children to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
+        'SHAPE COMPOSITION (2026-05-19, active only when include_tabs:true and mode is "lite" or unset): per-field opt-ins are available alongside `mode` for the embedded children. Defaults match the prior lite shape plus chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink embedded children to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
       inputSchema: {
         include_tabs: z.boolean().optional().describe('Embed each library\'s tabs in the response. Default false. Use this for cross-library semantic search in one call.'),
         mode:         z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy mode for embedded tabs (only used when include_tabs:true). Default "minimal". Composable opts (minimal + include_*) take precedence when both are passed.'),
@@ -3038,7 +3046,7 @@ function createMcpServer() {
         include_opened_date:       z.boolean().optional().describe('Shape opt (when include_tabs:true): include openedDate on tab nodes. Default true.'),
         include_tags:              z.boolean().optional().describe('Shape opt (when include_tabs:true): include the tags array per node. Default true.'),
         include_memos:             z.boolean().optional().describe('Shape opt (when include_tabs:true): include memoText per node. Default true.'),
-        include_lineage:           z.boolean().optional().describe('Shape opt (when include_tabs:true): include parentWindow + parentGroup pointers + collapsed flag. Default true.'),
+        include_lineage:           z.boolean().optional().describe('Shape opt (when include_tabs:true): include the collapsed flag. Default true.'),
         include_chrome_tab_groups: z.boolean().optional().describe('Shape opt (when include_tabs:true): include chromeGroupId/Title/Color metadata on tab nodes (Chromium Tab Group, NOT Pinako Group nodes). Default true.'),
         include_star_color:        z.boolean().optional().describe('Shape opt (when include_tabs:true): include per-node starColor when set. Default true.'),
         include_row_color:         z.boolean().optional().describe('Shape opt (when include_tabs:true): include per-node rowColor when set. Default true.'),
@@ -3113,7 +3121,7 @@ function createMcpServer() {
     {
       description: 'Returns one library\'s contents. Three legacy modes: "minimal" (FLAT, compact URLs, drops children/collapsed/ghost — best for scanning), "lite" (DEFAULT — tree shape, full URLs, drops favicons and note content), "full" (everything including rich-text note bodies, but NO favicons unless include_favicons:true). Use "full" when you specifically need to read a note\'s rich-text body or visual properties. ' +
         'PAGINATION (Slice S2a): pass `after` (last-seen node id) and/or `limit` (default 500) to receive a FLAT paginated response: {items:[...], nextCursor:..., totalItems:N, library:{id,title,description}, notes:[...]} — the library\'s tabs/windows/groups/folders are paginated; metadata + note titles are returned at the top level. Cursor is robust to list churn. ' +
-        'SHAPE COMPOSITION (2026-05-19, active when mode is "lite" or unset): per-field opt-ins are available alongside `mode` for finer control over the children tree shape. Defaults match the prior lite shape PLUS add parentWindow/parentGroup/chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink children to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
+        'SHAPE COMPOSITION (2026-05-19, active when mode is "lite" or unset): per-field opt-ins are available alongside `mode` for finer control over the children tree shape. Defaults match the prior lite shape PLUS add chromeGroupId/Title/Color/starColor/rowColor/customTitle when present. Pass `minimal:true` to shrink children to basics-only; pass any individual `include_*:false` to opt out; pass `include_favicons:true` for per-tab favIconUrl (heavy: 1-3KB per tab). Composable opts take precedence over `mode` when both are passed.' + FRESHNESS_HINT,
       inputSchema: {
         library_id: z.string().describe('Library id from list_libraries'),
         mode:       z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "lite". Composable opts (minimal + include_*) take precedence when both are passed.'),
@@ -3126,7 +3134,7 @@ function createMcpServer() {
         include_opened_date:       z.boolean().optional().describe('Include openedDate on tab nodes. Default true.'),
         include_tags:              z.boolean().optional().describe('Include the tags array per node. Default true.'),
         include_memos:             z.boolean().optional().describe('Include memoText per node. Default true.'),
-        include_lineage:           z.boolean().optional().describe('Include parentWindow + parentGroup pointers + collapsed flag. Default true.'),
+        include_lineage:           z.boolean().optional().describe('Include the collapsed flag. Default true.'),
         include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId/Title/Color metadata on tab nodes (Chromium Tab Group, NOT Pinako Group nodes). Default true.'),
         include_star_color:        z.boolean().optional().describe('Include per-node starColor when set. Default true.'),
         include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set. Default true.'),

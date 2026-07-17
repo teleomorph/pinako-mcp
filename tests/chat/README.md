@@ -173,7 +173,7 @@ The lite-node shape was previously fixed; it's now composable per-field:
 | `include_opened_date`       | `true`  | drop `openedDate` |
 | `include_tags`              | `true`  | drop `tags[]` |
 | `include_memos`             | `true`  | drop `memoText` |
-| `include_lineage`           | `true`  | drop `parentWindow` / `parentGroup` / `collapsed` |
+| `include_lineage`           | `true`  | drop `collapsed` (`parentWindow` / `parentGroup` reads removed 2026-07-16 — were never populated) |
 | `include_chrome_tab_groups` | `true`  | drop `chromeGroupId` / `chromeGroupTitle` / `chromeGroupColor` on tab nodes (Pinako Group nodes always returned regardless) |
 | `include_star_color`        | `true`  | drop `starColor` |
 | `include_row_color`         | `true`  | drop `rowColor` |
@@ -186,7 +186,7 @@ The lite-node shape was previously fixed; it's now composable per-field:
 | `get_tree({minimal:true})` | every node has only `{id, type, title, url, ghost, children}` keys — strict basics-set; 0 violators |
 | `get_tree({include_tags:false})` | tags absent on previously-tagged node + no `tags` key anywhere in the tree |
 | `get_tree({include_memos:false})` | `memoText` absent on previously-memoed node + zero leaks |
-| `get_tree({include_lineage:false})` | `collapsed` / `parentWindow` / `parentGroup` absent everywhere |
+| `get_tree({include_lineage:false})` | `collapsed` / `parentWindow` / `parentGroup` absent everywhere (the latter two are tripwires — never emitted under any flags since 2026-07-16) |
 | `get_tree({include_star_color:false})` | `starColor` absent on previously-starred node + zero leaks |
 | `get_tree({include_favicons:true})` | default has zero `favIconUrl`s; opt-in surfaces at least one |
 | `get_tree({include_ghost_tabs:false})` | zero ghost tabs at any depth (regression-verification for `f147a88` chat ghost-filter recursion fix) |
