@@ -8,7 +8,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { SERVICE_PATH } from './paths.js';
+import { spawnSync } from 'node:child_process';
+import { HOME, SERVICE_PATH } from './paths.js';
 
 const MCP_URL = 'http://127.0.0.1:37421/mcp';
 
@@ -62,6 +63,26 @@ function readJson(filePath) {
 function writeJson(filePath, obj) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(obj, null, 2) + '\n', 'utf8');
+}
+
+// readJson() above deliberately swallows parse errors and returns {} — safe for
+// the small per-client MCP config files we own outright (a 0-byte or corrupt
+// mcp.json should just be replaced). It is NOT safe for a large stateful file
+// the client owns, where {} would silently destroy the user's data. Use this
+// instead there: missing → null (create it), unparseable → throw (leave it be).
+function readJsonStrict(filePath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+  if (!raw.trim()) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`${filePath} exists but is not valid JSON (${e.message}) — refusing to overwrite it`);
+  }
 }
 
 // Deep-merge src into dst (one level for mcpServers, not recursive)
@@ -119,15 +140,89 @@ function buildPinakoTomlBlock(nl) {
   ].join(nl);
 }
 
+// ─── Claude Code helpers ─────────────────────────────────────────────────────
+// Claude Code stores MCP servers in ~/.claude.json (both `local` and `user`
+// scope) or in a project-root .mcp.json. It does NOT read them from
+// ~/.claude/settings.json — that file only carries *approval* flags
+// (enabledMcpjsonServers / disabledMcpjsonServers) for servers defined
+// elsewhere. We wrote settings.json up to 2026-07-23, so every install since
+// the bridge shipped registered a server Claude Code silently ignored.
+// Re-installs now clean that stale key up as well as writing the real one.
+//
+// Preferred path is the documented CLI (`claude mcp add --scope user`): it owns
+// the file's schema and locking, and ~/.claude.json is a large live file Claude
+// Code writes to constantly. Direct merge is the fallback for machines where
+// the launcher isn't on PATH.
+
+const CLAUDE_JSON_PATH = path.join(HOME, '.claude.json');
+const CLAUDE_SETTINGS_PATH = path.join(HOME, '.claude', 'settings.json');
+
+// Windows resolves the `claude.cmd` npm shim only via cmd — Node refuses to
+// spawn .cmd directly, and `shell: true` would emit a DEP0190 warning into the
+// installer's output. Going through `cmd /c` explicitly avoids both.
+function runClaudeCli(args) {
+  const win = process.platform === 'win32';
+  const res = win
+    ? spawnSync('cmd', ['/c', 'claude', ...args], { stdio: 'ignore', timeout: 60_000 })
+    : spawnSync('claude', args, { stdio: 'ignore', timeout: 60_000 });
+  return res.status === 0;
+}
+
+function addViaClaudeCli() {
+  // `claude mcp add` errors when the name is taken, so drop any prior entry
+  // first. A missing entry makes remove fail harmlessly — ignore its status.
+  runClaudeCli(['mcp', 'remove', 'pinako', '--scope', 'user']);
+  return runClaudeCli(['mcp', 'add', '--scope', 'user', '--transport', 'http', 'pinako', MCP_URL]);
+}
+
+function addViaClaudeJsonMerge() {
+  const config = readJsonStrict(CLAUDE_JSON_PATH) || {};
+  config.mcpServers = config.mcpServers || {};
+  config.mcpServers.pinako = { type: 'http', url: MCP_URL };
+  writeJson(CLAUDE_JSON_PATH, config);
+}
+
+// Remove the entry earlier installers wrote to the file Claude Code ignores, so
+// a stale 127.0.0.1 record can't shadow the real one in a user's mental model.
+function pruneStaleClaudeSettingsEntry() {
+  let config;
+  try {
+    config = readJsonStrict(CLAUDE_SETTINGS_PATH);
+  } catch {
+    return; // unparseable settings.json is the user's business, not ours
+  }
+  if (!config?.mcpServers?.pinako) return;
+  delete config.mcpServers.pinako;
+  if (Object.keys(config.mcpServers).length === 0) delete config.mcpServers;
+  writeJson(CLAUDE_SETTINGS_PATH, config);
+}
+
+// ─── Antigravity helpers ─────────────────────────────────────────────────────
+// Antigravity reads `~/.gemini/config/mcp_config.json` (global) or a workspace
+// `.agents/mcp_config.json`. It used to read a per-tool
+// `~/.gemini/antigravity/mcp_config.json`; current builds migrate that forward
+// and drop a `.migrated` marker beside the new file. HTTP entries use the
+// `serverUrl` key — `url` and `httpUrl` are explicitly unsupported.
+
+const ANTIGRAVITY_LEGACY_PATH =
+  path.join(HOME, '.gemini', 'antigravity', 'mcp_config.json');
+
+function writeAntigravityConfig(configPath) {
+  const config = readJson(configPath);
+  config.mcpServers = config.mcpServers || {};
+  config.mcpServers.pinako = { serverUrl: MCP_URL };
+  writeJson(configPath, config);
+}
+
 // ─── Per-client config writers ────────────────────────────────────────────────
 
 const writers = {
 
-  'claude-code'(configPath) {
-    const config = readJson(configPath);
-    config.mcpServers = config.mcpServers || {};
-    config.mcpServers.pinako = { type: 'http', url: MCP_URL };
-    writeJson(configPath, config);
+  'claude-code'() {
+    // configPath is ignored: which file we touch depends on whether the CLI is
+    // available, and we clean a second file either way.
+    if (!addViaClaudeCli()) addViaClaudeJsonMerge();
+    pruneStaleClaudeSettingsEntry();
   },
 
   'claude-desktop'(configPath) {
@@ -159,12 +254,13 @@ const writers = {
   },
 
   'antigravity'(configPath) {
-    const config = readJson(configPath);
-    config.mcpServers = config.mcpServers || {};
-    // Antigravity (Google's agent IDE, built by the former Windsurf team) uses
-    // `serverUrl` — NOT `url` — for HTTP MCP servers. Same mcpServers shape.
-    config.mcpServers.pinako = { serverUrl: MCP_URL };
-    writeJson(configPath, config);
+    writeAntigravityConfig(configPath);
+    // Refresh the pre-migration per-tool path too, but only when it already
+    // exists — creating it on a current build would leave an orphan file that
+    // nothing reads and that contradicts the live config.
+    if (configPath !== ANTIGRAVITY_LEGACY_PATH && fs.existsSync(ANTIGRAVITY_LEGACY_PATH)) {
+      writeAntigravityConfig(ANTIGRAVITY_LEGACY_PATH);
+    }
   },
 
   'cline'(configPath) {

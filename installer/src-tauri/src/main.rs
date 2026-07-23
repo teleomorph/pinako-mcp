@@ -457,15 +457,100 @@ fn ensure_obj(v: &mut serde_json::Value, key: &str) {
     }
 }
 
+/// read_json() above falls back to `{}` on a parse error — fine for the small
+/// per-client MCP config files we own outright, fatal for a large stateful file
+/// the client owns. Missing/empty → Ok(None) (create it); unparseable → Err
+/// (leave it alone). Mirrors readJsonStrict() in setup/configure.js.
+fn read_json_strict(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| format!("{} exists but is not valid JSON ({e}) — refusing to overwrite it",
+                             path.display()))
+}
+
+// ── Claude Code ──────────────────────────────────────────────────────────────
+// Claude Code reads MCP servers from ~/.claude.json (local + user scope) or a
+// project-root .mcp.json — never from ~/.claude/settings.json, which only holds
+// approval flags for .mcp.json servers. Installers wrote settings.json up to
+// 2026-07-23; those entries were silently ignored. Prefer the documented CLI,
+// which owns the file's schema and locking; merge directly only as a fallback.
+// Mirrors the writer in setup/configure.js.
+
+fn run_claude_cli(args: &[&str]) -> bool {
+    // Windows resolves the `claude.cmd` npm shim only through a shell.
+    #[cfg(target_os = "windows")]
+    let out = std::process::Command::new("cmd")
+        .arg("/c")
+        .arg("claude")
+        .args(args)
+        .output();
+    #[cfg(not(target_os = "windows"))]
+    let out = std::process::Command::new("claude").args(args).output();
+
+    matches!(out, Ok(o) if o.status.success())
+}
+
+fn configure_claude_code(home: &Path) -> Result<(), String> {
+    // `claude mcp add` errors when the name is taken; a missing entry makes
+    // remove fail harmlessly, so its status is deliberately ignored.
+    run_claude_cli(&["mcp", "remove", "pinako", "--scope", "user"]);
+    let added = run_claude_cli(&[
+        "mcp", "add", "--scope", "user", "--transport", "http", "pinako", MCP_URL,
+    ]);
+
+    if !added {
+        let path = home.join(".claude.json");
+        let mut cfg = read_json_strict(&path)?.unwrap_or_else(|| serde_json::json!({}));
+        ensure_obj(&mut cfg, "mcpServers");
+        cfg["mcpServers"]["pinako"] = serde_json::json!({ "type": "http", "url": MCP_URL });
+        write_json(&path, &cfg)?;
+    }
+
+    prune_stale_claude_settings_entry(home);
+    Ok(())
+}
+
+/// Drop the entry earlier installers wrote to the file Claude Code ignores.
+fn prune_stale_claude_settings_entry(home: &Path) {
+    let path = home.join(".claude").join("settings.json");
+    // An unparseable settings.json is the user's business, not ours.
+    let Ok(Some(mut cfg)) = read_json_strict(&path) else { return };
+    if !cfg["mcpServers"]["pinako"].is_object() {
+        return;
+    }
+    if let Some(servers) = cfg["mcpServers"].as_object_mut() {
+        servers.remove("pinako");
+        if servers.is_empty() {
+            if let Some(root) = cfg.as_object_mut() {
+                root.remove("mcpServers");
+            }
+        }
+    }
+    let _ = write_json(&path, &cfg);
+}
+
+// ── Antigravity ──────────────────────────────────────────────────────────────
+// Global MCP config is ~/.gemini/config/mcp_config.json; current builds migrate
+// the old per-tool ~/.gemini/antigravity path forward. HTTP entries use
+// `serverUrl` — `url` and `httpUrl` are explicitly unsupported.
+
+fn write_antigravity_config(path: &Path) -> Result<(), String> {
+    let mut cfg = read_json(path);
+    ensure_obj(&mut cfg, "mcpServers");
+    cfg["mcpServers"]["pinako"] = serde_json::json!({ "serverUrl": MCP_URL });
+    write_json(path, &cfg)
+}
+
 fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String> {
     match id {
-        "claude-code" => {
-            let path = home.join(".claude").join("settings.json");
-            let mut cfg = read_json(&path);
-            ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "type": "http", "url": MCP_URL });
-            write_json(&path, &cfg)
-        }
+        "claude-code" => configure_claude_code(home),
         "claude-desktop" => {
             let mut errs: Vec<String> = Vec::new();
             let mut wrote = false;
@@ -503,12 +588,16 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             write_json(&path, &cfg)
         }
         "antigravity" => {
-            // Antigravity uses `serverUrl` (not `url`) for HTTP MCP servers.
-            let path = home.join(".gemini").join("antigravity").join("mcp_config.json");
-            let mut cfg = read_json(&path);
-            ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "serverUrl": MCP_URL });
-            write_json(&path, &cfg)
+            write_antigravity_config(
+                &home.join(".gemini").join("config").join("mcp_config.json"))?;
+            // Refresh the pre-migration per-tool path too, but only when it
+            // already exists — creating it on a current build would leave an
+            // orphan file that nothing reads.
+            let legacy = home.join(".gemini").join("antigravity").join("mcp_config.json");
+            if legacy.exists() {
+                write_antigravity_config(&legacy)?;
+            }
+            Ok(())
         }
         "cline" => {
             let path = appdata

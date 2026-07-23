@@ -15,7 +15,11 @@ export const CLIENTS = [
   {
     id: 'claude-code',
     label: 'Claude Code',
-    configPath: path.join(HOME, '.claude', 'settings.json'),
+    // MCP servers live in ~/.claude.json (local + user scope), NOT in
+    // ~/.claude/settings.json — that file only holds approval flags for
+    // .mcp.json servers. The writer prefers `claude mcp add --scope user` and
+    // only merges this file directly when the CLI isn't on PATH.
+    configPath: path.join(HOME, '.claude.json'),
     detectPath: path.join(HOME, '.claude'),
     detectType: 'dir',
     note: null,
@@ -47,10 +51,13 @@ export const CLIENTS = [
   {
     id: 'antigravity',
     label: 'Antigravity',
-    // Google's agent IDE, built by the former Windsurf team. Config lives at
-    // ~/.gemini/antigravity/mcp_config.json (NOT .codeium). HTTP entries use the
-    // `serverUrl` key, not `url` — see the writer in configure.js.
-    configPath: path.join(HOME, '.gemini', 'antigravity', 'mcp_config.json'),
+    // Google's agent IDE, built by the former Windsurf team. Global MCP config
+    // lives at ~/.gemini/config/mcp_config.json (NOT .codeium, and no longer
+    // the per-tool ~/.gemini/antigravity path — current builds migrate that
+    // forward). HTTP entries use `serverUrl`, not `url` — see configure.js.
+    // Detection stays on the data dir: ~/.gemini/config is shared with the
+    // Gemini CLI, so it would false-positive without Antigravity installed.
+    configPath: path.join(HOME, '.gemini', 'config', 'mcp_config.json'),
     detectPath: path.join(HOME, '.gemini', 'antigravity'),
     detectType: 'dir',
     note: null,
