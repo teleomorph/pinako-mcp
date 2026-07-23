@@ -1432,6 +1432,11 @@ const PAGINATION_DEFAULT_LIMITS = {
 // `opts` (2026-05-19): composable shape opt-ins for the lite branch. Pass-
 // through to liteNode (then children are stripped since pagination is flat).
 // Ignored by minimal and full modes (their shapes are fixed).
+//
+// Flat pagination shapes each node in isolation, so the tabgroup-ancestor
+// inheritance liteNode does through its own children recursion has to be
+// threaded here too (N5) — otherwise a paginated read of a containment-world
+// tree drops the per-tab chromeGroup* fields that the nested read emits.
 function _flattenTreeWithMode(nodes, scope, libraryId, mode, includeFavicons, opts, parentId = null, out = []) {
   if (!Array.isArray(nodes)) return out;
   for (const node of nodes) {
@@ -1458,7 +1463,16 @@ function _flattenTreeWithMode(nodes, scope, libraryId, mode, includeFavicons, op
     }
     out.push(shaped);
     if (Array.isArray(node.children) && node.children.length > 0) {
-      _flattenTreeWithMode(node.children, scope, libraryId, mode, includeFavicons, opts, node.id, out);
+      const childOpts = (mode === 'lite' && node.type === 'tabgroup')
+        ? Object.assign({}, opts || {}, {
+            _tgAncestor: {
+              groupId: node.chromeGroupId != null ? node.chromeGroupId : null,
+              title:   node.title || '',
+              color:   node.color || '',
+            },
+          })
+        : opts;
+      _flattenTreeWithMode(node.children, scope, libraryId, mode, includeFavicons, childOpts, node.id, out);
     }
   }
   return out;
@@ -2036,10 +2050,27 @@ function stripFavicons(node) {
 // shape (id, type, title, scope, libraryId, url, ghost). Shortcut for cheap
 // large-tree scans.
 //
-// Pinako Group nodes (type='group') are tree nodes — always returned as
-// nodes regardless of include_chrome_tab_groups. That flag controls only
-// the Chromium Tab Group METADATA fields (chromeGroupId/Title/Color)
-// emitted on individual tab nodes.
+// Window Groups (type='group') are tree nodes — always returned as nodes
+// regardless of include_chrome_tab_groups. That flag controls only the
+// browser Tab Group METADATA fields (chromeGroupId/Title/Color).
+//
+// include_chrome_tab_groups contract (N5, tab-group-node-plan.md). Those
+// fields are emitted for BOTH representations of a browser Tab Group, so
+// existing agent consumers keep a stable tab-level shape across the
+// migration:
+//   - SNAPSHOT world (legacy): read from the member tab's own
+//     groupSnapshot {groupId, title, color}.
+//   - CONTAINMENT world (tabgroup nodes): member tabs carry NO snapshot —
+//     the group identity lives on the type='tabgroup' ANCESTOR node
+//     ({chromeGroupId, title, color}), and every tab in that branch (at any
+//     depth — tabs nested under a member are members too) derives its
+//     fields from it. The tabgroup node ALSO serializes as a typed
+//     container carrying chromeGroupId + chromeGroupColor of its own; its
+//     `title` already IS the group name, so no chromeGroupTitle is added.
+// The ancestor wins when both are somehow present: containment is the
+// structural truth and is what the tree actually renders.
+// Suppression rules are identical in both worlds — a ghost member
+// (chromeId === null) keeps title/color and drops the stale live id.
 function liteNode(node, scope, libraryId, opts) {
   if (!node || typeof node !== 'object') return node;
   opts = opts || {};
@@ -2077,21 +2108,45 @@ function liteNode(node, scope, libraryId, opts) {
     // parentPath; minimal mode carries parentId.
     if (node.collapsed) out.collapsed = true;
   }
-  if (wantChromeGroups && node.type === 'tab' && node.groupSnapshot) {
-    // Sourced from groupSnapshot {groupId, title, color}. Live groupId is
-    // suppressed on ghosts (chromeId === null) and absent on library clones
-    // (stored as null) — title/color are the durable group identity.
-    const gs = node.groupSnapshot;
-    if (gs.groupId != null && node.chromeId !== null) out.chromeGroupId = gs.groupId;
-    if (gs.title) out.chromeGroupTitle = gs.title;
-    if (gs.color) out.chromeGroupColor = gs.color;
+  if (wantChromeGroups && node.type === 'tab') {
+    // Group identity {groupId, title, color}: from the tabgroup ANCESTOR
+    // when the tab sits in a containment branch, else from the tab's own
+    // legacy groupSnapshot. Live groupId is suppressed on ghosts
+    // (chromeId === null) and absent on library clones (stored as null) —
+    // title/color are the durable group identity.
+    const gs = opts._tgAncestor || node.groupSnapshot;
+    if (gs) {
+      if (gs.groupId != null && node.chromeId !== null) out.chromeGroupId = gs.groupId;
+      if (gs.title) out.chromeGroupTitle = gs.title;
+      if (gs.color) out.chromeGroupColor = gs.color;
+    }
+  }
+  if (wantChromeGroups && node.type === 'tabgroup') {
+    // The container itself: its `title` already carries the group name, so
+    // only the id (live only) and the color are added.
+    if (node.chromeGroupId != null) out.chromeGroupId = node.chromeGroupId;
+    if (node.color) out.chromeGroupColor = node.color;
   }
   if (wantStarColor && node.starColor) out.starColor = node.starColor;
   if (wantRowColor && node.rowColor) out.rowColor = node.rowColor;
   if (wantCustomTitle && node.customTitle) out.customTitle = true;
 
   if (Array.isArray(node.children) && node.children.length > 0) {
-    out.children = node.children.map(c => liteNode(c, scope, libraryId, opts));
+    // A tabgroup node stamps its identity onto a DERIVED opts object so its
+    // whole branch inherits it; every other node passes opts through
+    // untouched (no allocation on the common path). Inlined rather than
+    // factored into a helper so liteNode stays self-contained — the smoke
+    // harness slices this one function out of host.js and evals it alone.
+    const childOpts = node.type === 'tabgroup'
+      ? Object.assign({}, opts, {
+          _tgAncestor: {
+            groupId: node.chromeGroupId != null ? node.chromeGroupId : null,
+            title:   node.title || '',
+            color:   node.color || '',
+          },
+        })
+      : opts;
+    out.children = node.children.map(c => liteNode(c, scope, libraryId, childOpts));
   }
   return out;
 }
@@ -2240,7 +2295,14 @@ function resolveBrowserData(browserArg) {
   return { error: multiBrowserError() };
 }
 
-function searchInTree(nodes, query, includeGhost, results = []) {
+// `tgAncestor` (N5) carries the nearest type='tabgroup' ancestor down the walk.
+// Hits are pushed as DETACHED flat copies, so the containment inheritance
+// liteNode performs through its own children recursion cannot run here — the
+// stamp is recorded per hit in `stamps` (index-parallel to `results`) and
+// applied by the caller when it shapes in lite mode. Without it a containment-
+// world member silently loses its chromeGroup* fields on a lite search, while
+// the same tab read via get_tree emits them.
+function searchInTree(nodes, query, includeGhost, results = [], stamps = [], tgAncestor = null) {
   const q = query.toLowerCase();
   for (const node of nodes) {
     // Never expose incognito nodes via MCP
@@ -2263,9 +2325,19 @@ function searchInTree(nodes, query, includeGhost, results = []) {
         const flat = sanitizeNode(node);
         delete flat.children;
         results.push(flat);
+        stamps.push(tgAncestor);
       }
     }
-    if (node.children?.length) searchInTree(node.children, query, includeGhost, results);
+    if (node.children?.length) {
+      const childStamp = node.type === 'tabgroup'
+        ? {
+            groupId: node.chromeGroupId != null ? node.chromeGroupId : null,
+            title:   node.title || '',
+            color:   node.color || '',
+          }
+        : tgAncestor;
+      searchInTree(node.children, query, includeGhost, results, stamps, childStamp);
+    }
   }
   return results;
 }
@@ -2474,7 +2546,7 @@ Write tools fall into four categories:
 - COMPOSITE: bulk_apply (up to 250 sub-ops, atomic, undoable as a single unit).
 
 STRUCTURE RULES (tree + library organization):
-- "Folder" is ONE concept — never reason about folder vs library-folder; pass scope and the engine picks the type. Valid parents: tab → window / folder / ROOT (root auto-wraps it into a window; NEVER directly under a group); window → group / folder / ROOT; group → group / ROOT (groups hold only windows + groups, never loose tabs or folders); folder → folder / ROOT (folders hold mixed tabs/windows/folders; library + bookmark scopes only — the main tree has no folders).
+- "Folder" is ONE concept — never reason about folder vs library-folder; pass scope and the engine picks the type. Valid parents: tab → window / folder / tabgroup / ROOT (root auto-wraps it into a window; NEVER directly under a Window Group); window → group / folder / ROOT; group (Window Group) → group / ROOT (Window Groups hold only windows + other Window Groups, never loose tabs or folders); tabgroup (browser Tab Group node, where the build has them) → window and nothing else; folder → folder / ROOT (folders hold mixed tabs/windows/folders; library + bookmark scopes only — the main tree has no folders).
 - Prefer the SIMPLEST container: for "organize by X", one window-per-bucket (main tree) or one folder-per-bucket (library) is usually enough; don't stack group+window+folder unless asked.
 - To gather loose tabs into a bucket, use create_window (one atomic call) instead of moving tabs to ROOT one at a time (which scatters them into singleton windows).
 - POST-REORG CLEANUP: after a reorganization (especially with failed attempts / intermediate moves), re-read (get_tree_summary / get_library) and remove containers you created or emptied. Empty WINDOWS are auto-pruned by the engine; empty GROUPS and FOLDERS persist, so delete those yourself (delete_node) unless the user wants placeholders.
@@ -2529,10 +2601,16 @@ DELETE/GHOST OPS ARE IDEMPOTENT-ON-RETRY. NODE_NOT_FOUND (delete_node) or NODE_N
 ERROR HANDLING. Every write tool returns either {ok:true, ...result} or {ok:false, error:{code, message, context}}. Branch on error.code to react programmatically (e.g., CONFIRMATION_REQUIRED → ask the user to confirm; NOTE_CONTENT_OVER_TIER_LIMIT → trim content or warn the user; LIBRARY_NOT_FOUND → re-fetch list_libraries; subOpIndex in bulk_apply errors identifies the failing sub-op so you can correct and resubmit).
 
 DATA MODEL
-The tab tree is hierarchical: Windows → Groups → Tabs.
+The tab tree is hierarchical: Window Groups → Windows → Tabs. Some builds additionally mirror the browser's own Tab Groups as container nodes (type='tabgroup') that sit between a window and its member tabs — see BROWSER TAB GROUPS below.
 - Each node has: id, type, title, url, favIconUrl, tags (string[]), memoText (short plain-text note, max 2500 chars), notes (rich text documents with title and HTML content), openedDate (Unix ms timestamp — the date the tab was opened or saved), collapsed, and children.
 - Ghost tabs (chromeId = null) are tabs the user closed in the browser but chose to preserve in the Pinako tree. They can be reopened on demand. Treat them as saved/bookmarked tabs — they are NOT currently open in Chrome.
-- Groups have a title and color. Windows have a title.
+- Window Groups (type='group') are Pinako's organizational rows for nesting windows; they have a title and a row color. Windows have a title.
+
+BROWSER TAB GROUPS
+The colored, named chips in the browser's own tab strip. The browser owns their title and color; Pinako mirrors them read-only. Pinako represents them in ONE of two shapes depending on the user's build — read whichever the tool results actually show you, never assume:
+- As a CONTAINER NODE: a real tree node with type='tabgroup', sitting directly under a window and holding its member tabs as children (tabs nested under a member are members too). Its title is the browser group's name (empty title is legal); its color is the browser's group color.
+- As PER-TAB METADATA: no container node; each member tab carries chromeGroupId / chromeGroupTitle / chromeGroupColor instead.
+Member tabs carry the chromeGroup* fields in BOTH shapes (include_chrome_tab_groups), so membership is identifiable either way. Membership is controlled by move_node and nothing else: in the container-node shape move a tab INTO or OUT OF the tabgroup node; in the per-tab-metadata shape it follows strip position (see move_node's description). You cannot create, rename, recolor, or dissolve a browser Tab Group — set_title and set_row_color reject tabgroup nodes. Never confuse browser Tab Groups with Window Groups (type='group') or Library Groups.
 - Libraries are user-created collections of saved tabs organized into folders — like bookmarks but richer, with notes, tags, and memos.
 - Main Notes are rich text documents attached to the user's main tree (the live tab tree) rather than to a library or an individual tab. Refer to them as "Main Notes" in any user-facing language. (Internal field names like 'globalNotes' / "owner_type:'global'" are legacy and being renamed; treat them as synonyms but never surface them to the user.)
 
@@ -2550,7 +2628,7 @@ search_docs(query, max_results?) gives you fast local access to Pinako's user gu
 
 Call search_docs BEFORE acting when any of these is true:
 
-1. A PINAKO-SPECIFIC TERM is uncertain. Examples: "memo" vs "note", "group row color" or "group node color" vs Chrome "Tab Group" color, "folder" vs "group", "ghost tab", "library group", "snapshot". These have product-specific meanings that differ from generic tab-manager intuition; don't guess from the term alone.
+1. A PINAKO-SPECIFIC TERM is uncertain. Examples: "memo" vs "note", "Window Group row color" vs browser "Tab Group" color, "folder" vs "group", "ghost tab", "library group", "snapshot". These have product-specific meanings that differ from generic tab-manager intuition; don't guess from the term alone.
 
 2. The user uses ORDINARY-ENGLISH PHRASING that doesn't map 1:1 to a write tool. "Save this tab" — add_to_library? ghost_node? "Organize my research" — move_node, create_library, or bulk_apply? "Archive these" — ghost_node, move to library, or delete_live_node? "Color-code by topic" — set_row_color or set_star_color? When the verb is vague or could plausibly match multiple ops, check the guide before choosing.
 
@@ -2578,7 +2656,7 @@ SEMANTIC / categorical intent — the user named a topic, theme, or concept:
   Approach (faster AND more accurate than synonym iteration):
   1. Call get_tree({mode:"minimal"}) — flat list of every main-tree tab in compact form (~100 bytes/tab; fits 2000+ tab trees comfortably).
   2. Call list_libraries({include_tabs:true, mode:"minimal"}) — flat list of every library tab in compact form, one call across all libraries.
-  3. Read the title+url+openedDate of every tab in those two responses and identify matches USING YOUR OWN UNDERSTANDING. You know "exercise" extends to squats, pushups, stretches, mobility, ancestral movement, primal patterns, strength training, etc. Match in-head; do not iterate search_tabs with keyword after keyword. WEIGHT CONTAINER ANCESTORS: a tab's enclosing Pinako Group, Folder, Window, or Library title is deliberate categorization — treat every tab inside a group named "Recipes" as a recipe unless its own title/url clearly says otherwise. But a matching container is an INCLUSION signal, NOT a filter: classify EVERY tab on its own merits and include matches that sit OUTSIDE any on-topic container (a steak-recipe video in a generic "Video" window is still a recipe) — never equate "the category" with "just the contents of the one obviously-named container." Do NOT treat an ancestor TAB's title as a category signal (Pinako lets tabs nest under unrelated tabs, so a parent tab carries no categorization intent for its children). When container context is part of the signal, read in "lite" mode (tree shape preserves lineage) rather than "minimal" (flat list drops it).
+  3. Read the title+url+openedDate of every tab in those two responses and identify matches USING YOUR OWN UNDERSTANDING. You know "exercise" extends to squats, pushups, stretches, mobility, ancestral movement, primal patterns, strength training, etc. Match in-head; do not iterate search_tabs with keyword after keyword. WEIGHT CONTAINER ANCESTORS: a tab's enclosing Window Group, browser Tab Group, Folder, Window, or Library title is deliberate categorization — treat every tab inside a group named "Recipes" as a recipe unless its own title/url clearly says otherwise. But a matching container is an INCLUSION signal, NOT a filter: classify EVERY tab on its own merits and include matches that sit OUTSIDE any on-topic container (a steak-recipe video in a generic "Video" window is still a recipe) — never equate "the category" with "just the contents of the one obviously-named container." Do NOT treat an ancestor TAB's title as a category signal (Pinako lets tabs nest under unrelated tabs, so a parent tab carries no categorization intent for its children). When container context is part of the signal, read in "lite" mode (tree shape preserves lineage) rather than "minimal" (flat list drops it).
   4. Apply writes via per-scope bulk_apply (one per scope/libraryId — see WRITES below).
 
   Mode tiers (read tools):
@@ -2744,7 +2822,7 @@ function createMcpServer() {
     'get_tree',
     {
       description:
-        'Returns the tab tree (Windows → Groups → Tabs) from the Pinako extension. Three legacy modes (prefer composable shape opts — see SHAPE COMPOSITION below): ' +
+        'Returns the tab tree (Window Groups → Windows → Tabs) from the Pinako extension. Three legacy modes (prefer composable shape opts — see SHAPE COMPOSITION below): ' +
         '"minimal" (FLAT list, compact URLs, drops children/collapsed/ghost, keeps openedDate — best for semantic search across 500+ tab trees); ' +
         '"lite" (DEFAULT — tree shape with children/collapsed/ghost, full URLs, keeps openedDate, no favicons); ' +
         '"full" (everything in source data EXCEPT favicons; useful only for visual-field workflows). ' +
@@ -2765,9 +2843,9 @@ function createMcpServer() {
         include_tags:              z.boolean().optional().describe('Include the tags array per node. Default true.'),
         include_memos:             z.boolean().optional().describe('Include memoText per node. Default true.'),
         include_lineage:           z.boolean().optional().describe('Include the collapsed flag (which subtrees the user has folded up). Default true. Tree position/ancestry needs no flag — the nested children structure conveys it (or parentId in minimal/paginated mode).'),
-        include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId + chromeGroupTitle + chromeGroupColor metadata on tab nodes (the colored-strip Chromium Tab Group in Chrome\'s tab bar, mirrored read-only). NOT to be confused with Pinako Group nodes (type="group"), which are always returned as nodes regardless of this flag. Default true.'),
+        include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId + chromeGroupTitle + chromeGroupColor metadata on tab nodes (the colored-strip Tab Group in the browser\'s own tab bar, mirrored read-only). Where the build mirrors tab groups as type="tabgroup" container nodes, member tabs derive these fields from their tabgroup ancestor and the tabgroup node itself carries chromeGroupId + chromeGroupColor. NOT to be confused with Window Groups (type="group"), which are always returned as nodes regardless of this flag. Default true.'),
         include_star_color:        z.boolean().optional().describe('Include per-node starColor when set. Default true (cheap when absent).'),
-        include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set (Pinako Group / Folder background tint). Default true (cheap when absent).'),
+        include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set (Window Group / Folder background tint). Default true (cheap when absent).'),
         include_custom_title:      z.boolean().optional().describe('Include the customTitle flag indicating a user-customized title. Default true (cheap when absent).'),
       },
       annotations: TOOL_ANNOTATIONS.get_tree,
@@ -2828,7 +2906,7 @@ function createMcpServer() {
         include_tags:              z.boolean().optional().describe('Include the tags array per node. Default true.'),
         include_memos:             z.boolean().optional().describe('Include memoText per node. Default true.'),
         include_lineage:           z.boolean().optional().describe('Include the collapsed flag. Default true.'),
-        include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId + chromeGroupTitle + chromeGroupColor metadata on tab nodes (Chromium Tab Group, NOT Pinako Group nodes type="group"). Default true.'),
+        include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId + chromeGroupTitle + chromeGroupColor metadata on tab nodes (browser Tab Group, NOT Window Groups type="group"). Where present, type="tabgroup" container nodes also carry chromeGroupId + chromeGroupColor. Default true.'),
         include_star_color:        z.boolean().optional().describe('Include per-node starColor when set. Default true (cheap when absent).'),
         include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set. Default true (cheap when absent).'),
         include_custom_title:      z.boolean().optional().describe('Include the customTitle flag. Default true (cheap when absent).'),
@@ -2846,8 +2924,16 @@ function createMcpServer() {
       const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
-      const results = searchInTree(r.data.tree, query, include_ghost_tabs);
-      const out     = shapeTree(results, 'tree', null, mode, include_favicons, shapeOpts);
+      const stamps  = [];
+      const results = searchInTree(r.data.tree, query, include_ghost_tabs, [], stamps);
+      // Lite hits are shaped one-by-one so each carries its own tabgroup
+      // ancestor stamp (N5); minimal and full emit no chromeGroup* fields, so
+      // they stay on the shared shapeTree path.
+      const out     = (mode === 'lite')
+        ? results.map((n, i) => liteNode(
+            n, 'tree', null,
+            stamps[i] ? Object.assign({}, shapeOpts, { _tgAncestor: stamps[i] }) : shapeOpts))
+        : shapeTree(results, 'tree', null, mode, include_favicons, shapeOpts);
       return { content: [{ type: 'text', text: JSON.stringify({
         browser: r.data.browserBrand,
         mode,
@@ -3047,7 +3133,7 @@ function createMcpServer() {
         include_tags:              z.boolean().optional().describe('Shape opt (when include_tabs:true): include the tags array per node. Default true.'),
         include_memos:             z.boolean().optional().describe('Shape opt (when include_tabs:true): include memoText per node. Default true.'),
         include_lineage:           z.boolean().optional().describe('Shape opt (when include_tabs:true): include the collapsed flag. Default true.'),
-        include_chrome_tab_groups: z.boolean().optional().describe('Shape opt (when include_tabs:true): include chromeGroupId/Title/Color metadata on tab nodes (Chromium Tab Group, NOT Pinako Group nodes). Default true.'),
+        include_chrome_tab_groups: z.boolean().optional().describe('Shape opt (when include_tabs:true): include chromeGroupId/Title/Color metadata on tab nodes (browser Tab Group, NOT Window Groups). Where present, type="tabgroup" container nodes also carry chromeGroupId + chromeGroupColor. Default true.'),
         include_star_color:        z.boolean().optional().describe('Shape opt (when include_tabs:true): include per-node starColor when set. Default true.'),
         include_row_color:         z.boolean().optional().describe('Shape opt (when include_tabs:true): include per-node rowColor when set. Default true.'),
         include_custom_title:      z.boolean().optional().describe('Shape opt (when include_tabs:true): include the customTitle flag. Default true.'),
@@ -3135,7 +3221,7 @@ function createMcpServer() {
         include_tags:              z.boolean().optional().describe('Include the tags array per node. Default true.'),
         include_memos:             z.boolean().optional().describe('Include memoText per node. Default true.'),
         include_lineage:           z.boolean().optional().describe('Include the collapsed flag. Default true.'),
-        include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId/Title/Color metadata on tab nodes (Chromium Tab Group, NOT Pinako Group nodes). Default true.'),
+        include_chrome_tab_groups: z.boolean().optional().describe('Include chromeGroupId/Title/Color metadata on tab nodes (browser Tab Group, NOT Window Groups). Where present, type="tabgroup" container nodes also carry chromeGroupId + chromeGroupColor. Default true.'),
         include_star_color:        z.boolean().optional().describe('Include per-node starColor when set. Default true.'),
         include_row_color:         z.boolean().optional().describe('Include per-node rowColor when set. Default true.'),
         include_custom_title:      z.boolean().optional().describe('Include the customTitle flag. Default true.'),
@@ -3738,7 +3824,7 @@ function createMcpServer() {
     RESOURCE_URIS.tree,
     {
       title:       'Pinako tab tree',
-      description: 'Current tab tree (Windows → Groups → Tabs) for the connected Pinako browser. Subscribe to receive notifications/resources/updated when the tree mutates. For multi-browser scenarios, use the get_tree tool with a browser argument.',
+      description: 'Current tab tree (Window Groups → Windows → Tabs) for the connected Pinako browser. Subscribe to receive notifications/resources/updated when the tree mutates. For multi-browser scenarios, use the get_tree tool with a browser argument.',
       mimeType:    'application/json',
     },
     async (uri) => {
@@ -3854,7 +3940,7 @@ function createMcpServer() {
   const SCOPE_TREE_OR_LIBRARY = "Scope: 'tree' (default), 'library' (libraryId required), or 'bookmarks'. Most node-targeted ops only need scope when working outside the main tree.";
   // 2026-05-24: narrower variant for ops that don't apply to bookmark scope.
   // delete_live_node + ghost_node have no meaning on bookmarks (no live tabs);
-  // create_group fails because bookmark tree shape has no Pinako Group node type.
+  // create_group fails because bookmark tree shape has no Window Group node type.
   // Engine returns INVALID_NODE_TYPE / INVALID_PARENT for these on bookmarks
   // scope; this narrower describe spares the agent the trial-and-error.
   const SCOPE_TREE_OR_LIBRARY_ONLY = "Scope: 'tree' (default) or 'library' (libraryId required). NOT applicable to 'bookmarks' — this op operates on Pinako tree/library structures that don't exist in the Chrome bookmark tree.";
@@ -3924,7 +4010,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_star_color', args));
 
   srv.registerTool('set_row_color', {
-    description: 'Sets the rowColor of a Pinako Group node or Folder node. NOT related to Chrome Tab Group color (Chrome owns those — agent has no direct control over them; tabs join/leave Chrome Tab Groups implicitly via move_node positioning). Accepts: "accent2" (theme-tracking default), a named color ("blue", "red", "green", "purple", "yellow", "orange", "pink", "cyan", "grey"), an explicit 6-digit hex ("#1890ff"), or null (reset to "accent2"). Rejects on non-group/non-folder node types with INVALID_NODE_TYPE.',
+    description: 'Sets the rowColor of a Window Group node or Folder node. NOT related to browser Tab Group color (the browser owns those; agent has no direct control over them, and tabgroup nodes are rejected with INVALID_NODE_TYPE - tabs join/leave browser Tab Groups via move_node, see that tool). Accepts: "accent2" (theme-tracking default), a named color ("blue", "red", "green", "purple", "yellow", "orange", "pink", "cyan", "grey"), an explicit 6-digit hex ("#1890ff"), or null (reset to "accent2"). Rejects on non-group/non-folder node types (including tabgroup) with INVALID_NODE_TYPE.',
     inputSchema: {
       nodeId:    z.string().describe('Target group or folder node id.'),
       rowColor:  z.union([z.string(), z.null()]).describe('"accent2", named color, 6-digit hex, or null to reset.'),
@@ -3936,7 +4022,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_row_color', args));
 
   srv.registerTool('set_title', {
-    description: 'Sets a custom title on a tab, window, group, or folder node. Trimmed; max 200 chars. Sets customTitle=true so the title persists across browser restarts.',
+    description: 'Sets a custom title on a tab, window, Window Group (type="group"), or folder node. Trimmed; max 200 chars. Sets customTitle=true so the title persists across browser restarts. Rejects tabgroup nodes with INVALID_TARGET (the browser owns a Tab Group name, Pinako does not) and rejects the library container (use set_library_title).',
     inputSchema: {
       nodeId:    z.string().describe('Target node id.'),
       title:     z.string().describe('New title (trimmed, non-empty, max 200 chars).'),
@@ -3949,7 +4035,7 @@ function createMcpServer() {
 
   // ─── Tree-structure ops ─────────────────────────────────────────────────────
   srv.registerTool('move_node', {
-    description: 'Moves a node (and its full subtree) under newParentId at an optional position. SUBTREE SEMANTICS: all descendants come along. To move ONLY the node WITHOUT its children (e.g., "move tab X but leave the nested tabs"), use the outdent-first-child pattern: outdent the node\'s first child first (sibling-adoption pulls the rest under it), then move the now-empty target. Or wrap both ops in a single bulk_apply for atomicity. Pass newParentId=null to move to root (auto-wraps tabs into a new window). VALID PARENT BY MOVED-NODE TYPE (engine rejects others with INVALID_PARENT): tabs → ROOT or window or folder; windows → ROOT or group or folder; groups → ROOT or group; folders → ROOT or group or folder. Critically: a tab CANNOT be moved directly under a Pinako Group node — create or move into a window first if you want tabs gathered under a Group row. (Tab-under-tab nesting is a designed Pinako shape but is reachable only via indent_node, not move_node — move_node\'s DND-semantic rules intentionally exclude it.) CHROME TAB GROUP behavior (Pinako has no direct ops for Chrome Tab Group membership — it\'s controlled implicitly by tree position): a tab JOINS a Chrome Tab Group only when moved INTO a position BETWEEN two existing group members. Moving a tab to the position immediately BEFORE the first group member or immediately AFTER the last member does NOT auto-join — it stays adjacent but outside the group. A grouped tab moved AWAY from its siblings forcibly leaves the group. So to add tabs to a Chrome Tab Group: move them between any two members. To position a tab next to a group without joining: move it before the first member or after the last. BOOKMARK-SCOPE NOTE: scope:"bookmarks" moves go through chrome.bookmarks.move and are NOT Pinako-undoable (the bookmark tree has no Ctrl+Z coverage). Less severe than delete (data isn\'t lost, just relocated), but for batch reorganization (more than a few items) suggest the user back up bookmarks first via the import/export button on the Bookmarks panel.',
+    description: 'Moves a node (and its full subtree) under newParentId at an optional position. SUBTREE SEMANTICS: all descendants come along. To move ONLY the node WITHOUT its children (e.g., "move tab X but leave the nested tabs"), use the outdent-first-child pattern: outdent the node\'s first child first (sibling-adoption pulls the rest under it), then move the now-empty target. Or wrap both ops in a single bulk_apply for atomicity. Pass newParentId=null to move to root (auto-wraps tabs into a new window). VALID PARENT BY MOVED-NODE TYPE (engine rejects others with INVALID_PARENT): tabs → ROOT or window or folder or tabgroup; windows → ROOT or group or folder; groups → ROOT or group; folders → ROOT or group or folder; tabgroup nodes → window only. Critically: a tab CANNOT be moved directly under a Window Group node — create or move into a window first if you want tabs gathered under a Window Group row. (Tab-under-tab nesting is a designed Pinako shape but is reachable only via indent_node, not move_node — move_node\'s DND-semantic rules intentionally exclude it.) BROWSER TAB GROUP behavior (move_node is the only lever; there are no dedicated membership ops). The rule depends on which of the two shapes the tree is in, so check what you actually read rather than assuming. CONTAINER-NODE SHAPE (type="tabgroup" nodes present): membership follows CONTAINMENT — move the tab INTO the tabgroup node to join, OUT of it (to the window, another tabgroup, anywhere else) to leave. Moving the tabgroup node itself carries the whole group; its only valid parent is a window. PER-TAB-METADATA SHAPE (no tabgroup nodes): membership follows POSITION — a tab JOINS only when moved INTO a position BETWEEN two existing members; moving it immediately BEFORE the first member or immediately AFTER the last does NOT auto-join (it stays adjacent but outside), and a grouped tab moved AWAY from its siblings forcibly leaves the group. Either way you cannot create, rename, recolor, or dissolve a browser Tab Group — the browser owns that identity. BOOKMARK-SCOPE NOTE: scope:"bookmarks" moves go through chrome.bookmarks.move and are NOT Pinako-undoable (the bookmark tree has no Ctrl+Z coverage). Less severe than delete (data isn\'t lost, just relocated), but for batch reorganization (more than a few items) suggest the user back up bookmarks first via the import/export button on the Bookmarks panel.',
     inputSchema: {
       nodeId:      z.string().describe('Node to move (with its subtree).'),
       newParentId: z.union([z.string(), z.null()]).optional().describe('Destination parent id, or null for root.'),
@@ -3962,7 +4048,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('move_node', args));
 
   srv.registerTool('create_group', {
-    description: 'Creates a new Pinako group node. Groups can contain other groups and windows but NOT tabs directly (tabs always live under a window or another tab). Position defaults to TOP of the destination siblings (matches the manual UI). For Chrome tab groups (the colored-strip groups in the browser tab bar), Pinako mirrors what Chrome shows; create those by moving tabs together in a window via move_node, not via this op.',
+    description: 'Creates a new Window Group node (type="group" — Pinako\'s organizational row for nesting windows). Window Groups can contain other Window Groups and windows but NOT tabs directly (tabs always live under a window, a tabgroup node, or another tab). Position defaults to TOP of the destination siblings (matches the manual UI). This does NOT create a browser Tab Group (the colored-strip groups in the browser tab bar): Pinako mirrors those read-only and has no create op for them — tabs join an EXISTING browser Tab Group via move_node.',
     inputSchema: {
       title:     z.string().describe('Group title (trimmed, non-empty, max 200 chars).'),
       rowColor:  z.string().optional().describe('Optional row background color: a named color, hex string, or "accent2" (default, theme-tracking).'),
