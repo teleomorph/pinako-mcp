@@ -551,6 +551,12 @@ function handleNmMessage(msg) {
     const libraryPanelOrder = (msg.data && 'libraryPanelOrder' in msg.data)
       ? (msg.data.libraryPanelOrder || [])
       : (prior?.libraryPanelOrder || []);
+    // S3.8 §7.4: the tab-world flag-label registry (hex→label + name→hex
+    // snapshot). Rides the initial getTree and a dedicated flagLabels-only
+    // push on registry edits; every other update omits it — preserve.
+    const flagLabels = (msg.data && 'flagLabels' in msg.data)
+      ? (msg.data.flagLabels || null)
+      : (prior?.flagLabels || null);
     cachedData.set(browserId, {
       tree,
       libraries,
@@ -559,6 +565,7 @@ function handleNmMessage(msg) {
       docs,
       libraryGroups,
       libraryPanelOrder,
+      flagLabels,
       updatedAt:      Date.now(),
       browserId,
       browserBrand,
@@ -2349,8 +2356,21 @@ function searchInTree(nodes, query, includeGhost, results = [], stamps = [], tgA
 // it, plus parentPath, so the agent can prioritize or display per-source.
 // Powers MCP `search_pinako` (the omnibus tool); legacy `search_tabs`
 // continues to use searchInTree above for tab-only main-tree results.
+// S3.8 §7.4: resolve a node's starColor to its user-named flag LABEL via the
+// registry snapshot the extension delivers ({labels: {hex: label}, names:
+// {name: hex}}). Legacy stores may hold a bare color NAME; the names snapshot
+// covers that without a hardcoded palette copy. Unlabeled/unknown → ''.
+function _flagLabelOf(starColor, flagLabels) {
+  if (!starColor || !flagLabels || !flagLabels.labels) return '';
+  const s = String(starColor);
+  const hex = s.charAt(0) === '#'
+    ? s.toLowerCase()
+    : ((flagLabels.names && flagLabels.names[s]) || s);
+  return flagLabels.labels[hex] || '';
+}
+
 function _searchInTreeOmni({
-  tree, query, scope, sourceLibraryId, matchFields, exactTag, includeGhost, limit, results,
+  tree, query, scope, sourceLibraryId, matchFields, exactTag, includeGhost, limit, results, flagLabels,
 }) {
   if (!Array.isArray(tree) || tree.length === 0) return;
   const q = query.toLowerCase();
@@ -2358,6 +2378,7 @@ function _searchInTreeOmni({
   const wantUrl   = matchFields.includes('url');
   const wantMemo  = matchFields.includes('memo');
   const wantTags  = matchFields.includes('tags');
+  const wantFlag  = matchFields.includes('flag'); // S3.8 §7.4 — parity with the native chat route
   const pathStack = [];
 
   function walk(node) {
@@ -2370,6 +2391,7 @@ function _searchInTreeOmni({
     const url      = node.url || '';
     const memo     = node.memoText || '';
     const tagArr   = Array.isArray(node.tags) ? node.tags : [];
+    const flag     = wantFlag ? _flagLabelOf(node.starColor, flagLabels) : '';
     const nodeType = node.type || (typeof url === 'string' && url.length > 0 ? 'bookmark' : 'folder');
 
     // For tree scope, optionally skip ghost tabs.
@@ -2386,6 +2408,7 @@ function _searchInTreeOmni({
         if (tagArr.some(t => String(t).toLowerCase().includes(q))) matched.push('tags');
       }
     }
+    if (wantFlag && flag && flag.toLowerCase().includes(q)) matched.push('flag');
 
     if (matched.length > 0 && !(isGhostTab && !includeGhost)) {
       const entry = {
@@ -2400,6 +2423,7 @@ function _searchInTreeOmni({
       if (url)             entry.url = url;
       if (tagArr.length)   entry.tags = [...tagArr];
       if (memo)            entry.memoText = memo;
+      if (flag)            entry.flag = flag;
       if (node.type === 'tab' && node.chromeId === null) entry.ghost = true;
       results.push(entry);
     }
@@ -2946,20 +2970,20 @@ function createMcpServer() {
     {
       description: 'Omnibus LITERAL substring search across Pinako data surfaces — the broad replacement for search_tabs. Bridge-side scan; no LLM. Use this WHENEVER the user names a literal substring and the question may match non-tab nodes (groups, folders, library titles), non-tree surfaces (libraries, bookmarks, notes), or wants exact-tag semantics (default fuzzy substring matching can over-match a tag like "food" against "football"). Avoids the fetch-and-filter anti-pattern (list_libraries with include_tabs then grep in your own head), which costs LLM tokens proportional to data size and falls over at scale.\n\n' +
         'SCOPE SELECTION:\n' +
-        '  - "tree" (default) — live tab tree (main-tree windows, groups, folders, tabs). Default match_fields: title, url, tags, memo. Returns non-tab nodes too when their title / tag / memo matches (this is the legacy search_tabs gap).\n' +
-        '  - "library" — one specific library (requires library_id). Default match_fields: title, url, tags, memo.\n' +
-        '  - "libraries-all" — UNION across every library in the install. Default match_fields: title, url, tags, memo. The right scope for "find tabs tagged X across all my libraries". Each hit is tagged with sourceLibraryId.\n' +
-        '  - "bookmarks" — Chrome\'s bookmark tree. Default match_fields: title, url (Chrome bookmark items don\'t carry tags or memos; if either is passed in match_fields it simply yields zero hits for that field).\n' +
+        '  - "tree" (default) — live tab tree (main-tree windows, groups, folders, tabs). Default match_fields: title, url, tags, memo, flag. Returns non-tab nodes too when their title / tag / memo / flag label matches (this is the legacy search_tabs gap).\n' +
+        '  - "library" — one specific library (requires library_id). Default match_fields: title, url, tags, memo, flag.\n' +
+        '  - "libraries-all" — UNION across every library in the install. Default match_fields: title, url, tags, memo, flag. The right scope for "find tabs tagged X across all my libraries". Each hit is tagged with sourceLibraryId.\n' +
+        '  - "bookmarks" — Chrome\'s bookmark tree. Default match_fields: title, url, flag (Pinako annotates bookmarks with stars, so their flag labels match; Chrome bookmark items don\'t carry tags or memos — if either is passed in match_fields it simply yields zero hits for that field).\n' +
         '  - "notes" — Pinako notes (BOTH library notes AND Main Notes in one pass). Default match_fields: title, content (Tiptap HTML is server-side stripped of tags before matching). Each hit returns a 200-char snippet centered on the first content match.\n' +
         '  - "all" — union of tree + every library + notes, plus bookmarks ONLY when the bookmark tree is small (≤600 links) or include_bookmarks:true is passed. On a larger bookmark tree, "all" skips the bookmark surface and the response carries a bookmarksSkipped notice with the count — surface it to the user and ask before including them. Use for "is this thing anywhere in my Pinako" questions. Limit param applies to the combined result count.\n\n' +
         'TAG MATCHING: by default tag matching is SUBSTRING (matches "foo" against "food", "footnote", etc.). Pass exact_tag:true to require the tag value to EQUAL the query exactly (case-insensitive). When the user names a specific tag ("show me items tagged exactly \'food\'") MUST set exact_tag:true; substring matching otherwise leaks false positives.\n\n' +
         'LIMIT: default 200 results. Pass limit (max 2000) to widen. Response includes truncated:true when the limit was hit so the agent knows results were cut off (in which case narrow the scope/query or raise limit).\n\n' +
-        'RESPONSE: results[] is a flat array sorted in discovery order (depth-first walk). Each entry: {type ("tab" | "tabgroup" | "group" | "window" | "folder" | "library-folder" | "note" | "bookmark"), scope, nodeId or noteId, sourceLibraryId? (present for library scopes), matchedFields (subset of the requested match_fields that actually matched), title, url? (when present), tags? (when present), memoText? (when present), parentPath (slash-joined ancestor breadcrumb; tree/library/bookmarks scopes), snippet? (notes only, 200-char window centered on the first content hit), ghost? (true when a tree-scope tab is a ghost tab AND include_ghost_tabs was true)}.' + FRESHNESS_HINT,
+        'RESPONSE: results[] is a flat array sorted in discovery order (depth-first walk). Each entry: {type ("tab" | "tabgroup" | "group" | "window" | "folder" | "library-folder" | "note" | "bookmark"), scope, nodeId or noteId, sourceLibraryId? (present for library scopes), matchedFields (subset of the requested match_fields that actually matched), title, url? (when present), tags? (when present), memoText? (when present), flag? (the node\'s star-label when named), parentPath (slash-joined ancestor breadcrumb; tree/library/bookmarks scopes), snippet? (notes only, 200-char window centered on the first content hit), ghost? (true when a tree-scope tab is a ghost tab AND include_ghost_tabs was true)}.' + FRESHNESS_HINT,
       inputSchema: {
         query:              z.string().describe('LITERAL substring (case-insensitive). For semantic intent, prefer get_tree/list_libraries + in-head matching.'),
         scope:              z.enum(['tree', 'library', 'libraries-all', 'bookmarks', 'notes', 'all']).optional().describe('Which data surface to search. Default "tree".'),
         library_id:         z.string().optional().describe('Library id from list_libraries. Required when scope:"library".'),
-        match_fields:       z.array(z.enum(['title', 'url', 'tags', 'memo', 'content'])).optional().describe('Which fields to match. Defaults are scope-aware: tree/library/libraries-all default to ["title","url","tags","memo"]; bookmarks defaults to ["title","url"]; notes defaults to ["title","content"]; "all" scope uses the scope-appropriate default per surface. "content" only applies to notes scope; for other scopes it is ignored.'),
+        match_fields:       z.array(z.enum(['title', 'url', 'tags', 'memo', 'flag', 'content'])).optional().describe('Which fields to match. Defaults are scope-aware: tree/library/libraries-all default to ["title","url","tags","memo","flag"]; bookmarks defaults to ["title","url","flag"]; notes defaults to ["title","content"]; "all" scope uses the scope-appropriate default per surface. "flag" matches the user-named star-color label (e.g. a color named "Important"); hits carry it as `flag`. "content" only applies to notes scope; for other scopes it is ignored.'),
         exact_tag:          z.boolean().optional().describe('When true, tag matches must equal the query exactly (case-insensitive). When false (default), tag matches use substring semantics. Use exact_tag:true whenever the user names a specific tag.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs in tree scope. Default true.'),
         include_bookmarks:  z.boolean().optional().describe('Set true ONLY after the user confirms they want their browser bookmarks searched in a broad scope:"all" query. Bypasses the >600-link confirmation gate. No effect on other scopes (scope:"bookmarks" always searches them; tree/library/notes never do).'),
@@ -2978,9 +3002,12 @@ function createMcpServer() {
       if (r.error) return r.error;
 
       const effectiveLimit = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 2000) : 200;
-      const treeFields     = (Array.isArray(match_fields) && match_fields.length > 0) ? match_fields : ['title', 'url', 'tags', 'memo'];
-      const bookmarkFields = (Array.isArray(match_fields) && match_fields.length > 0) ? match_fields : ['title', 'url'];
+      // S3.8 §7.4: 'flag' (the user's star label) joins the tree/library and
+      // bookmark defaults — parity with the native chat route's defaults.
+      const treeFields     = (Array.isArray(match_fields) && match_fields.length > 0) ? match_fields : ['title', 'url', 'tags', 'memo', 'flag'];
+      const bookmarkFields = (Array.isArray(match_fields) && match_fields.length > 0) ? match_fields : ['title', 'url', 'flag'];
       const noteFields     = (Array.isArray(match_fields) && match_fields.length > 0) ? match_fields : ['title', 'content'];
+      const flagLabels     = r.data.flagLabels || null;
 
       const results = [];
       let bookmarksSkipped = null;
@@ -2995,6 +3022,7 @@ function createMcpServer() {
           includeGhost:    include_ghost_tabs,
           limit:           effectiveLimit,
           results,
+          flagLabels,
         });
       }
       function runLibrary(lib) {
@@ -3007,6 +3035,7 @@ function createMcpServer() {
           includeGhost:    true,
           limit:           effectiveLimit,
           results,
+          flagLabels,
         });
       }
       function runBookmarks() {
@@ -3019,6 +3048,7 @@ function createMcpServer() {
           includeGhost:    true,
           limit:           effectiveLimit,
           results,
+          flagLabels,
         });
       }
       function runNotes() {
