@@ -610,7 +610,13 @@ function handleNmMessage(msg) {
       if (msg.data && 'docs'        in msg.data) updatedFields.push('docs');
       if (updatedFields.length > 0) broadcastResourceUpdated(updatedFields);
     }
-    process.stderr.write(`[pinako-mcp] Tree updated from ${browserBrand} (${browserId.slice(0,16)}…): ${msg.data.tree?.length || 0} windows.\n`);
+    // S3.8 §7.4: a flagLabels-only push carries no tree, so the usual line
+    // reported "0 windows" — which reads like a wipe when you're scanning the
+    // log. Name what actually changed instead.
+    const flagsOnlyPush = !!(msg.data && 'flagLabels' in msg.data && !('tree' in msg.data));
+    process.stderr.write(flagsOnlyPush
+      ? `[pinako-mcp] Flag-label registry updated from ${browserBrand} (${browserId.slice(0,16)}…).\n`
+      : `[pinako-mcp] Tree updated from ${browserBrand} (${browserId.slice(0,16)}…): ${msg.data.tree?.length || 0} windows.\n`);
     // Diagnostic: surface docs/bookmarks counts on every NM update so we can
     // tell at a glance whether the extension is pushing them. Logged to the
     // disk log (not just stderr) so it survives across leader processes.
@@ -2360,13 +2366,17 @@ function searchInTree(nodes, query, includeGhost, results = [], stamps = [], tgA
 // registry snapshot the extension delivers ({labels: {hex: label}, names:
 // {name: hex}}). Legacy stores may hold a bare color NAME; the names snapshot
 // covers that without a hardcoded palette copy. Unlabeled/unknown → ''.
+// Both maps are JSON-derived, so every lookup is own-property guarded: without
+// it a starColor of 'constructor' (or 'toString', '__proto__'…) resolves off the
+// prototype chain and a function ends up standing in for a label.
 function _flagLabelOf(starColor, flagLabels) {
   if (!starColor || !flagLabels || !flagLabels.labels) return '';
+  const own = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
   const s = String(starColor);
   const hex = s.charAt(0) === '#'
     ? s.toLowerCase()
-    : ((flagLabels.names && flagLabels.names[s]) || s);
-  return flagLabels.labels[hex] || '';
+    : (own(flagLabels.names, s) ? flagLabels.names[s] : s);
+  return (own(flagLabels.labels, hex) && flagLabels.labels[hex]) || '';
 }
 
 function _searchInTreeOmni({
@@ -4540,6 +4550,14 @@ const httpServer = http.createServer(async (req, res) => {
           const libraryPanelOrderField = (data && 'libraryPanelOrder' in data)
             ? (data.libraryPanelOrder || [])
             : (priorCache?.libraryPanelOrder || []);
+          // S3.8 §7.4: the flag-label registry follows the NM path's
+          // preserve-when-omitted contract too. It was missing here, so every
+          // ordinary /update relay (which omits flagLabels) rebuilt the entry
+          // without it and non-leader browsers lost their labels until the
+          // next registry edit re-pushed them.
+          const flagLabelsField = (data && 'flagLabels' in data)
+            ? (data.flagLabels || null)
+            : (priorCache?.flagLabels || null);
           cachedData.set(id, {
             tree:              treeField,
             libraries:         librariesField,
@@ -4548,6 +4566,7 @@ const httpServer = http.createServer(async (req, res) => {
             docs:              docsField,
             libraryGroups:     libraryGroupsField,
             libraryPanelOrder: libraryPanelOrderField,
+            flagLabels:        flagLabelsField,
             updatedAt:      Date.now(),
             browserId:      id,
             browserBrand:   brand,
