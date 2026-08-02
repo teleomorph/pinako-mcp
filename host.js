@@ -2549,7 +2549,7 @@ const SERVER_INSTRUCTIONS = `Pinako is a browser tab manager Chrome extension. T
 ROUTING - when the user expresses one of these intents, CALL THE LISTED TOOL FIRST instead of planning the task yourself by reading the tree:
 
   "organize / clean up / sort / categorize my bookmarks"
-    -> Handle it yourself with the normal read + write tools - there is no one-call "auto-organize" tool; don't look for one or tell the user to use one. For a large bookmark tree: get_tree_summary({scope:"bookmarks"}) first (cheap size + topDomains overview), then read in pages with get_bookmarks (after + limit), create destination folders with create_folder, relocate with move_node / bulk_apply (scope:"bookmarks"). Surface the backup warning from BOOKMARK SCOPE RECOVERY below before any destructive bookmark op.
+    -> search_docs({query:"playbook", full_sections:true}) FIRST, then follow it. There is no one-call "auto-organize" tool; don't look for one or tell the user to use one. The short version: get_tree_summary({scope:"bookmarks"}) for size, then get_bookmarks' COMPOSABLE OPTS (folders_only to find a destination, parent+leaves_only for exact ids) rather than a whole-tree read or a paginated walk, then create_folder + move_node / bulk_apply (scope:"bookmarks"). Surface the backup warning from BOOKMARK SCOPE RECOVERY below before any destructive bookmark op.
 
   "find / remove duplicate bookmarks" / "dedupe"
     -> find_duplicates({scope:"bookmarks"}), then ASK whether to (1) move duplicates to a 'Duplicates' folder for review or (2) delete them directly via bulk_apply delete_node({confirmedByUser:true}). Present both as equal options; don't default-pick.
@@ -2564,7 +2564,7 @@ ROUTING - when the user expresses one of these intents, CALL THE LISTED TOOL FIR
     -> get_tree_summary({scope}) FIRST. Exact counts + cheap structural overview. Never count by searching (search tools are substring finders, not counters) and never pull the whole tree just to tally it.
 
   Questions about Pinako features / terminology / "how does X work"
-    -> search_docs FIRST. "Group", "folder", "memo", "ghost tab", "library group", "snapshot" have product-specific meanings; never guess from the term alone.
+    -> search_docs FIRST. "Group", "folder", "memo", "ghost tab", "library group", "snapshot" have product-specific meanings; never guess from the term alone. Excerpts are 500 chars, so pass full_sections:true when you need the whole answer rather than the section's name. search_docs({query:"orientation", full_sections:true}) returns the capabilities map if you're starting cold.
 
   A browser-data task when you don't yet know which browser to act on
     -> list_browsers FIRST; if more than one browser shows, ASK the user which (see MULTI-BROWSER below). Exception: the user named a browser in the request itself.
@@ -3626,7 +3626,34 @@ function createMcpServer() {
     'more','most','some','any','all','each','every','both','either','neither',
     'very','too','than','then','so','yet',
   ]);
-  function _searchDocsSections(docs, query, maxN) {
+  // Full-section retrieval (WP-8 of the 2026-07-07 efficiency audit, finding
+  // F5). A 500-char excerpt truncates mid-section, so an answer sitting past
+  // that boundary was unreachable without a second, differently-phrased search
+  // that might never surface it. `full_sections:true` swaps the excerpt for the
+  // WHOLE section body on the top FULL_TOP_N hits (capped at FULL_CHAR_CAP
+  // each); hits below that rank keep their excerpt, so one call still returns
+  // the ranked tail for orientation. Kept in lockstep with the chat executor's
+  // _searchDocsForChat in Pinako/pinako.js (same constants, same fields).
+  const _DOCS_EXCERPT_CAP   = 500;
+  const _DOCS_FULL_TOP_N    = 2;
+  const _DOCS_FULL_CHAR_CAP = 4000;
+
+  // Body hits score with DIMINISHING RETURNS instead of linearly (Batch 54).
+  // Title and subheading hits are worth 10 each; body hits used to be worth 1
+  // each with NO ceiling, so a long section beat a precisely-titled short one
+  // on sheer length — "cloud sync" landed on #guide-synced-devices, "3 panel
+  // view" on #guide-libraries, "ai semantic search" on #guide-ai-librarian,
+  // and "workona tab manager" didn't reach the top 5 at all. The 20th mention
+  // of a term says little the 3rd didn't; sublinear term-frequency weighting
+  // is the standard fix (same shape BM25 uses). Measured over two gold sets —
+  // 40 self-title queries and 45 hand-labeled natural phrasings — this moved
+  // top-1 from 62.5%→72.5% and 80.0%→86.7% with ZERO ranking regressions on
+  // either set. Keep identical to pinako.js's _docsBodyScoreForChat.
+  //   1 hit → 2 · 3 → 4 · 7 → 6 · 15 → 8 · 31 → 10 · 63 → 12
+  function _docsBodyScore(hits) {
+    return Math.round(2 * Math.log2(1 + hits));
+  }
+  function _searchDocsSections(docs, query, maxN, fullSections) {
     const tokens = (query || '').toLowerCase().split(/\W+/)
       .filter(t => t.length > 1 && !_STOPWORDS.has(t));
     if (tokens.length === 0) return [];
@@ -3655,33 +3682,44 @@ function createMcpServer() {
           }
         }
         const matches = text.match(new RegExp(escapeRe(t), 'g'));
-        if (matches) score += matches.length;
+        if (matches) score += _docsBodyScore(matches.length);
       }
       if (score > 0) scored.push({ d, score, subAnchor: bestSubAnchorId });
     }
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, maxN).map(({ d, score, subAnchor }) => ({
-      id:      d.id,
-      title:   d.title,
-      source:  d.source,
-      excerpt: (d.text || '').length > 500 ? (d.text || '').slice(0, 500) + '…' : (d.text || ''),
-      score,
-      ...(subAnchor ? { subAnchor } : {}),
-    }));
+    return scored.slice(0, maxN).map(({ d, score, subAnchor }, rank) => {
+      const body = d.text || '';
+      const full = !!fullSections && rank < _DOCS_FULL_TOP_N;
+      const cap  = full ? _DOCS_FULL_CHAR_CAP : _DOCS_EXCERPT_CAP;
+      const cut  = body.length > cap;
+      const clipped = cut ? body.slice(0, cap) + '…' : body;
+      return {
+        id:     d.id,
+        title:  d.title,
+        source: d.source,
+        // `text` = whole section (full mode); `excerpt` = 500-char head.
+        // Never both — the field name IS how the model knows which it got.
+        ...(full ? { text: clipped, ...(cut ? { truncated: true } : {}) }
+                 : { excerpt: clipped }),
+        score,
+        ...(subAnchor ? { subAnchor } : {}),
+      };
+    });
   }
 
   srv.registerTool(
     'search_docs',
     {
-      description: 'Searches the Pinako user guide. Returns sections matching the query with title, anchor id, source ("user-guide" / "ai-connect" / "import"), excerpt, and score. The guide is bundled with this bridge and served from local cache (~10ms, no internet). See the DOCS LOOKUP section in server instructions for WHEN to call this. Cite anchor ids back to the user ("see #guide-library-groups") so they can jump to that section in their own copy of the guide.',
+      description: 'Searches the Pinako user guide. Returns ranked sections with title, anchor id, source ("user-guide" / "ai-connect" / "import" / "agent"), excerpt, and score. Bundled with this bridge, served from local cache (~10ms, no internet). Two RESERVED single-word queries address agent-only material and match nothing else in the corpus: "orientation" returns the two-part capabilities map (what Pinako is, which anchor documents what — the right first call in a cold conversation), and "playbook" returns the two-part bookmark playbook (run it before any broad bookmark survey or reorganization). Pair either with full_sections:true and one call returns both halves whole. See the DOCS LOOKUP section in server instructions for WHEN to call this. Cite anchor ids back to the user ("see #guide-library-groups") so they can jump to that section in their own copy of the guide — EXCEPT ids starting with "agent-", which exist only in this corpus and would be a dead link for them.',
       inputSchema: {
         query: z.string().describe('Search query — keywords or short phrase (case-insensitive).'),
         max_results: z.number().int().min(1).max(20).optional().describe('Cap on returned sections. Default 5.'),
+        full_sections: z.boolean().optional().describe('Return the WHOLE section body (field `text`, capped ~4000 chars, `truncated:true` if cut) for the top 2 hits instead of a 500-char `excerpt`; lower-ranked hits keep their excerpt. Use it when an excerpt cut off before the answer, or up front for a procedure you intend to follow rather than just name.'),
         browser: z.string().optional().describe(BROWSER_ARG_DESC),
       },
       annotations: TOOL_ANNOTATIONS.search_docs,
     },
-    async ({ query, max_results, browser }) => {
+    async ({ query, max_results, full_sections, browser }) => {
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
       const docs = Array.isArray(r.data.docs) ? r.data.docs : [];
@@ -3694,12 +3732,15 @@ function createMcpServer() {
           note:     'No docs cached yet for this browser. The extension pushes the user guide on its first connect; if this just rotated, re-call after the next treeUpdate.',
         }) }] };
       }
-      const results = _searchDocsSections(docs, query, max_results || 5);
+      const results = _searchDocsSections(docs, query, max_results || 5, full_sections === true);
       return { content: [{ type: 'text', text: JSON.stringify({
         browser: r.data.browserBrand,
         query,
         results,
         count:   results.length,
+        ...(full_sections === true
+          ? { fullSections: Math.min(results.length, _DOCS_FULL_TOP_N) }
+          : {}),
       }) }] };
     }
   );
