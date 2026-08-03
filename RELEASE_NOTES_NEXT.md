@@ -1,11 +1,9 @@
+# Pinako AI Bridge — next release (draft)
+
+> **Working draft.** Edit at release time, then paste into `gh release create vX.Y.Z --notes-file RELEASE_NOTES_NEXT.md` (or via the GitHub Releases UI). Reset this file to empty after the release ships.
+
+> **Next version:** TBD (last shipped: v1.1.5 on 2026-08-02).
+
 ## What's new
 
-- **Six new AI clients auto-configured.** The installer now detects and configures **VS Code (Copilot agent mode)**, **Grok Build**, **Kimi Code**, **OpenClaw**, **Hermes**, and **Zoo Code** (the Roo Code successor), alongside the existing clients. VS Code registers through `code --add-mcp` so the entry lands in your active profile; OpenClaw needs a gateway restart after install.
-- **Fixed: Cline connected over the wrong transport, and Roo Code's entry was invalid.** The Cline entry omitted the `type` field, which Cline treats as legacy SSE — the wrong protocol for the Bridge; it now says `streamableHttp`, and the installer writes both config locations Cline's current A/B-tested bundles read (including the `~/.cline` file shared with the Cline CLI and JetBrains). Roo Code requires an explicit `type` and spells auto-approve `alwaysAllow`, so its old entry was rejected outright; it's fixed for existing installs even though Roo itself was discontinued in May 2026. Config writes are now atomic everywhere, so a client watching its config file can never catch a half-written one. **Cline and Roo users: re-run the installer.**
-- **Fixed: Continue.dev configuration targeted a file Continue no longer reads.** The entry now ships as a standalone block file under `~/.continue/mcpServers/`, which the (now feature-frozen) extensions auto-discover.
-- **Gemini CLI support**, for installs still active under an enterprise license or API key (Google retired the consumer service in June 2026 — Antigravity, already supported, is its successor).
-- **Codex is now labeled ChatGPT-Codex**, matching OpenAI's merged desktop app branding. Same config, same behavior.
-- **Fixed: Claude Code and Antigravity were configured at paths they don't read.** The installer wrote Claude Code's MCP entry to `~/.claude/settings.json`, which only holds approval flags, and wrote Antigravity's to its older per-tool location after Antigravity moved global MCP config to `~/.gemini/config/mcp_config.json`. Both clients silently ignored the registration. Claude Code now registers through `claude mcp add --scope user`, falling back to a direct write to `~/.claude.json` when the CLI isn't on your PATH, and the stale `settings.json` entry is cleared. **If you use either client, re-run the installer** to get a working connection.
-- **Fixed: a failed `npm ci` no longer wipes `node_modules` and kills the Bridge.** An interrupted or failing install left the dependency tree empty, taking the Bridge down with it until a manual reinstall.
-- **Tab groups are a first-class node type for agents.** Matching the extension's v1.3.0 rework, a browser tab group now reaches AI clients as its own container node with its member tabs nested inside, carrying the group's name and color. Per-tab group fields derive from that container, `search_pinako` includes `tabgroup` in its result types, and the tool guidance for parents and moves reflects the container model.
-- **`search_pinako` matches your flag labels.** Colors you've named in the star palette ("Read later", "Important") now match searches by that name across your tree and bookmarks, at parity with Pinako's built-in chat. Also fixed: multi-browser setups no longer drop the label registry on relayed updates, so label search works on every connected browser, not just the first.
+*(nothing staged yet)*
