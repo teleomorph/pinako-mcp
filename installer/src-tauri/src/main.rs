@@ -178,6 +178,33 @@ fn write_claude_desktop_config(path: &Path) -> Result<(), String> {
     write_json(path, &cfg)
 }
 
+// ── Home-dir resolution for clients with env overrides ───────────────────────
+
+fn env_or_home(var: &str, default_leaf: &str) -> PathBuf {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(default_leaf))
+}
+
+fn grok_home() -> PathBuf { env_or_home("GROK_HOME", ".grok") }
+fn kimi_code_home() -> PathBuf { env_or_home("KIMI_CODE_HOME", ".kimi-code") }
+fn openclaw_home() -> PathBuf { env_or_home("OPENCLAW_STATE_DIR", ".openclaw") }
+
+/// Hermes: HERMES_HOME wins; the native Windows installer uses
+/// %LOCALAPPDATA%\hermes rather than the POSIX ~/.hermes, so probe both and
+/// prefer whichever exists (LOCALAPPDATA first — it's the Windows default).
+fn hermes_home() -> PathBuf {
+    if let Some(p) = std::env::var_os("HERMES_HOME") {
+        return PathBuf::from(p);
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "windows")]
+    candidates.push(local_appdata().join("hermes"));
+    candidates.push(home().join(".hermes"));
+    candidates.iter().find(|p| p.exists()).cloned()
+        .unwrap_or_else(|| candidates[0].clone())
+}
+
 /// Detect which AI clients are installed on this machine.
 #[tauri::command]
 fn detect_clients() -> Vec<ClientInfo> {
@@ -193,18 +220,39 @@ fn detect_clients() -> Vec<ClientInfo> {
             h.join(".codeium").join("windsurf"), None),
         client("antigravity", "Antigravity",
             h.join(".gemini").join("antigravity"), None),
+        // Gemini CLI: detect on the settings FILE, not ~/.gemini — that dir
+        // also exists on Antigravity-only machines.
+        client("gemini-cli", "Gemini CLI",
+            h.join(".gemini").join("settings.json"),
+            Some("Consumer service retired June 2026; enterprise/API-key installs still work")),
         client("cline", "Cline (VS Code extension)",
             a.join("Code").join("User").join("globalStorage")
              .join("saoudrizwan.claude-dev"), None),
         client("roo-code", "Roo Code (VS Code extension)",
             a.join("Code").join("User").join("globalStorage")
-             .join("rooveterinaryinc.roo-cline"), None),
+             .join("rooveterinaryinc.roo-cline"),
+            Some("Discontinued upstream (May 2026); Zoo Code is the successor")),
+        client("zoo-code", "Zoo Code (VS Code extension)",
+            a.join("Code").join("User").join("globalStorage")
+             .join("zoocodeorganization.zoo-code"), None),
+        client("vscode", "VS Code (Copilot agent mode)",
+            a.join("Code").join("User"),
+            Some("Requires VS Code 1.102+ with Copilot chat enabled")),
         client("continue", "Continue.dev",
             h.join(".continue"),
-            Some("HTTP transport requires Continue.dev v0.9.210+")),
-        client("codex", "Codex (CLI / IDE / app)",
+            Some("Discontinued upstream (acquired by Cursor); existing installs still work")),
+        client("codex", "ChatGPT-Codex (app / CLI / IDE)",
             h.join(".codex"),
-            Some("Shared by Codex CLI, IDE, and desktop app. Windows desktop app may clear the entry on launch (OpenAI bug #24718) — re-run to restore.")),
+            Some("Shared by the ChatGPT-Codex desktop app, Codex CLI, and IDE extension. The Windows app may clear the entry on launch (OpenAI bug #24718) — re-run to restore.")),
+        client("grok", "Grok Build",
+            grok_home(), None),
+        client("kimi-code", "Kimi Code",
+            kimi_code_home(), None),
+        client("openclaw", "OpenClaw",
+            openclaw_home(),
+            Some("Restart the OpenClaw gateway after install to pick up the new server")),
+        client("hermes", "Hermes",
+            hermes_home(), None),
     ]
 }
 
@@ -428,10 +476,17 @@ fn client_label(id: &str) -> &str {
         "cursor"         => "Cursor",
         "windsurf"       => "Windsurf",
         "antigravity"    => "Antigravity",
+        "gemini-cli"     => "Gemini CLI",
         "cline"          => "Cline",
         "roo-code"       => "Roo Code",
+        "zoo-code"       => "Zoo Code",
+        "vscode"         => "VS Code",
         "continue"       => "Continue.dev",
-        "codex"          => "Codex",
+        "codex"          => "ChatGPT-Codex",
+        "grok"           => "Grok Build",
+        "kimi-code"      => "Kimi Code",
+        "openclaw"       => "OpenClaw",
+        "hermes"         => "Hermes",
         other            => other,
     }
 }
@@ -443,12 +498,17 @@ fn read_json(path: &Path) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
+// Atomic write: several clients (Cline notably) watch their config file and
+// can observe — and act on — a half-written file. Temp file in the same
+// directory + rename is atomic on every platform we ship.
 fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let content = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    std::fs::write(path, content + "\n").map_err(|e| e.to_string())
+    let tmp = path.with_extension("pinako-tmp");
+    std::fs::write(&tmp, content + "\n").map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 fn ensure_obj(v: &mut serde_json::Value, key: &str) {
@@ -600,17 +660,36 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             Ok(())
         }
         "cline" => {
-            let path = appdata
-                .join("Code").join("User").join("globalStorage")
-                .join("saoudrizwan.claude-dev").join("settings")
-                .join("cline_mcp_settings.json");
-            let mut cfg = read_json(&path);
-            ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({
+            // `type` is load-bearing: omitting it selects Cline's legacy SSE
+            // transport — wrong protocol for our streamable-HTTP endpoint.
+            // Cline 4.1.x A/B-tests two bundles per window that read
+            // DIFFERENT paths (legacy → globalStorage, next/SDK → the
+            // ~/.cline file shared with the Cline CLI and JetBrains); the
+            // flag is remote and can flip on any reload, so write both.
+            let entry = serde_json::json!({
+                "type": "streamableHttp",
                 "url": MCP_URL, "disabled": false, "autoApprove": READ_ONLY_TOOLS
             });
-            write_json(&path, &cfg)
+            let paths = [
+                appdata
+                    .join("Code").join("User").join("globalStorage")
+                    .join("saoudrizwan.claude-dev").join("settings")
+                    .join("cline_mcp_settings.json"),
+                home.join(".cline").join("data").join("settings")
+                    .join("cline_mcp_settings.json"),
+            ];
+            for path in &paths {
+                let mut cfg = read_json(path);
+                ensure_obj(&mut cfg, "mcpServers");
+                cfg["mcpServers"]["pinako"] = entry.clone();
+                write_json(path, &cfg)?;
+            }
+            Ok(())
         }
+        // Roo Code (discontinued 2026-05-15; kept for existing installs) and
+        // its successor fork Zoo Code share a schema: an explicit hyphenated
+        // `type` is REQUIRED for url servers (Roo throws without it), and the
+        // auto-approve field is `alwaysAllow`, NOT Cline's `autoApprove`.
         "roo-code" => {
             let path = appdata
                 .join("Code").join("User").join("globalStorage")
@@ -619,39 +698,107 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
             cfg["mcpServers"]["pinako"] = serde_json::json!({
-                "url": MCP_URL, "disabled": false, "autoApprove": READ_ONLY_TOOLS
+                "type": "streamable-http",
+                "url": MCP_URL, "disabled": false, "alwaysAllow": READ_ONLY_TOOLS
             });
             write_json(&path, &cfg)
         }
-        "continue" => {
-            let path = home.join(".continue").join("config.json");
+        "zoo-code" => {
+            let path = appdata
+                .join("Code").join("User").join("globalStorage")
+                .join("zoocodeorganization.zoo-code").join("settings")
+                .join("mcp_settings.json");
             let mut cfg = read_json(&path);
-            if !cfg["experimental"].is_object() {
-                cfg["experimental"] = serde_json::json!({});
-            }
-            let existing = cfg["experimental"]["modelContextProtocolServers"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            // Remove stale pinako entry, then append fresh one
-            let mut servers: Vec<_> = existing.into_iter()
-                .filter(|s| {
-                    s.get("transport")
-                        .and_then(|t| t.get("url"))
-                        .and_then(|u| u.as_str())
-                        != Some(MCP_URL)
-                })
-                .collect();
-            servers.push(serde_json::json!({
-                "transport": { "type": "streamableHttp", "url": MCP_URL }
-            }));
-            cfg["experimental"]["modelContextProtocolServers"] =
-                serde_json::Value::Array(servers);
+            ensure_obj(&mut cfg, "mcpServers");
+            cfg["mcpServers"]["pinako"] = serde_json::json!({
+                "type": "streamable-http",
+                "url": MCP_URL, "disabled": false, "alwaysAllow": READ_ONLY_TOOLS
+            });
             write_json(&path, &cfg)
         }
+        "vscode" => {
+            // Prefer `code --add-mcp`: it writes to the ACTIVE profile (a
+            // file written to User/mcp.json is invisible to users running a
+            // named profile) and lets VS Code own its JSONC parsing. Fallback
+            // merges the default profile's mcp.json — top-level key is
+            // `servers`, NOT `mcpServers`.
+            if !run_code_add_mcp() {
+                let path = appdata.join("Code").join("User").join("mcp.json");
+                let mut cfg = read_json_strict(&path)?
+                    .unwrap_or_else(|| serde_json::json!({}));
+                ensure_obj(&mut cfg, "servers");
+                cfg["servers"]["pinako"] =
+                    serde_json::json!({ "type": "http", "url": MCP_URL });
+                write_json(&path, &cfg)?;
+            }
+            Ok(())
+        }
+        "gemini-cli" => {
+            // ~/.gemini/settings.json is Gemini CLI's main settings file
+            // (auth, prefs) — strict read so a corrupt file is refused.
+            // Streamable HTTP uses `httpUrl` (`url` means SSE here, and
+            // Antigravity's `serverUrl` file does not serve this CLI).
+            let path = home.join(".gemini").join("settings.json");
+            let mut cfg = read_json_strict(&path)?
+                .unwrap_or_else(|| serde_json::json!({}));
+            ensure_obj(&mut cfg, "mcpServers");
+            cfg["mcpServers"]["pinako"] = serde_json::json!({ "httpUrl": MCP_URL });
+            write_json(&path, &cfg)
+        }
+        "grok" => {
+            // Same [mcp_servers.pinako] TOML shape as Codex; `enabled = true`
+            // matches the bundled docs' convention for url-form servers.
+            upsert_pinako_toml_table(
+                &grok_home().join("config.toml"),
+                &[&format!("url = \"{MCP_URL}\""), "enabled = true"])
+        }
+        "kimi-code" => {
+            // Dedicated mcp.json (Claude-Desktop-compatible shape); a bare
+            // `url` with no `transport` key is treated as streamable HTTP.
+            let path = kimi_code_home().join("mcp.json");
+            let mut cfg = read_json(&path);
+            ensure_obj(&mut cfg, "mcpServers");
+            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": MCP_URL });
+            write_json(&path, &cfg)
+        }
+        "openclaw" => {
+            // openclaw.json is the MAIN gateway config (channels, auth,
+            // plugins, agents) — strict read so a corrupt file is refused,
+            // never replaced. Transport is NOT inferred from `url` here;
+            // "streamable-http" must be explicit.
+            let path = openclaw_home().join("openclaw.json");
+            let mut cfg = read_json_strict(&path)?
+                .unwrap_or_else(|| serde_json::json!({}));
+            ensure_obj(&mut cfg, "mcp");
+            if !cfg["mcp"]["servers"].is_object() {
+                cfg["mcp"]["servers"] = serde_json::json!({});
+            }
+            cfg["mcp"]["servers"]["pinako"] = serde_json::json!({
+                "url": MCP_URL, "transport": "streamable-http", "enabled": true
+            });
+            write_json(&path, &cfg)
+        }
+        "hermes" => upsert_hermes_yaml(&hermes_home().join("config.yaml")),
+        "continue" => {
+            // Standalone MCP block file the IDE extensions auto-discover. We
+            // own this file outright, so a plain overwrite is idempotent and
+            // can never clobber the user's config.yaml. (The previous writer
+            // targeted config.json's experimental key, which Continue ignores
+            // once config.yaml exists — a silent no-op in practice. Continue
+            // itself is frozen upstream: acquired by Cursor, final 2.0.0.)
+            let path = home.join(".continue").join("mcpServers").join("pinako.yaml");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let yaml = format!(
+                "name: Pinako\nversion: 0.0.1\nschema: v1\nmcpServers:\n  - name: Pinako\n    type: streamable-http\n    url: {MCP_URL}\n"
+            );
+            std::fs::write(&path, yaml).map_err(|e| e.to_string())
+        }
         "codex" => {
-            let path = home.join(".codex").join("config.toml");
-            write_codex_config(&path)
+            upsert_pinako_toml_table(
+                &home.join(".codex").join("config.toml"),
+                &[&format!("url = \"{MCP_URL}\""), "startup_timeout_sec = 20"])
         }
         other => Err(format!("Unknown client id: {other}")),
     }
@@ -667,7 +814,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
 // streamable-HTTP server automatically; no experimental flag is written (an
 // unrecognized key would break Codex's --strict-config).
 
-const CODEX_TABLE: &str = "mcp_servers.pinako";
+const PINAKO_TABLE: &str = "mcp_servers.pinako";
 
 fn strip_toml_table(toml: &str, table: &str) -> String {
     let nl = if toml.contains("\r\n") { "\r\n" } else { "\n" };
@@ -687,14 +834,14 @@ fn strip_toml_table(toml: &str, table: &str) -> String {
     out.join(nl)
 }
 
-fn write_codex_config(path: &Path) -> Result<(), String> {
+/// Drop any prior pinako table (idempotent re-install), then append a fresh
+/// canonical block with the given body lines. Shared by Codex and Grok Build.
+fn upsert_pinako_toml_table(path: &Path, body_lines: &[&str]) -> Result<(), String> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let nl = if existing.contains("\r\n") { "\r\n" } else { "\n" };
-    let stripped = strip_toml_table(&existing, CODEX_TABLE);
+    let stripped = strip_toml_table(&existing, PINAKO_TABLE);
     let stripped = stripped.trim_end();
-    let block = format!(
-        "[{CODEX_TABLE}]{nl}url = \"{MCP_URL}\"{nl}startup_timeout_sec = 20"
-    );
+    let block = format!("[{PINAKO_TABLE}]{nl}{}", body_lines.join(nl));
     let next = if stripped.is_empty() {
         format!("{block}{nl}")
     } else {
@@ -703,6 +850,118 @@ fn write_codex_config(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    std::fs::write(path, next).map_err(|e| e.to_string())
+}
+
+/// `code --add-mcp '<json>'` upserts into the active VS Code profile's
+/// mcp.json. Same .cmd-shim spawn rules as the claude CLI.
+fn run_code_add_mcp() -> bool {
+    let entry = serde_json::json!({ "name": "pinako", "type": "http", "url": MCP_URL })
+        .to_string();
+    #[cfg(target_os = "windows")]
+    let out = std::process::Command::new("cmd")
+        .args(["/c", "code", "--add-mcp", &entry])
+        .output();
+    #[cfg(not(target_os = "windows"))]
+    let out = std::process::Command::new("code")
+        .args(["--add-mcp", &entry])
+        .output();
+    matches!(out, Ok(o) if o.status.success())
+}
+
+// ── Hermes YAML (textual surgery) ────────────────────────────────────────────
+// Hermes config is a large user-owned YAML we must not re-serialize (comments,
+// anchors, _config_version). Three recognized cases, mirroring the JS writer:
+// no `mcp_servers:` key → append block at EOF; a bare `mcp_servers:` (or
+// `mcp_servers: {}`) line → replace any existing pinako child, insert ours
+// matching the block's existing child indent; anything else → refuse with a
+// manual hint. YAML forbids tabs in indentation, so space-math is safe.
+
+fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let lines: Vec<String> = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split(['\n']).map(|l| l.trim_end_matches('\r').to_string()).collect()
+    };
+
+    // Matches `mcp_servers:` / `mcp_servers: {}`, optionally comment-trailed —
+    // the JS writer's /^mcp_servers:\s*(\{\s*\}\s*)?(#.*)?$/ equivalent.
+    let is_open_header = |l: &str| -> bool {
+        let Some(rest) = l.strip_prefix("mcp_servers:") else { return false };
+        let no_comment = rest.split('#').next().unwrap_or("").trim();
+        no_comment.is_empty() || no_comment.replace(' ', "") == "{}"
+    };
+
+    let idx = lines.iter().position(|l| is_open_header(l));
+    let Some(idx) = idx else {
+        if lines.iter().any(|l| l.starts_with("mcp_servers:")) {
+            return Err(format!(
+                "config.yaml declares mcp_servers in a format this installer does not edit — \
+                 add this entry manually: mcp_servers: {{ pinako: {{ url: \"{MCP_URL}\" }} }}"));
+        }
+        let block = format!(
+            "mcp_servers:{nl}  pinako:{nl}    url: \"{MCP_URL}\"{nl}    enabled: true{nl}");
+        let base = text.trim_end();
+        let next = if base.is_empty() {
+            block
+        } else {
+            format!("{base}{nl}{nl}{block}")
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        return std::fs::write(path, next).map_err(|e| e.to_string());
+    };
+
+    let mut lines = lines;
+    // Normalize `mcp_servers: {}` into an open block.
+    if lines[idx].contains('{') {
+        lines[idx] = "mcp_servers:".to_string();
+    }
+
+    // The block runs until the next non-blank line at column 0.
+    let mut end = idx + 1;
+    while end < lines.len() {
+        let l = &lines[end];
+        if !l.is_empty() && !l.starts_with(' ') { break; }
+        end += 1;
+    }
+
+    // Siblings must share indentation — reuse the block's existing indent.
+    let indent: String = lines[idx + 1..end].iter()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.chars().take_while(|c| *c == ' ').collect())
+        .unwrap_or_else(|| "  ".to_string());
+
+    // Drop any existing pinako child (its header + every deeper line).
+    let mut kept: Vec<String> = Vec::new();
+    let mut skipping = false;
+    for l in &lines[idx + 1..end] {
+        let header = format!("{indent}pinako:");
+        let after = l.strip_prefix(header.as_str()).map(str::trim);
+        if matches!(after, Some(rest) if rest.is_empty() || rest.starts_with('#')) {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            let line_indent = l.chars().take_while(|c| *c == ' ').count();
+            if l.trim().is_empty() || line_indent > indent.len() { continue; }
+            skipping = false;
+        }
+        kept.push(l.clone());
+    }
+
+    let child_indent = format!("{indent}{indent}");
+    let mut next_lines: Vec<String> = lines[..idx + 1].to_vec();
+    next_lines.push(format!("{indent}pinako:"));
+    next_lines.push(format!("{child_indent}url: \"{MCP_URL}\""));
+    next_lines.push(format!("{child_indent}enabled: true"));
+    next_lines.extend(kept);
+    next_lines.extend_from_slice(&lines[end..]);
+
+    let next = format!("{}{nl}", next_lines.join(nl).trim_end());
     std::fs::write(path, next).map_err(|e| e.to_string())
 }
 

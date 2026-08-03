@@ -164,7 +164,8 @@ async function main() {
 
   if (found.length === 0) {
     console.log(yellow('  No supported AI apps found on this machine.'));
-    console.log(dim('  Install Claude Code, Claude Desktop, Cursor, Windsurf, Antigravity, Cline, Roo Code, or Continue.dev'));
+    console.log(dim('  Install Claude Code, Claude Desktop, Cursor, ChatGPT-Codex, VS Code (Copilot),'));
+    console.log(dim('  Antigravity, Grok Build, Kimi Code, OpenClaw, Hermes, Cline, or Zoo Code'));
     console.log(dim('  then re-run this installer.'));
     console.log('');
     await showFinalInstructions();
