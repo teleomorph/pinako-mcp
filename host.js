@@ -25,6 +25,7 @@ import { randomUUID, randomBytes } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import pkg from './package.json' with { type: 'json' };
+import { PINAKO_ICONS } from './icons.js';
 
 // ─── Debug log file ───────────────────────────────────────────────────────────
 // Cross-platform log path (host.js is bundled independently — no import from setup/paths.js)
@@ -2640,9 +2641,23 @@ CONNECTION RECOVERY. If a tool returns "No data yet - open the Pinako extension 
 
 For complete documentation, see: https://pinako.pro/docs/ai-connect`;
 
+// serverInfo advertised in the MCP initialize response. `icons` (SEP-973) is
+// what Claude Desktop renders beside the connector name — without it a local
+// (stdio) connector falls back to a generic lettered avatar while the cloud
+// connector, which does send icons, shows the logo. `title` + `websiteUrl`
+// give clients a human label + link beyond the protocol `name`. Mirrors
+// supabase/functions/mcp-server/index.ts SERVER_INFO.
+const SERVER_INFO = {
+  name: 'pinako',
+  title: 'Pinako',
+  version: pkg.version,
+  websiteUrl: 'https://pinako.pro',
+  icons: PINAKO_ICONS,
+};
+
 function createMcpServer() {
   const srv = new McpServer(
-    { name: 'pinako', version: pkg.version },
+    SERVER_INFO,
     { instructions: SERVER_INSTRUCTIONS }
   );
 
