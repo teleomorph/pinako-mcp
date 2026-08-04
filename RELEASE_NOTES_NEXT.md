@@ -6,4 +6,5 @@
 
 ## What's new
 
+- **Removed the `/debug` HTTP endpoint (security hardening).** It replayed the last 10 MCP requests, including write payloads and session ids, to any local caller. The same diagnostics remain available in `pinako-mcp.log`, which is protected by your user profile's file permissions.
 - **Claude Desktop no longer shows "Could not attach to MCP server pinako" when no browser is running.** The `--stdio-mcp` shim now completes the MCP handshake and serves the full tool catalog locally, connects to the Bridge lazily per call, returns a clear "open your browser with the Pinako extension" message on tool calls made while no browser is up, and reconnects automatically (refreshing the client's tool list) the moment the Bridge comes back.

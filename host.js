@@ -44,7 +44,6 @@ function getLogPath() {
 }
 const LOG_PATH = getLogPath();
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate active log past 5 MB (was unbounded; a crash loop once grew it to 27 MB)
-const recentRequests = []; // last 10 /mcp requests for /debug endpoint
 let logDirCreated = false;
 let logBytesWritten = 0;
 let logSizeSeeded = false;
@@ -78,17 +77,12 @@ function log(msg) {
   } catch (_) {}
 }
 
+// Request diagnostics go to the log file only (user-profile ACL). The old
+// /debug HTTP endpoint replayed the last 10 /mcp requests — full write
+// payloads + mcp-session-id headers — to ANY local caller, violating the
+// localhost threat model (see the forwarderToken comment below). Removed
+// 2026-08-04; full auth for /mcp itself is ai-todo #67.
 function logRequest(label, req, body) {
-  const entry = {
-    time: new Date().toISOString(),
-    label,
-    method: req.method,
-    url: req.url,
-    headers: req.headers,
-    body,
-  };
-  recentRequests.push(entry);
-  if (recentRequests.length > 10) recentRequests.shift();
   log(`${label}: ${req.method} ${req.url} | headers: ${JSON.stringify(req.headers)} | body: ${JSON.stringify(body)}`);
 }
 
@@ -4411,13 +4405,6 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Debug: shows last 10 requests to /mcp
-  if (req.url === '/debug') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ recentRequests }, null, 2));
-    return;
-  }
-
   // Internal: new host instance forwards fresh data here when EADDRINUSE
   if (req.url === '/update' && req.method === 'POST') {
     const chunks = [];
@@ -4727,7 +4714,8 @@ const httpServer = http.createServer(async (req, res) => {
         if (pending) {
           // 2026-05-11: token-bind /edit-result to the forwarder that owns
           // the target browserId. Without this, any local process that
-          // observed a requestId (via /debug, or by guessing) could spoof
+          // observed a requestId (by guessing, or via the since-removed
+          // /debug endpoint) could spoof
           // a successful editApplied for the AI client. SSE-routed pending
           // entries have entry.browserId; the leader's expected token for
           // that browserId is in cachedData. Local-NM pending entries
