@@ -372,6 +372,12 @@ process.stdout.on('error', (err) => {
 });
 
 function nmWrite(obj) {
+  // In --stdio-mcp mode stdout IS the MCP stdio channel to the AI client —
+  // no extension is attached, and a length-prefixed NM frame written here
+  // would splice into the JSON-RPC line stream and corrupt it (observed with
+  // a host extension's periodic queries gluing onto a notification line).
+  // Report unwritable, same as a broken NM stdout.
+  if (BRIDGE_URL) return false;
   if (_nmStdoutBroken) return false;
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
   const header = Buffer.alloc(4);
@@ -4958,132 +4964,270 @@ if (!BRIDGE_URL) {
 
 // ─── Stdio MCP bridge mode ────────────────────────────────────────────────────
 // When invoked with `--stdio-mcp <URL>`, act as a stdio MCP server that proxies
-// every JSON-RPC message to a local HTTP MCP server. Used by Claude Desktop,
-// whose mcpServers config only accepts stdio subprocesses (command + args).
-// Replaces the need for `npx mcp-remote` and the Node.js dependency on the
-// end user's machine.
+// JSON-RPC messages to a local HTTP MCP server. Used by Claude Desktop, whose
+// mcpServers config only accepts stdio subprocesses (command + args). Replaces
+// the need for `npx mcp-remote` and the Node.js dependency on the end user's
+// machine.
+//
+// Resilience contract (2026-08-03): the bridge on `httpUrl` is spawned by a
+// BROWSER (native messaging), so "nothing is listening on 37421" is a normal,
+// expected state — the user simply hasn't opened a browser yet. The old shim
+// proxied `initialize` to the bridge, so a stopped bridge failed the MCP
+// handshake and the AI client painted a "could not attach" error banner on
+// every launch. The shim must therefore NEVER let bridge downtime reach the
+// handshake:
+//   - `initialize` / `notifications/initialized` are ALWAYS answered by a
+//     local in-process McpServer — the same createMcpServer() the HTTP bridge
+//     builds per session, so serverInfo / instructions / capabilities /
+//     tool catalog are identical by construction (no cached copy to drift).
+//   - The remote session is shim-originated: we self-author an `initialize`
+//     to the bridge lazily (on demand, plus a background retry while down),
+//     never forwarding the client's own handshake.
+//   - `tools/list` and other catalog/utility requests forward to the live
+//     bridge when it's up, and fall back to the local instance when not.
+//   - `tools/call` while the bridge is down returns an in-band tool result
+//     with isError:true and actionable text — the model relays it; no
+//     protocol error, no banner.
+//   - When the bridge comes back, the shim reconnects transparently and (if
+//     it ever served a locally-answered tools/list) emits
+//     notifications/tools/list_changed so the client refreshes its catalog
+//     from the live bridge.
 async function runStdioBridge(httpUrl) {
-  const stdio  = new StdioServerTransport();
-  let remote   = new StreamableHTTPClientTransport(new URL(httpUrl));
+  const stdio = new StdioServerTransport();
 
-  // Slice W-4 (refined): we need to replay `initialize` on re-handshake
-  // because the new bridge has an empty activeSessions Map and rejects
-  // any tools/call without a valid session. The SDK's
-  // StreamableHTTPClientTransport doesn't synthesize initialize on its
-  // own — it just forwards whatever message we hand it. So we cache the
-  // initialize request as it flows through from Claude Desktop on first
-  // connect, and replay it before retrying the original failing message.
-  // The initialize-replay response is intercepted so Claude Desktop
-  // doesn't see a duplicate handshake completion.
-  let cachedInitialize = null;   // the original {jsonrpc:'2.0',id:N,method:'initialize',params:...}
-  let cachedInitNotif  = null;   // the optional {jsonrpc:'2.0',method:'notifications/initialized'} (no id)
-  let suppressInitReplayId = null;  // id of an in-flight replay; intercept its response
-  let reHandshakeInFlight = null;   // mutex so concurrent failing requests don't double-recreate the transport
+  // ── Local fallback backend ──
+  // A loopback transport wired straight to stdio: whatever the local server
+  // answers goes back to the client verbatim. Only messages we explicitly
+  // route here (feedLocal) reach it, so it can never double-answer a request
+  // that was forwarded to the live bridge.
+  const loopback = {
+    async start() {},
+    async close() {},
+    async send(msg) {
+      try { await stdio.send(msg); }
+      catch (err) { process.stderr.write(`[stdio-mcp] local reply error: ${err.message}\n`); }
+    },
+    onmessage: null,
+    onerror: null,
+    onclose: null,
+  };
+  const localServer = createMcpServer();
+  await localServer.connect(loopback);
+  const feedLocal = (msg) => {
+    try { loopback.onmessage && loopback.onmessage(msg); }
+    catch (err) { process.stderr.write(`[stdio-mcp] local dispatch error: ${err.message}\n`); }
+  };
 
-  // remote → stdio (forward responses back to Claude Desktop). Defined as
-  // a function so we can rebind onto a freshly-created transport after a
-  // stale-session re-handshake.
-  function wireRemoteListeners() {
-    remote.onmessage = async (msg) => {
-      // Slice W-4: swallow the initialize-replay response — the upstream
-      // client already saw a handshake completion at the start of the
-      // session; re-emitting one would confuse it.
-      if (suppressInitReplayId !== null && msg && msg.id !== undefined && msg.id === suppressInitReplayId) {
-        suppressInitReplayId = null;
+  // ── Remote (live bridge) session state ──
+  let remote = null;                 // StreamableHTTPClientTransport with an established session
+  let ensureInFlight = null;         // mutex: concurrent callers share one connection attempt
+  let clientProtocolVersion = '2025-03-26'; // echo the client's negotiated version to the bridge
+  let servedLocalToolsList = false;  // catalog was answered locally → notify list_changed on reconnect
+  let downLogged = false;            // log unreachability once per outage, not per retry
+  let retryTimer = null;
+  let shimIdCounter = 0;
+  const shimSuppressIds = new Set(); // shim-originated request ids; swallow their responses
+
+  // Session-not-found from a live bridge after leader rotation (Slice W-4) —
+  // distinct from "nothing is listening": the bridge is up but our session id
+  // died with the old leader, so rebuild the session and retry the message.
+  const STALE_SESSION_RE = /Session not found|-32001|reinitialize|HTTP 404|status code 404/i;
+  // Transport-level unreachability — the bridge process isn't there (or is
+  // wedged). This marks the remote DOWN and starts the background retry.
+  const CONNECTION_ERR_RE = /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENETUNREACH|EPIPE|socket hang up|network|timed out/i;
+
+  const withTimeout = (promise, ms, what) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(what)), ms);
+    if (t.unref) t.unref();
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
+  });
+
+  function wireRemoteListeners(t) {
+    t.onmessage = async (msg) => {
+      // Swallow responses to shim-originated requests (the self-authored
+      // initialize) — the client already completed its own handshake locally.
+      if (msg && msg.id !== undefined && shimSuppressIds.has(msg.id)) {
+        shimSuppressIds.delete(msg.id);
         return;
       }
-      try {
-        await stdio.send(msg);
-      } catch (err) {
-        process.stderr.write(`[stdio-mcp] reply error: ${err.message}\n`);
-      }
+      try { await stdio.send(msg); }
+      catch (err) { process.stderr.write(`[stdio-mcp] reply error: ${err.message}\n`); }
     };
-    remote.onerror = (err) => {
+    t.onerror = (err) => {
       process.stderr.write(`[stdio-mcp] remote transport error: ${err.message}\n`);
     };
   }
-  wireRemoteListeners();
 
-  // Slice W-4: transparent stale-session re-handshake. After a leader
-  // rotation (zombie recovery + forwarder promotion), the new bridge
-  // returns HTTP 404 (code -32001 "Session not found — reinitialize.")
-  // per Slice W's spec compliance. The SDK's StreamableHTTPClientTransport
-  // surfaces this as a send error but doesn't auto-reset the session.
-  // We detect the error, close the transport, build a fresh one, replay
-  // the cached initialize (extracting the new session id from the
-  // response headers via the transport's internal state), optionally
-  // replay the cached `notifications/initialized`, and retry the
-  // original failing message.
-  const STALE_SESSION_RE = /Session not found|-32001|reinitialize|HTTP 404|status code 404/i;
-
-  async function performReHandshake() {
-    if (!cachedInitialize) {
-      throw new Error('cannot re-handshake: no cached initialize message');
-    }
-    process.stderr.write(`[stdio-mcp] re-handshaking transparently...\n`);
-    try { await remote.close(); } catch (_) {}
-    remote = new StreamableHTTPClientTransport(new URL(httpUrl));
-    wireRemoteListeners();
-    await remote.start();
-    // Intercept the initialize response (matches by id) so Claude Desktop
-    // doesn't see a second handshake-complete reply.
-    suppressInitReplayId = (cachedInitialize.id !== undefined) ? cachedInitialize.id : null;
-    await remote.send(cachedInitialize);
-    // Replay the initialized notification if we saw one. Notifications
-    // have no id and no response; just fire-and-forget.
-    if (cachedInitNotif) {
-      try { await remote.send(cachedInitNotif); } catch (_) { /* tolerate */ }
-    }
-    process.stderr.write(`[stdio-mcp] re-handshake complete\n`);
+  function teardownRemote() {
+    if (remote) { const t = remote; remote = null; t.close().catch(() => {}); }
   }
 
-  // stdio (from Claude Desktop) → remote (HTTP MCP server)
-  stdio.onmessage = async (msg) => {
-    // Slice W-4: cache initialize + the optional initialized notification
-    // on the way through so we can replay them on re-handshake. We cache
-    // the LAST initialize we saw (typically only one per session, but if
-    // Claude Desktop ever re-initializes we'd want the latest).
-    if (msg && msg.method === 'initialize') {
-      cachedInitialize = msg;
-    } else if (msg && msg.method === 'notifications/initialized') {
-      cachedInitNotif = msg;
+  function scheduleRetry() {
+    if (retryTimer) return;
+    retryTimer = setInterval(() => { ensureRemote(); }, 15000);
+    if (retryTimer.unref) retryTimer.unref();
+  }
+
+  function stopRetry() {
+    if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
+  }
+
+  function markRemoteDown(reason) {
+    teardownRemote();
+    if (!downLogged) {
+      downLogged = true;
+      process.stderr.write(`[stdio-mcp] bridge unreachable at ${httpUrl} (${reason}) — serving handshake/catalog locally; will keep retrying\n`);
     }
+    scheduleRetry();
+  }
+
+  async function establishRemoteSession() {
+    const t = new StreamableHTTPClientTransport(new URL(httpUrl));
+    wireRemoteListeners(t);
+    await t.start();
+    const initId = `pinako-shim-init-${++shimIdCounter}`;
+    shimSuppressIds.add(initId);
+    try {
+      // ECONNREFUSED fails in milliseconds; the timeout only bounds a bridge
+      // whose port is open but wedged (zombie leader mid-rotation).
+      await withTimeout(t.send({
+        jsonrpc: '2.0',
+        id: initId,
+        method: 'initialize',
+        params: {
+          protocolVersion: clientProtocolVersion,
+          capabilities: {},
+          clientInfo: { name: 'pinako-stdio-bridge', version: pkg.version },
+        },
+      }), 8000, 'bridge initialize timed out');
+      // send() resolves after the HTTP response headers are processed, so the
+      // transport already holds the Mcp-Session-Id for subsequent requests.
+      await t.send({ jsonrpc: '2.0', method: 'notifications/initialized' }).catch(() => {});
+      return t;
+    } catch (err) {
+      shimSuppressIds.delete(initId);
+      t.close().catch(() => {});
+      throw err;
+    }
+  }
+
+  // Establish (or reuse) the shim→bridge session. Returns true when the
+  // remote is usable. Never throws; failure marks the remote down and lets
+  // the caller fall back to local handling.
+  function ensureRemote() {
+    if (remote) return Promise.resolve(true);
+    if (!ensureInFlight) {
+      ensureInFlight = (async () => {
+        try {
+          const t = await establishRemoteSession();
+          remote = t;
+          stopRetry();
+          if (downLogged) {
+            downLogged = false;
+            process.stderr.write(`[stdio-mcp] reconnected to ${httpUrl}\n`);
+          } else {
+            process.stderr.write(`[stdio-mcp] connected to ${httpUrl}\n`);
+          }
+          // The client's catalog may have come from the local fallback; tell
+          // it to re-list so it picks up the live bridge's catalog (normally
+          // identical — same binary — but version skew across an update or a
+          // host-extension delta would otherwise linger until app restart).
+          if (servedLocalToolsList) {
+            servedLocalToolsList = false;
+            try { await stdio.send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }); } catch (_) {}
+          }
+          return true;
+        } catch (err) {
+          markRemoteDown((err && err.message) ? err.message : String(err));
+          return false;
+        } finally {
+          ensureInFlight = null;
+        }
+      })();
+    }
+    return ensureInFlight;
+  }
+
+  // Answer a message without the live bridge. Requests that only need the
+  // catalog/protocol (tools/list, ping, prompts/*, resources/*) go to the
+  // local instance — byte-identical behavior to the real bridge. tools/call
+  // needs live browser data, so it gets an in-band, actionable tool error
+  // the model can relay (never a protocol error, which clients render as a
+  // server failure).
+  async function respondWithoutBridge(msg, detail) {
+    const isRequest = msg && msg.method !== undefined && msg.id !== undefined && msg.id !== null;
+    if (!isRequest) return; // notification or stray response — nothing to answer
+    if (msg.method === 'tools/call') {
+      const text = (detail && !CONNECTION_ERR_RE.test(detail))
+        ? `Pinako bridge error: ${detail}. The Pinako browser extension may be restarting — try again in a few seconds.`
+        : 'Pinako Bridge isn\'t running — no browser with the Pinako extension is connected right now. Ask the user to open their browser (with the Pinako extension enabled); the bridge reconnects automatically within a few seconds. This request was NOT executed.';
+      try {
+        await stdio.send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { content: [{ type: 'text', text }], isError: true },
+        });
+      } catch (_) { /* stdio gone, give up */ }
+      return;
+    }
+    if (msg.method === 'tools/list') servedLocalToolsList = true;
+    feedLocal(msg);
+  }
+
+  // stdio (from the AI client) → remote bridge, local fallback, or both
+  stdio.onmessage = async (msg) => {
+    // The handshake is ALWAYS local — a stopped bridge must never be able to
+    // fail it (that failure is exactly what painted the client's attach
+    // banner). The local instance shares createMcpServer() with the real
+    // bridge, so the client sees the same serverInfo/instructions/catalog.
+    if (msg && msg.method === 'initialize') {
+      if (msg.params && msg.params.protocolVersion) {
+        clientProtocolVersion = msg.params.protocolVersion;
+      }
+      feedLocal(msg);
+      ensureRemote(); // background warm-up; don't block the handshake on it
+      return;
+    }
+    if (msg && msg.method === 'notifications/initialized') {
+      feedLocal(msg);
+      return;
+    }
+
+    // Lazy per-message connect: fails in milliseconds when nothing listens.
+    const up = await ensureRemote();
+    if (!up) {
+      await respondWithoutBridge(msg, null);
+      return;
+    }
+
     try {
       await remote.send(msg);
+      return;
     } catch (err) {
       let effectiveErr = err;
       const errStr = (err && err.message) ? err.message : String(err) || '';
-      if (STALE_SESSION_RE.test(errStr) && cachedInitialize) {
+      if (STALE_SESSION_RE.test(errStr)) {
+        // Slice W-4: leader rotated, session id died with it. Rebuild the
+        // shim-originated session and retry the original message once.
+        process.stderr.write('[stdio-mcp] stale session — re-handshaking transparently...\n');
+        teardownRemote();
         try {
-          // Serialize concurrent re-handshakes — N in-flight failed sends
-          // shouldn't all create N fresh transports.
-          if (!reHandshakeInFlight) {
-            reHandshakeInFlight = performReHandshake().finally(() => { reHandshakeInFlight = null; });
+          if (await ensureRemote()) {
+            await remote.send(msg);
+            process.stderr.write('[stdio-mcp] request retried after re-handshake\n');
+            return;
           }
-          await reHandshakeInFlight;
-          // Now retry the original message on the fresh session.
-          await remote.send(msg);
-          process.stderr.write(`[stdio-mcp] request retried after re-handshake\n`);
-          return;
         } catch (retryErr) {
-          process.stderr.write(`[stdio-mcp] re-handshake failed: ${retryErr.message}\n`);
           effectiveErr = retryErr;
         }
       }
-      process.stderr.write(`[stdio-mcp] forward error: ${effectiveErr.message}\n`);
-      // Return a JSON-RPC error if this was a request (has id)
-      if (msg && msg.id !== undefined && msg.id !== null) {
-        try {
-          await stdio.send({
-            jsonrpc: '2.0',
-            id: msg.id,
-            error: {
-              code: -32603,
-              message: `Pinako bridge: ${effectiveErr.message}. Make sure the Pinako extension is open.`,
-            },
-          });
-        } catch (_) { /* stdio gone, give up */ }
-      }
+      const emsg = (effectiveErr && effectiveErr.message) ? effectiveErr.message : String(effectiveErr);
+      process.stderr.write(`[stdio-mcp] forward error: ${emsg}\n`);
+      if (CONNECTION_ERR_RE.test(emsg)) markRemoteDown(emsg);
+      await respondWithoutBridge(msg, emsg);
     }
   };
 
@@ -5091,25 +5235,22 @@ async function runStdioBridge(httpUrl) {
     process.stderr.write(`[stdio-mcp] stdio transport error: ${err.message}\n`);
   };
 
-  // Start stdio first (always succeeds — local pipes only).
+  // Note: localServer.connect() already started the loopback; StdioServerTransport
+  // starts here, after all handlers are wired.
   await stdio.start();
 
-  // Try to connect to the remote, but stay alive even if the extension
-  // isn't open yet. Per-call errors give a useful message; restarting
-  // Claude Desktop after opening Pinako isn't required.
-  try {
-    await remote.start();
-    process.stderr.write(`[stdio-mcp] connected to ${httpUrl}\n`);
-  } catch (err) {
-    process.stderr.write(`[stdio-mcp] could not connect to ${httpUrl} yet: ${err.message}\n`);
-    process.stderr.write(`[stdio-mcp] open the Pinako extension and tools will start working.\n`);
-  }
+  // Warm up the bridge connection in the background. Failure is fine — the
+  // handshake and catalog are served locally, and the retry loop + per-call
+  // lazy connects pick the bridge up the moment a browser opens.
+  ensureRemote();
 
-  // Shut down cleanly when Claude Desktop closes the stdio pipe.
+  // Shut down cleanly when the AI client closes the stdio pipe.
   process.stdin.on('end', async () => {
     process.stderr.write('[stdio-mcp] stdin closed, shutting down\n');
-    try { await stdio.close();  } catch (_) {}
-    try { await remote.close(); } catch (_) {}
+    stopRetry();
+    try { await stdio.close(); } catch (_) {}
+    try { if (remote) await remote.close(); } catch (_) {}
+    try { await localServer.close(); } catch (_) {}
     process.exit(0);
   });
 }
