@@ -4995,6 +4995,11 @@ if (!BRIDGE_URL) {
 async function runStdioBridge(httpUrl) {
   const stdio = new StdioServerTransport();
 
+  const BRIDGE_RETRY_MS = 15000;        // background reconnect probe while down
+  const BRIDGE_INIT_TIMEOUT_MS = 8000;  // bound on a wedged (port-open) bridge handshake
+  const BRIDGE_SEND_TIMEOUT_MS = 45000; // bound on established-session sends; > the bridge's 30s edit timeout
+  const BRIDGE_DOWN_COOLDOWN_MS = 3000; // fast-fail window after a failed connect attempt
+
   // ── Local fallback backend ──
   // A loopback transport wired straight to stdio: whatever the local server
   // answers goes back to the client verbatim. Only messages we explicitly
@@ -5014,14 +5019,23 @@ async function runStdioBridge(httpUrl) {
   const localServer = createMcpServer();
   await localServer.connect(loopback);
   const feedLocal = (msg) => {
-    try { loopback.onmessage && loopback.onmessage(msg); }
-    catch (err) { process.stderr.write(`[stdio-mcp] local dispatch error: ${err.message}\n`); }
+    // The SDK's onmessage is async — catch rejections too, not just sync throws.
+    try {
+      const p = loopback.onmessage && loopback.onmessage(msg);
+      if (p && typeof p.catch === 'function') {
+        p.catch((err) => process.stderr.write(`[stdio-mcp] local dispatch error: ${err.message}\n`));
+      }
+    } catch (err) {
+      process.stderr.write(`[stdio-mcp] local dispatch error: ${err.message}\n`);
+    }
   };
 
   // ── Remote (live bridge) session state ──
   let remote = null;                 // StreamableHTTPClientTransport with an established session
+  let remoteProtoVersion = null;     // protocolVersion the current remote session was built with
   let ensureInFlight = null;         // mutex: concurrent callers share one connection attempt
-  let clientProtocolVersion = '2025-03-26'; // echo the client's negotiated version to the bridge
+  let lastConnectFailAt = 0;         // cooldown anchor so a wedged bridge doesn't cost 8s per message
+  let clientProtocolVersion = '2025-03-26'; // the client's negotiated version, echoed to the bridge
   let servedLocalToolsList = false;  // catalog was answered locally → notify list_changed on reconnect
   let downLogged = false;            // log unreachability once per outage, not per retry
   let retryTimer = null;
@@ -5034,7 +5048,11 @@ async function runStdioBridge(httpUrl) {
   const STALE_SESSION_RE = /Session not found|-32001|reinitialize|HTTP 404|status code 404/i;
   // Transport-level unreachability — the bridge process isn't there (or is
   // wedged). This marks the remote DOWN and starts the background retry.
-  const CONNECTION_ERR_RE = /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENETUNREACH|EPIPE|socket hang up|network|timed out/i;
+  const CONNECTION_ERR_RE = /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENETUNREACH|EPIPE|socket hang up|network|timed out|terminated/i;
+  // Subset of the above where the request provably never left this process
+  // (connect-phase failures) — only these justify telling the model the
+  // request was definitively not executed.
+  const NEVER_SENT_RE = /fetch failed|ECONNREFUSED/i;
 
   const withTimeout = (promise, ms, what) => new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(what)), ms);
@@ -5049,7 +5067,9 @@ async function runStdioBridge(httpUrl) {
     t.onmessage = async (msg) => {
       // Swallow responses to shim-originated requests (the self-authored
       // initialize) — the client already completed its own handshake locally.
-      if (msg && msg.id !== undefined && shimSuppressIds.has(msg.id)) {
+      // Matched by prefix, not set membership: a timed-out establish may have
+      // already given up on its id when the late response finally arrives.
+      if (msg && typeof msg.id === 'string' && msg.id.startsWith('pinako-shim-')) {
         shimSuppressIds.delete(msg.id);
         return;
       }
@@ -5057,17 +5077,28 @@ async function runStdioBridge(httpUrl) {
       catch (err) { process.stderr.write(`[stdio-mcp] reply error: ${err.message}\n`); }
     };
     t.onerror = (err) => {
-      process.stderr.write(`[stdio-mcp] remote transport error: ${err.message}\n`);
+      // The SDK fires onerror for every failed POST before throwing to the
+      // caller — while the bridge is known-down that's one line per retry
+      // tick, thousands per day in the AI client's MCP log. markRemoteDown
+      // owns outage logging; suppress the per-attempt connection noise.
+      const m = (err && err.message) ? err.message : String(err);
+      if (downLogged && CONNECTION_ERR_RE.test(m)) return;
+      process.stderr.write(`[stdio-mcp] remote transport error: ${m}\n`);
     };
   }
 
-  function teardownRemote() {
-    if (remote) { const t = remote; remote = null; t.close().catch(() => {}); }
+  // Generation-aware teardown: pass the transport whose failure motivated the
+  // teardown, and it becomes a no-op if a concurrent handler already replaced
+  // the session — a late-surfacing error from an old send must not clobber a
+  // freshly rebuilt, healthy session.
+  function teardownRemote(onlyIfTransport) {
+    if (onlyIfTransport && remote !== onlyIfTransport) return;
+    if (remote) { const t = remote; remote = null; remoteProtoVersion = null; t.close().catch(() => {}); }
   }
 
   function scheduleRetry() {
     if (retryTimer) return;
-    retryTimer = setInterval(() => { ensureRemote(); }, 15000);
+    retryTimer = setInterval(() => { ensureRemote(); }, BRIDGE_RETRY_MS);
     if (retryTimer.unref) retryTimer.unref();
   }
 
@@ -5075,8 +5106,10 @@ async function runStdioBridge(httpUrl) {
     if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
   }
 
-  function markRemoteDown(reason) {
+  function markRemoteDown(reason, failedTransport) {
+    if (failedTransport && remote && remote !== failedTransport) return; // stale failure; current session is newer
     teardownRemote();
+    lastConnectFailAt = Date.now();
     if (!downLogged) {
       downLogged = true;
       process.stderr.write(`[stdio-mcp] bridge unreachable at ${httpUrl} (${reason}) — serving handshake/catalog locally; will keep retrying\n`);
@@ -5102,7 +5135,7 @@ async function runStdioBridge(httpUrl) {
           capabilities: {},
           clientInfo: { name: 'pinako-stdio-bridge', version: pkg.version },
         },
-      }), 8000, 'bridge initialize timed out');
+      }), BRIDGE_INIT_TIMEOUT_MS, 'bridge initialize timed out');
       // send() resolves after the HTTP response headers are processed, so the
       // transport already holds the Mcp-Session-Id for subsequent requests.
       await t.send({ jsonrpc: '2.0', method: 'notifications/initialized' }).catch(() => {});
@@ -5119,35 +5152,45 @@ async function runStdioBridge(httpUrl) {
   // the caller fall back to local handling.
   function ensureRemote() {
     if (remote) return Promise.resolve(true);
-    if (!ensureInFlight) {
-      ensureInFlight = (async () => {
-        try {
-          const t = await establishRemoteSession();
-          remote = t;
-          stopRetry();
-          if (downLogged) {
-            downLogged = false;
-            process.stderr.write(`[stdio-mcp] reconnected to ${httpUrl}\n`);
-          } else {
-            process.stderr.write(`[stdio-mcp] connected to ${httpUrl}\n`);
-          }
-          // The client's catalog may have come from the local fallback; tell
-          // it to re-list so it picks up the live bridge's catalog (normally
-          // identical — same binary — but version skew across an update or a
-          // host-extension delta would otherwise linger until app restart).
-          if (servedLocalToolsList) {
-            servedLocalToolsList = false;
-            try { await stdio.send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }); } catch (_) {}
-          }
-          return true;
-        } catch (err) {
-          markRemoteDown((err && err.message) ? err.message : String(err));
-          return false;
-        } finally {
-          ensureInFlight = null;
-        }
-      })();
+    if (ensureInFlight) return ensureInFlight;
+    // Known-down cooldown: against a wedged (port-open) bridge each attempt
+    // costs the full init timeout — don't pay it on every message. Refused
+    // connections fail in ms, so this only defers the wedged case; the retry
+    // timer and post-cooldown lazy connects still pick the bridge up.
+    if (lastConnectFailAt && (Date.now() - lastConnectFailAt) < BRIDGE_DOWN_COOLDOWN_MS) {
+      return Promise.resolve(false);
     }
+    ensureInFlight = (async () => {
+      try {
+        const t = await establishRemoteSession();
+        remote = t;
+        remoteProtoVersion = clientProtocolVersion;
+        lastConnectFailAt = 0;
+        stopRetry();
+        if (downLogged) {
+          downLogged = false;
+          process.stderr.write(`[stdio-mcp] reconnected to ${httpUrl}\n`);
+        } else {
+          process.stderr.write(`[stdio-mcp] connected to ${httpUrl}\n`);
+        }
+        // The client's catalog may have come from the local fallback; tell
+        // it to re-list so it picks up the live bridge's catalog (normally
+        // identical — same binary — but version skew across an update or a
+        // host-extension delta would otherwise linger until app restart).
+        // Fire-and-forget: awaiting here would widen the window in which a
+        // concurrent failure can tear down the session we just published.
+        if (servedLocalToolsList) {
+          servedLocalToolsList = false;
+          stdio.send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }).catch(() => {});
+        }
+        return true;
+      } catch (err) {
+        markRemoteDown((err && err.message) ? err.message : String(err));
+        return false;
+      } finally {
+        ensureInFlight = null;
+      }
+    })();
     return ensureInFlight;
   }
 
@@ -5161,9 +5204,19 @@ async function runStdioBridge(httpUrl) {
     const isRequest = msg && msg.method !== undefined && msg.id !== undefined && msg.id !== null;
     if (!isRequest) return; // notification or stray response — nothing to answer
     if (msg.method === 'tools/call') {
-      const text = (detail && !CONNECTION_ERR_RE.test(detail))
-        ? `Pinako bridge error: ${detail}. The Pinako browser extension may be restarting — try again in a few seconds.`
-        : 'Pinako Bridge isn\'t running — no browser with the Pinako extension is connected right now. Ask the user to open their browser (with the Pinako extension enabled); the bridge reconnects automatically within a few seconds. This request was NOT executed.';
+      let text;
+      if (detail === null || detail === undefined || NEVER_SENT_RE.test(detail)) {
+        // Connect-phase failure: the request provably never left this process,
+        // so the definitive claim is safe and the model may retry freely.
+        text = 'Pinako Bridge isn\'t running — no browser with the Pinako extension is connected right now. Ask the user to open their browser (with the Pinako extension enabled); the bridge reconnects automatically within a few seconds. This request was NOT executed.';
+      } else if (CONNECTION_ERR_RE.test(detail)) {
+        // Mid-flight failure (reset/hang-up/timeout): the bridge may have
+        // dispatched the edit before dying — never invite a blind retry of a
+        // non-idempotent create/move/delete here.
+        text = `The connection to the Pinako Bridge dropped mid-request (${detail}). The request may or may not have been applied — verify current state with a read tool before retrying any create, move, or delete operation.`;
+      } else {
+        text = `Pinako bridge error: ${detail}. The Pinako browser extension may be restarting — try again in a few seconds.`;
+      }
       try {
         await stdio.send({
           jsonrpc: '2.0',
@@ -5187,8 +5240,11 @@ async function runStdioBridge(httpUrl) {
       if (msg.params && msg.params.protocolVersion) {
         clientProtocolVersion = msg.params.protocolVersion;
       }
+      // If a session already exists under a different negotiated version
+      // (client re-initialize), rebuild lazily so both halves stay aligned.
+      if (remote && remoteProtoVersion !== clientProtocolVersion) teardownRemote();
       feedLocal(msg);
-      ensureRemote(); // background warm-up; don't block the handshake on it
+      ensureRemote(); // background; don't block the handshake on it
       return;
     }
     if (msg && msg.method === 'notifications/initialized') {
@@ -5197,28 +5253,42 @@ async function runStdioBridge(httpUrl) {
     }
 
     // Lazy per-message connect: fails in milliseconds when nothing listens.
+    // Snapshot the transport after ensure — a concurrent message's failure
+    // path can tear `remote` down between the await resolving and our send.
     const up = await ensureRemote();
-    if (!up) {
+    const t = remote;
+    if (!up || !t) {
       await respondWithoutBridge(msg, null);
       return;
     }
 
     try {
-      await remote.send(msg);
+      // Bounded send: a bridge that accepts the POST but never answers (the
+      // wedged-leader state) must not hang the request forever — timeout is
+      // classified as a mid-flight connection failure below.
+      await withTimeout(t.send(msg), BRIDGE_SEND_TIMEOUT_MS, 'bridge send timed out');
       return;
     } catch (err) {
       let effectiveErr = err;
       const errStr = (err && err.message) ? err.message : String(err) || '';
-      if (STALE_SESSION_RE.test(errStr)) {
+      // Structural first (SDK errors carry the HTTP status in err.code — the
+      // message-format alternates in the regex drift across SDK versions).
+      const staleSession = (err && err.code === 404) || STALE_SESSION_RE.test(errStr);
+      if (staleSession) {
         // Slice W-4: leader rotated, session id died with it. Rebuild the
-        // shim-originated session and retry the original message once.
+        // shim-originated session and retry the original message once. Only
+        // tear down OUR failed transport — a concurrent handler may already
+        // have published a fresh session we must not clobber.
         process.stderr.write('[stdio-mcp] stale session — re-handshaking transparently...\n');
-        teardownRemote();
+        teardownRemote(t);
         try {
           if (await ensureRemote()) {
-            await remote.send(msg);
-            process.stderr.write('[stdio-mcp] request retried after re-handshake\n');
-            return;
+            const t2 = remote;
+            if (t2) {
+              await withTimeout(t2.send(msg), BRIDGE_SEND_TIMEOUT_MS, 'bridge send timed out');
+              process.stderr.write('[stdio-mcp] request retried after re-handshake\n');
+              return;
+            }
           }
         } catch (retryErr) {
           effectiveErr = retryErr;
@@ -5226,7 +5296,7 @@ async function runStdioBridge(httpUrl) {
       }
       const emsg = (effectiveErr && effectiveErr.message) ? effectiveErr.message : String(effectiveErr);
       process.stderr.write(`[stdio-mcp] forward error: ${emsg}\n`);
-      if (CONNECTION_ERR_RE.test(emsg)) markRemoteDown(emsg);
+      if (CONNECTION_ERR_RE.test(emsg)) markRemoteDown(emsg, t);
       await respondWithoutBridge(msg, emsg);
     }
   };
@@ -5239,10 +5309,10 @@ async function runStdioBridge(httpUrl) {
   // starts here, after all handlers are wired.
   await stdio.start();
 
-  // Warm up the bridge connection in the background. Failure is fine — the
-  // handshake and catalog are served locally, and the retry loop + per-call
-  // lazy connects pick the bridge up the moment a browser opens.
-  ensureRemote();
+  // Deliberately NO eager warm-up here: the client's initialize arrives within
+  // milliseconds and triggers the first connect AFTER the negotiated
+  // protocolVersion is known — an earlier connect would freeze the bridge
+  // session on the default version for the process lifetime.
 
   // Shut down cleanly when the AI client closes the stdio pipe.
   process.stdin.on('end', async () => {
