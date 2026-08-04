@@ -21,7 +21,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID, randomBytes, timingSafeEqual, createHmac } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import pkg from './package.json' with { type: 'json' };
@@ -45,6 +45,143 @@ function getLogPath() {
 const LOG_PATH = getLogPath();
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate active log past 5 MB (was unbounded; a crash loop once grew it to 27 MB)
 let logDirCreated = false;
+
+// ─── Local auth token (ai-todo #67) ───────────────────────────────────────────
+// A persistent machine-local secret shared between this bridge, the installer
+// (which writes it into every AI client's configured URL), and the --stdio-mcp
+// shim. Distinct from _myForwarderToken below: that one is per-process and
+// ephemeral, which is right for binding a forwarder's SSE channel but useless
+// for AI clients whose configs are written once and must survive leader
+// rotation, reboots, and upgrades.
+//
+// Trust boundary: the file sits in the user's own profile dir (0600 on POSIX,
+// per-user ACL on Windows). A process running AS THE USER can read it and is
+// therefore trusted — it already owns everything the bridge could protect.
+// What the token does gate: other OS users, sandboxed/low-integrity processes,
+// and web content (which can reach 127.0.0.1 but cannot read local files).
+const TOKEN_PATH = path.join(path.dirname(LOG_PATH), 'mcp-auth-token');
+const TOKEN_BYTES = 32;
+
+let _authToken = null;
+
+// Read the token, creating it if absent. Returns null only if the filesystem
+// is unusable — callers treat that as "auth unavailable" and fail OPEN on
+// reads / CLOSED on writes rather than bricking the bridge.
+function loadOrCreateAuthToken() {
+  if (_authToken) return _authToken;
+  try {
+    const existing = fs.readFileSync(TOKEN_PATH, 'utf8').trim();
+    if (/^[0-9a-f]{32,128}$/i.test(existing)) { _authToken = existing; return _authToken; }
+    log(`Auth token at ${TOKEN_PATH} is malformed — regenerating.`);
+  } catch (_) { /* absent → create below */ }
+  const fresh = randomBytes(TOKEN_BYTES).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(TOKEN_PATH), { recursive: true });
+    // wx: if a concurrently-starting bridge won the race, don't clobber its
+    // token — the loser re-reads the winner's value below.
+    fs.writeFileSync(TOKEN_PATH, fresh + '\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    // mode on writeFileSync is a no-op when the file pre-exists and is
+    // ignored entirely on Windows; chmod explicitly on POSIX.
+    if (process.platform !== 'win32') { try { fs.chmodSync(TOKEN_PATH, 0o600); } catch (_) {} }
+    _authToken = fresh;
+    log('Auth token created.');
+  } catch (err) {
+    if (err && err.code === 'EEXIST') {
+      try {
+        const raced = fs.readFileSync(TOKEN_PATH, 'utf8').trim();
+        if (/^[0-9a-f]{32,128}$/i.test(raced)) { _authToken = raced; return _authToken; }
+      } catch (_) {}
+    }
+    log(`Auth token unavailable (${err && err.message ? err.message : err}) — write tools will be refused for tokenless callers.`);
+    return null;
+  }
+  return _authToken;
+}
+
+// Constant-time compare so a network-timing oracle can't walk the token out.
+function tokenMatches(candidate) {
+  const expected = loadOrCreateAuthToken();
+  if (!expected || typeof candidate !== 'string' || candidate.length === 0) return false;
+  const a = Buffer.from(candidate, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  try { return timingSafeEqual(a, b); } catch (_) { return false; }
+}
+
+// Pull a token off a request: `?token=` (the capability-URL form the installer
+// writes, because a bare URL is the only field ALL 16 client configs carry
+// uniformly) or `Authorization: Bearer` (for hand-configured clients).
+function extractRequestToken(req) {
+  try {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const q = url.searchParams.get('token');
+    if (q) return q;
+  } catch (_) {}
+  const auth = req.headers && req.headers['authorization'];
+  if (typeof auth === 'string' && /^bearer\s+/i.test(auth)) return auth.replace(/^bearer\s+/i, '').trim();
+  return null;
+}
+
+function requestIsAuthed(req) {
+  return tokenMatches(extractRequestToken(req));
+}
+
+// ─── Tier B: tokenless sessions are read-only (ai-todo #67) ──────────────────
+// The migration state. Clients configured before the tokened URL shipped keep
+// working for reads; write attempts return an actionable in-band tool error
+// (the model relays it verbatim, so the error message IS the upgrade prompt).
+// Flip to token-required-for-reads in a later release — tokenless reads still
+// expose the whole tree, so this is a migration state, not the end state.
+//
+// Default-DENY: anything not positively known to be read-only counts as a
+// write. That covers tools registered by host extensions too, which a
+// hardcoded write-list would silently miss.
+const READ_ONLY_TOOL_NAMES = new Set([
+  'get_tree', 'search_tabs', 'search_pinako', 'list_libraries', 'get_library',
+  'get_main_tree_notes', 'get_bookmarks', 'list_browsers', 'find_duplicates',
+  'get_tree_summary', 'search_docs',
+]);
+
+// Kept exact against the annotation table rather than hand-maintained: any
+// tool whose readOnlyHint flips also flips its auth treatment, in one place.
+function _syncReadOnlyToolNames(annotations) {
+  for (const [name, ann] of Object.entries(annotations || {})) {
+    if (ann && ann.readOnlyHint === true) READ_ONLY_TOOL_NAMES.add(name);
+    else READ_ONLY_TOOL_NAMES.delete(name);
+  }
+}
+
+// Sessions that presented a valid token on `initialize`. Belt-and-suspenders
+// for any client that configures the tokened URL but drops the query string on
+// follow-up requests; the per-request check is the primary path.
+const authedSessions = new Set();
+
+const WRITE_AUTH_MESSAGE =
+  'This Pinako tool needs an authorized connection. The AI Bridge now requires a local access token, ' +
+  'and this client is connected without one, so it has read-only access. ' +
+  'Tell the user (verbatim, do not paraphrase the fix): re-run the Pinako AI Bridge installer to refresh ' +
+  'this client\'s configuration, then restart this client. Reads keep working in the meantime.';
+
+function writeToolBlockedResponse(id, toolName) {
+  return {
+    jsonrpc: '2.0',
+    id: id === undefined ? null : id,
+    result: {
+      content: [{ type: 'text', text: JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED', tool: toolName, message: WRITE_AUTH_MESSAGE } }) }],
+      isError: true,
+    },
+  };
+}
+
+// Proof-of-token for the port-squat challenge: a caller about to trust the
+// process holding 37421 sends a nonce, and only a holder of the same token
+// can answer. Lets our own shim/forwarders detect an impostor BEFORE handing
+// it tree payloads or forwarderTokens.
+function challengeProof(nonce) {
+  const secret = loadOrCreateAuthToken();
+  if (!secret || !nonce) return null;
+  return createHmac('sha256', secret).update(String(nonce)).digest('hex');
+}
 let logBytesWritten = 0;
 let logSizeSeeded = false;
 
@@ -86,7 +223,11 @@ function logRequest(label, req, body) {
   log(`${label}: ${req.method} ${req.url} | headers: ${JSON.stringify(req.headers)} | body: ${JSON.stringify(body)}`);
 }
 
-const MCP_PORT = 37421;
+// 37421 is the fixed port every client config points at. PINAKO_MCP_PORT
+// overrides it for tests only, so an auth/protocol smoke run can bind its own
+// port instead of colliding with (or being demoted to a forwarder of) the
+// real bridge the developer has open.
+const MCP_PORT = Number(process.env.PINAKO_MCP_PORT) || 37421;
 const STDIN_GRACE_MS = 30_000;
 
 // Per-tier note content character limits. Mirrors NOTE_CHAR_LIMITS in
@@ -435,6 +576,18 @@ if (process.argv.includes('--diag')) {
   process.exit(0);
 }
 
+// ─── --print-token: emit the local access token, creating it if needed ───────
+// The Rust/Tauri installer calls this on the service binary it just wrote,
+// rather than reimplementing token generation in a third language. One
+// creation path, one format, no drift. Prints ONLY the token (no banner) so
+// the caller can consume stdout verbatim.
+if (process.argv.includes('--print-token')) {
+  const t = loadOrCreateAuthToken();
+  if (!t) { process.stderr.write('[pinako-mcp] could not create the access token\n'); process.exit(1); }
+  process.stdout.write(t + '\n');
+  process.exit(0);
+}
+
 (function loadHostExtensions() {
   const candidates = [
     path.join(_hostDir, 'host-ext.js'),
@@ -453,6 +606,14 @@ if (process.argv.includes('--diag')) {
           // Register extra MCP tools: fn(srv, { z }) is invoked for every server
           // instance createMcpServer() builds (one per MCP session).
           onMcpTools: (fn) => { if (typeof fn === 'function') _extMcpToolRegistrars.push(fn); },
+          // #67: extension-registered tools are treated as writes by default
+          // (fail-closed). An extension declares its READ tools here so they
+          // stay reachable for tokenless clients during the migration window.
+          declareReadOnlyTools: (names) => {
+            for (const n of (Array.isArray(names) ? names : [names])) {
+              if (typeof n === 'string' && n) READ_ONLY_TOOL_NAMES.add(n);
+            }
+          },
           // Dispatch an agent edit op through the same pipeline the built-in
           // write tools use (browser resolution, confirmation/tier gates, local
           // NM or SSE-forwarder routing). Returns the executeEdit result object.
@@ -2769,6 +2930,9 @@ function createMcpServer() {
     bulk_apply:                     COMPOSITE,
   };
 
+  // Keep the #67 auth allowlist exact against the table above.
+  _syncReadOnlyToolNames(TOOL_ANNOTATIONS);
+
   srv.registerTool(
     'get_tree',
     {
@@ -4389,24 +4553,76 @@ function broadcastResourceUpdated(fields) {
   }
 }
 
+// ─── Tier A: Host + Origin validation (ai-todo #67) ──────────────────────────
+// A web page cannot READ a cross-origin response, but it CAN send the request,
+// and the MCP streamable-HTTP spec calls out DNS rebinding for exactly this
+// reason: an attacker page resolves its own hostname to 127.0.0.1 and POSTs to
+// the bridge, so same-origin policy never engages. Two cheap invariants close
+// it, and neither costs any legitimate client anything:
+//   • Host must name loopback. A rebinding request carries the attacker's
+//     hostname here, not 127.0.0.1.
+//   • No browser Origin. The Pinako extension NEVER speaks HTTP to the bridge
+//     (native messaging only), and MCP clients are local processes that send
+//     no Origin — so any Origin at all means a web page is calling.
+function checkLoopbackOnly(req, res) {
+  const host = String(req.headers.host || '');
+  const hostOk = host === `127.0.0.1:${MCP_PORT}`
+              || host === `localhost:${MCP_PORT}`
+              || host === `[::1]:${MCP_PORT}`;
+  if (!hostOk) {
+    log(`Rejected request with non-loopback Host header: ${host.slice(0, 80)}`);
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: { code: 'BAD_HOST', message: 'Requests must address the bridge as 127.0.0.1 or localhost.' } }));
+    return false;
+  }
+  const origin = req.headers.origin;
+  if (origin) {
+    log(`Rejected browser-originated request (Origin: ${String(origin).slice(0, 80)})`);
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: { code: 'ORIGIN_FORBIDDEN', message: 'The Pinako bridge does not serve browser-originated requests.' } }));
+    return false;
+  }
+  return true;
+}
+
 const httpServer = http.createServer(async (req, res) => {
-  // Health check
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      ok: true,
-      extensionConnected,
-      browsers: [...cachedData.values()].map(d => ({
+  if (!checkLoopbackOnly(req, res)) return;
+
+  // #67: the installer now writes `/mcp?token=…`, so every route match has to
+  // compare the PATH, not the raw url. Exact-equality matching on req.url
+  // would 404 the tokened URL.
+  let reqPath = req.url || '';
+  { const q = reqPath.indexOf('?'); if (q !== -1) reqPath = reqPath.slice(0, q); }
+
+  // Health check. Doubles as the port-squat challenge endpoint: ?challenge=N
+  // returns HMAC(token, N), which our own shim + forwarders verify before
+  // trusting whoever holds 37421 (see #67 — a squatter that can't answer
+  // never receives tree payloads or forwarderTokens).
+  if (reqPath === '/health') {
+    const authed = requestIsAuthed(req);
+    let challenge = null;
+    try { challenge = new URL(req.url, 'http://127.0.0.1').searchParams.get('challenge'); } catch (_) {}
+    const body = { ok: true, extensionConnected };
+    if (challenge) body.proof = challengeProof(challenge);
+    // Browser ids/brands identify the user's machine + install; only an
+    // authenticated caller gets them. Tokenless callers still get liveness,
+    // which is all the "is the bridge up?" probes need.
+    if (authed) {
+      body.browsers = [...cachedData.values()].map(d => ({
         browserBrand: d.browserBrand,
         browserId:    d.browserId,
         dataAge:      Date.now() - d.updatedAt,
-      })),
-    }));
+      }));
+    } else {
+      body.browserCount = cachedData.size;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
     return;
   }
 
   // Internal: new host instance forwards fresh data here when EADDRINUSE
-  if (req.url === '/update' && req.method === 'POST') {
+  if (reqPath === '/update' && req.method === 'POST') {
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
@@ -4560,10 +4776,10 @@ const httpServer = http.createServer(async (req, res) => {
   // (forwardToExisting clears synchronously after listen() succeeds, but
   // a request could in principle land mid-promotion).
   if (forwardToExisting && (
-        req.url === '/edit' ||
-        req.url === '/edit-result' ||
-        req.url === '/organize-state-update' ||
-        (req.url && req.url.startsWith('/edits'))
+        reqPath === '/edit' ||
+        reqPath === '/edit-result' ||
+        reqPath === '/organize-state-update' ||
+        reqPath === '/edits'
       )) {
     res.writeHead(503, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -4581,7 +4797,7 @@ const httpServer = http.createServer(async (req, res) => {
   // connection alive across any localhost OS-idle timers. On req close, the
   // leader drops the forwarder entry and rejects in-flight pending edits for
   // that browserId so the AI client gets a fast failure.
-  if (req.url && req.url.startsWith('/edits') && req.method === 'GET') {
+  if (reqPath === '/edits' && req.method === 'GET') {
     const url = new URL(req.url, 'http://127.0.0.1');
     const browserId = url.searchParams.get('browserId');
     const token     = url.searchParams.get('token');
@@ -4647,7 +4863,7 @@ const httpServer = http.createServer(async (req, res) => {
   // when its local SW emits an organizeStateUpdate NM message (popup
   // confirm / pause / resume / reset / done). Mirrors handleNmMessage's
   // organizeStateUpdate branch for the NM-direct path.
-  if (req.url === '/organize-state-update' && req.method === 'POST') {
+  if (reqPath === '/organize-state-update' && req.method === 'POST') {
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
@@ -4698,7 +4914,7 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.url === '/edit-result' && req.method === 'POST') {
+  if (reqPath === '/edit-result' && req.method === 'POST') {
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', () => {
@@ -4761,7 +4977,17 @@ const httpServer = http.createServer(async (req, res) => {
   // After Phase 3 Slice A: routing + dispatch live in executeEdit; this
   // handler is just the HTTP wrapper. The MCP write tools registered in
   // createMcpServer() share executeEdit so their responses are identical.
-  if (req.url === '/edit' && req.method === 'POST') {
+  if (reqPath === '/edit' && req.method === 'POST') {
+    // #67: /edit is the same write surface as the MCP write tools, reachable
+    // by any local process with curl. Unlike /mcp there is no third-party
+    // client compatibility to preserve here (it's our dev/test endpoint), so
+    // it requires the token outright rather than degrading to read-only.
+    if (!requestIsAuthed(req)) {
+      log('POST /edit 401: missing or invalid access token');
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED', message: 'POST /edit requires the local access token (?token= or Authorization: Bearer).' } }));
+      return;
+    }
     const chunks = [];
     req.on('data', c => chunks.push(c));
     req.on('end', async () => {
@@ -4779,7 +5005,7 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.url !== '/mcp') { res.writeHead(404); res.end(); return; }
+  if (reqPath !== '/mcp') { res.writeHead(404); res.end(); return; }
 
   if (req.method === 'POST') {
     const chunks = [];
@@ -4793,6 +5019,27 @@ const httpServer = http.createServer(async (req, res) => {
         const sessionId = req.headers['mcp-session-id'];
         let transport;
 
+        // ── #67 auth ──
+        // A WRONG token is always fatal (someone is probing); an ABSENT one
+        // downgrades to read-only for the migration window.
+        const presentedToken = extractRequestToken(req);
+        if (presentedToken && !tokenMatches(presentedToken)) {
+          log('POST /mcp 401: invalid access token');
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Invalid Pinako access token.' }, id: parsed?.id ?? null }));
+          return;
+        }
+        const authed = !!presentedToken || (sessionId && authedSessions.has(sessionId));
+        if (parsed?.method === 'tools/call') {
+          const toolName = parsed?.params?.name;
+          if (!authed && !READ_ONLY_TOOL_NAMES.has(toolName)) {
+            log(`POST /mcp: write tool "${toolName}" refused — connection is tokenless (read-only).`);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(writeToolBlockedResponse(parsed?.id, toolName)));
+            return;
+          }
+        }
+
         if (sessionId && activeSessions.has(sessionId)) {
           // Existing session — reuse its transport
           transport = activeSessions.get(sessionId);
@@ -4803,6 +5050,7 @@ const httpServer = http.createServer(async (req, res) => {
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (id) => {
               activeSessions.set(id, transport);
+              if (authed) authedSessions.add(id);
               // Slice Y bonus: register the server so broadcastResourceUpdated
               // can reach it on subsequent cache mutations.
               activeServers.set(id, srv);
@@ -4815,6 +5063,7 @@ const httpServer = http.createServer(async (req, res) => {
             if (id) {
               activeSessions.delete(id);
               activeServers.delete(id);
+              authedSessions.delete(id);
               log(`MCP session closed: ${id}`);
             }
           };
@@ -4845,6 +5094,15 @@ const httpServer = http.createServer(async (req, res) => {
     // GET (SSE stream) / DELETE / OPTIONS
     logRequest(`${req.method} /mcp`, req, null);
     try {
+      // #67: a wrong token is fatal here too. No read-only downgrade needed —
+      // these carry no tool calls, only stream/teardown for an existing session.
+      const presented = extractRequestToken(req);
+      if (presented && !tokenMatches(presented)) {
+        log(`${req.method} /mcp 401: invalid access token`);
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Invalid Pinako access token.' }, id: null }));
+        return;
+      }
       const sessionId = req.headers['mcp-session-id'];
       const transport = sessionId ? activeSessions.get(sessionId) : undefined;
       if (!transport) {
@@ -4899,6 +5157,46 @@ function attemptListen() {
   });
 }
 
+// ─── #67: verify the leader before relaying to it ────────────────────────────
+// A forwarder hands the leader the FULL tree payload (titles, URLs, notes,
+// bookmarks) plus its forwarderToken — which is itself the key to that
+// browser's edit stream. If a squatter grabbed 37421 before the real bridge,
+// an unverified relay donates all of it. Challenge the port-holder to prove
+// it knows the shared token first. Fails open only when no token exists on
+// disk (nothing to verify against), so a broken filesystem can't wedge
+// multi-browser sync.
+let _leaderVerified = false;
+let _leaderVerifyInFlight = null;
+
+function verifyLeaderIdentity() {
+  if (_leaderVerified) return Promise.resolve(true);
+  if (_leaderVerifyInFlight) return _leaderVerifyInFlight;
+  _leaderVerifyInFlight = (async () => {
+    const secret = loadOrCreateAuthToken();
+    if (!secret) return true;
+    const nonce = randomBytes(16).toString('hex');
+    try {
+      const resp = await fetch(`http://127.0.0.1:${MCP_PORT}/health?challenge=${nonce}`);
+      if (!resp.ok) return false;
+      const body = await resp.json();
+      const expected = createHmac('sha256', secret).update(nonce).digest('hex');
+      const got = typeof body?.proof === 'string' ? body.proof : '';
+      const ok = got.length === expected.length
+              && timingSafeEqual(Buffer.from(got, 'utf8'), Buffer.from(expected, 'utf8'));
+      if (ok) _leaderVerified = true;
+      else log(`Leader identity NOT proven on port ${MCP_PORT} — refusing to relay tree data. Another process may hold the port.`);
+      return ok;
+    } catch (err) {
+      // Unreachable mid-rotation: not an impostor signal. Don't cache a pass.
+      log(`Leader identity probe failed (${err && err.message ? err.message : err}) — will retry on next relay.`);
+      return false;
+    } finally {
+      _leaderVerifyInFlight = null;
+    }
+  })();
+  return _leaderVerifyInFlight;
+}
+
 async function tryBindOrForward(initialAttempt) {
   const r = await attemptListen();
   if (r.ok) {
@@ -4921,17 +5219,31 @@ async function tryBindOrForward(initialAttempt) {
     if (initialAttempt) {
       process.stderr.write(`[pinako-mcp] Port ${MCP_PORT} in use — relaying to existing instance.\n`);
       forwardToExisting = (payload) => {
-        // 2026-05-11: include forwarderToken on every /update so the leader
-        // can token-bind this browserId's SSE subscription + /edit-result
-        // posts to THIS process. Without it, any local process could spoof.
-        const body = JSON.stringify({ ...payload, forwarderToken: _myForwarderToken });
-        const req = http.request(
-          { hostname: '127.0.0.1', port: MCP_PORT, path: '/update', method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
-          () => { process.stderr.write(`[pinako-mcp] Relayed tree update from ${payload.browserBrand || 'unknown'}.\n`); }
-        );
-        req.on('error', (err) => { process.stderr.write(`[pinako-mcp] Relay error: ${err.message}\n`); });
-        req.write(body); req.end();
+        // #67: never hand tree data + our forwarderToken to an unverified
+        // port-holder. The check is cached after the first success, so this
+        // costs one extra loopback request per outage, not per update.
+        verifyLeaderIdentity().then((ok) => {
+          if (!ok) {
+            process.stderr.write('[pinako-mcp] Relay withheld: the process on port 37421 did not prove it is the Pinako bridge.\n');
+            return;
+          }
+          // 2026-05-11: include forwarderToken on every /update so the leader
+          // can token-bind this browserId's SSE subscription + /edit-result
+          // posts to THIS process. Without it, any local process could spoof.
+          const body = JSON.stringify({ ...payload, forwarderToken: _myForwarderToken });
+          const req = http.request(
+            { hostname: '127.0.0.1', port: MCP_PORT, path: '/update', method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+            () => { process.stderr.write(`[pinako-mcp] Relayed tree update from ${payload.browserBrand || 'unknown'}.\n`); }
+          );
+          req.on('error', (err) => {
+            // The leader we verified may have died and been replaced; re-prove
+            // whoever holds the port before the next relay.
+            _leaderVerified = false;
+            process.stderr.write(`[pinako-mcp] Relay error: ${err.message}\n`);
+          });
+          req.write(body); req.end();
+        }).catch(() => {});
       };
       nmWrite({ type: 'getTree' });
       // Start promotion polling so we can take over when the leader dies.
@@ -4982,6 +5294,64 @@ if (!BRIDGE_URL) {
 //     from the live bridge.
 async function runStdioBridge(httpUrl) {
   const stdio = new StdioServerTransport();
+
+  // ── #67: token + server authentication ──
+  // The installer writes a tokened URL, but a config written before that
+  // shipped carries a bare one. Since the shim is OUR binary running as the
+  // user, it can read the token file directly and self-heal — a stale
+  // Claude Desktop config keeps full write access with no user action.
+  const shimToken = loadOrCreateAuthToken();
+  if (shimToken) {
+    try {
+      const u = new URL(httpUrl);
+      if (!u.searchParams.get('token')) {
+        u.searchParams.set('token', shimToken);
+        httpUrl = u.toString();
+        process.stderr.write('[stdio-mcp] attached local access token to a tokenless bridge URL\n');
+      }
+    } catch (_) { /* malformed URL — let the connect attempt report it */ }
+  }
+
+  // Port-squat defense. The bridge is plain HTTP on loopback, so a client
+  // cannot verify WHO holds 37421 — a process that squatted the port before
+  // the real bridge bound it would receive whatever we send. We can't fix
+  // that for third-party clients, but we can for our own shim: challenge the
+  // port-holder to prove it knows the shared token before trusting it.
+  // A squatter fails, and we treat it exactly like "bridge down" — the
+  // existing local-fallback path already handles that gracefully.
+  let _identityWarned = false;
+  async function bridgeIdentityOk() {
+    if (!shimToken) return true;   // no token on disk → nothing to verify against
+    const nonce = randomBytes(16).toString('hex');
+    let base;
+    try { const u = new URL(httpUrl); base = `${u.protocol}//${u.host}`; }
+    catch (_) { return true; }
+    try {
+      const resp = await withTimeout(
+        fetch(`${base}/health?challenge=${nonce}`),
+        BRIDGE_INIT_TIMEOUT_MS, 'bridge identity probe timed out'
+      );
+      if (!resp.ok) return false;
+      const body = await resp.json();
+      const expected = createHmac('sha256', shimToken).update(nonce).digest('hex');
+      const got = typeof body?.proof === 'string' ? body.proof : '';
+      const ok = got.length === expected.length
+              && timingSafeEqual(Buffer.from(got, 'utf8'), Buffer.from(expected, 'utf8'));
+      if (!ok && !_identityWarned) {
+        _identityWarned = true;
+        process.stderr.write(
+          `[stdio-mcp] REFUSING to connect: the process holding ${base} could not prove it is the Pinako bridge. ` +
+          'Another program may be occupying the port. Serving catalog locally instead.\n'
+        );
+      }
+      if (ok) _identityWarned = false;
+      return ok;
+    } catch (_) {
+      // Unreachable / non-JSON: not an impostor signal, just downtime. Let
+      // the normal connect path classify it.
+      return true;
+    }
+  }
 
   const BRIDGE_RETRY_MS = 15000;        // background reconnect probe while down
   const BRIDGE_INIT_TIMEOUT_MS = 8000;  // bound on a wedged (port-open) bridge handshake
@@ -5106,6 +5476,9 @@ async function runStdioBridge(httpUrl) {
   }
 
   async function establishRemoteSession() {
+    // #67: prove the port-holder is really the bridge before handing it a
+    // session (and, on write tools, user data).
+    if (!(await bridgeIdentityOk())) throw new Error('ECONNREFUSED (bridge identity not proven)');
     const t = new StreamableHTTPClientTransport(new URL(httpUrl));
     wireRemoteListeners(t);
     await t.start();

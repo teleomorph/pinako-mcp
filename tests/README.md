@@ -30,6 +30,33 @@ npm run test:watch # vitest watch mode
 Tests run sequentially in a single fork (see `vitest.config.js`) to avoid races
 on the shared MCP server cache.
 
+**Write tools now need a token** (ai-todo #67). The harness reads it from your
+Pinako data dir automatically, so `npm test` works unchanged on a machine where
+the installer has run. Override with `PINAKO_MCP_ENDPOINT` to target a
+different bridge or token:
+
+```
+PINAKO_MCP_ENDPOINT="http://127.0.0.1:37421/mcp?token=<token>" npm test
+```
+
+If write tools start failing with `AUTH_REQUIRED`, the token file is missing or
+stale — re-run the installer.
+
+## Standalone auth smoke tests
+
+Two scripts cover the local-auth surface and need **no browser and no
+extension** — each spawns its own host.js with an isolated data dir, on a
+scratch port, so neither touches your real token nor collides with a running
+bridge:
+
+```bash
+node tests/auth-67.smoke.js          # Host/Origin refusal, tokenless-read-only, /edit, squat challenge
+node tests/auth-67-writers.smoke.js  # every client writer bakes the token into its own config shape
+node tests/auth-67-shim.smoke.js     # --stdio-mcp token self-heal + refusal to trust a port squatter
+```
+
+They exit non-zero on failure and are safe to run any time.
+
 ## Cleanup pattern
 
 Pinako does NOT expose an MCP `delete_library` tool today, so each test file

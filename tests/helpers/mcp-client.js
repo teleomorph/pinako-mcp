@@ -1,7 +1,29 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-const DEFAULT_ENDPOINT = 'http://127.0.0.1:37421/mcp';
+// ai-todo #67: write tools are refused on a tokenless connection, so the
+// suites need the tokened URL. PINAKO_MCP_ENDPOINT supplies it; otherwise fall
+// back to reading the token file directly, which keeps `npm test` working with
+// no extra setup on a machine where the installer has run.
+const DEFAULT_ENDPOINT = process.env.PINAKO_MCP_ENDPOINT || defaultEndpointWithToken();
+
+function defaultEndpointWithToken() {
+  const base = 'http://127.0.0.1:37421/mcp';
+  try {
+    const dir = process.platform === 'win32'
+      ? path.join(process.env.APPDATA || '', 'Pinako')
+      : process.platform === 'darwin'
+        ? path.join(os.homedir(), 'Library', 'Application Support', 'Pinako')
+        : path.join(os.homedir(), '.local', 'share', 'pinako');
+    const token = fs.readFileSync(path.join(dir, 'mcp-auth-token'), 'utf8').trim();
+    return /^[0-9a-f]{32,128}$/i.test(token) ? `${base}?token=${token}` : base;
+  } catch (_) {
+    return base;
+  }
+}
 
 export async function connectPinakoMcp({ endpoint = DEFAULT_ENDPOINT } = {}) {
   const transport = new StreamableHTTPClientTransport(new URL(endpoint));

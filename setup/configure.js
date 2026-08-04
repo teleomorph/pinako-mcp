@@ -10,8 +10,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { HOME, APPDATA, SERVICE_PATH } from './paths.js';
+import { buildMcpUrl } from './token.js';
 
-const MCP_URL = 'http://127.0.0.1:37421/mcp';
+// ai-todo #67: the URL now carries the machine-local access token. Computed
+// once per run so every client written in the same install gets the same
+// value (and so a rotation mid-run can't split the client table).
+// Falls back to the bare URL if the token file can't be created — that
+// client still works, read-only, instead of failing the install outright.
+const MCP_URL = buildMcpUrl();
 
 // ─── Read-only tool list (auto-approved by default) ──────────────────────────
 // Cline supports an `autoApprove: [...]` array in its MCP server config;
