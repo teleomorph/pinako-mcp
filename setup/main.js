@@ -109,6 +109,7 @@ async function main() {
   console.log('');
 
   // ── Step 1: Extract service binary ──────────────────────────────────────────
+  let serviceWritten = true;
   process.stdout.write('  Installing Pinako MCP service...  ');
   try {
     fs.mkdirSync(PINAKO_DIR, { recursive: true });
@@ -119,11 +120,19 @@ async function main() {
     }
     console.log(ok);
   } catch (e) {
+    serviceWritten = false;
     console.log(err);
     console.log(`  ${c.red}Could not write service binary: ${e.message}${c.reset}`);
-    console.log(dim(PLATFORM === 'win32'
-      ? '  Try running as administrator if the error persists.'
-      : '  Try running with sudo if the error persists.'));
+    if (e && e.code === 'ETXTBSY') {
+      // Linux refuses to overwrite a RUNNING executable. The old binary
+      // survives, and it predates #67 — it will 404 any tokened URL.
+      console.log(yellow('  ⚠  The Bridge is currently running.'));
+      console.log(dim('     Close every browser with the Pinako extension, then re-run this installer.'));
+    } else {
+      console.log(dim(PLATFORM === 'win32'
+        ? '  Try running as administrator if the error persists.'
+        : '  Try running with sudo if the error persists.'));
+    }
     console.log('');
   }
 
@@ -131,13 +140,25 @@ async function main() {
   // Must run BEFORE configureClients, which bakes the token into every URL
   // it writes. A failure here is non-fatal: clients get a tokenless URL and
   // keep read-only access rather than the install failing outright.
-  process.stdout.write('  Creating local access token...  ');
-  if (readOrCreateToken()) {
-    console.log(ok);
+  //
+  // SKIPPED when the binary write failed. Writing tokened URLs against a
+  // surviving OLD binary is worse than doing nothing: that binary has no
+  // token support and 404s the tokened URL, so every client would break
+  // outright instead of merely staying read-only. Bare URLs keep the old
+  // binary working until the user closes their browsers and re-runs.
+  if (!serviceWritten) {
+    console.log(yellow('  ⚠  Skipping token setup — the service binary was not updated.'));
+    console.log(dim('     Apps will be configured for the existing Bridge version.'));
+    process.env.PINAKO_FORCE_BARE_MCP_URL = '1';
   } else {
-    console.log(err);
-    console.log(yellow(`  ⚠  Could not write ${TOKEN_PATH}`));
-    console.log(dim('     Apps will be configured with read-only access.'));
+    process.stdout.write('  Creating local access token...  ');
+    if (readOrCreateToken()) {
+      console.log(ok);
+    } else {
+      console.log(err);
+      console.log(yellow(`  ⚠  Could not write ${TOKEN_PATH}`));
+      console.log(dim('     Apps will be configured with read-only access.'));
+    }
   }
 
   // ── Step 2: Register native host ──────────────────────────────────────────

@@ -12,7 +12,9 @@
 
 - **The Bridge now refuses browser-originated requests** (any request carrying an `Origin` header, or addressed to a non-loopback hostname), closing a DNS-rebinding path that let a malicious web page reach the local endpoint.
 
-- **The Bridge and its Claude Desktop shim now verify each other.** Before relaying your tab data to whatever process holds port 37421, they require proof it knows the shared token — so a program that squatted the port cannot harvest tree payloads or impersonate the Bridge.
+- **The Bridge's own components now verify whoever holds port 37421 before trusting it.** The Claude Desktop shim and multi-browser forwarders require proof of the shared token before sending your tab data — so a program that squatted the port cannot harvest it or impersonate the Bridge. An older Bridge that predates this check is detected and connected to read-only rather than being refused.
+
+- **Rotating the access token now works everywhere and takes effect immediately.** `rotate-token` (Linux CLI installer) regenerates the secret and updates every detected app; on Windows and macOS, `pinako-mcp-service --rotate-token` regenerates it and re-running the installer updates your apps. A running Bridge notices the change and immediately stops honoring the old token, including for apps already connected.
 
 - **Removed the `/debug` HTTP endpoint (security hardening).** It replayed the last 10 MCP requests, including write payloads and session ids, to any local caller. The same diagnostics remain available in `pinako-mcp.log`, which is protected by your user profile's file permissions.
 - **Claude Desktop no longer shows "Could not attach to MCP server pinako" when no browser is running.** The `--stdio-mcp` shim now completes the MCP handshake and serves the full tool catalog locally, connects to the Bridge lazily per call, returns a clear "open your browser with the Pinako extension" message on tool calls made while no browser is up, and reconnects automatically (refreshing the client's tool list) the moment the Bridge comes back.

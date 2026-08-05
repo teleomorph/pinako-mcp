@@ -18,23 +18,41 @@ const HOST_NAME: &str = "com.pinako.mcp";
 // Resolved once per run so every client in one install gets the same value.
 // On failure we fall back to the bare URL: those clients still work read-only,
 // which beats failing the whole install.
-fn mcp_url_get() -> &'static str {
+// Only a VALIDATED tokened URL is cached. Caching the fallback was a silent
+// read-only trap: if the very first call happened while the service binary was
+// missing or AV-locked (it is written milliseconds earlier and is ~90 MB), the
+// bare URL was memoized for the rest of the process, so every client written
+// afterwards got a tokenless config even though a valid token existed on disk
+// by then — and nothing was shown to the user.
+fn mcp_url_get() -> String {
     static URL: OnceLock<String> = OnceLock::new();
-    URL.get_or_init(|| {
-        let service = pinako_dir().join(service_binary_name());
-        match std::process::Command::new(&service).arg("--print-token").output() {
-            Ok(out) if out.status.success() => {
-                let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if token.len() >= 32 && token.chars().all(|c| c.is_ascii_hexdigit()) {
-                    format!("{MCP_BASE_URL}?token={token}")
-                } else {
-                    MCP_BASE_URL.to_string()
-                }
-            }
-            _ => MCP_BASE_URL.to_string(),
+    if let Some(u) = URL.get() {
+        return u.clone();
+    }
+    let service = pinako_dir().join(service_binary_name());
+    let token = match std::process::Command::new(&service).arg("--print-token").output() {
+        Ok(out) if out.status.success() => {
+            let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if t.len() >= 32 && t.chars().all(|c| c.is_ascii_hexdigit()) { Some(t) } else { None }
         }
-    })
-    .as_str()
+        _ => None,
+    };
+    match token {
+        Some(t) => {
+            let url = format!("{MCP_BASE_URL}?token={t}");
+            let _ = URL.set(url.clone()); // cache successes only
+            url
+        }
+        // Do NOT cache: a later call in the same run may succeed once the
+        // binary settles, and that client deserves a working config.
+        None => MCP_BASE_URL.to_string(),
+    }
+}
+
+/// True when the token could not be resolved, so the UI can warn instead of
+/// silently configuring every client read-only.
+fn mcp_url_is_tokenless(url: &str) -> bool {
+    !url.contains("?token=")
 }
 
 // Read-only MCP tools — pre-populated into Cline / Roo Code `autoApprove`
@@ -389,6 +407,17 @@ fn quit() {
     std::process::exit(0);
 }
 
+/// The URL a user must paste to hand-configure an app the installer didn't
+/// detect. Must be the TOKENED one: the completion screen used to print a
+/// hardcoded bare URL, which silently grants read-only access, while the
+/// release notes told hand-configuring users to take the URL from that screen.
+/// `tokenless` lets the UI warn instead of handing over a crippled URL.
+#[tauri::command]
+fn mcp_url() -> serde_json::Value {
+    let url = mcp_url_get();
+    serde_json::json!({ "url": url, "tokenless": mcp_url_is_tokenless(&url) })
+}
+
 // ── Native host ───────────────────────────────────────────────────────────────
 
 fn install_native_host(pinako_dir: &Path, service_path: &Path) -> Result<(), String> {
@@ -594,7 +623,7 @@ fn configure_claude_code(home: &Path) -> Result<(), String> {
     // remove fail harmlessly, so its status is deliberately ignored.
     run_claude_cli(&["mcp", "remove", "pinako", "--scope", "user"]);
     let added = run_claude_cli(&[
-        "mcp", "add", "--scope", "user", "--transport", "http", "pinako", mcp_url,
+        "mcp", "add", "--scope", "user", "--transport", "http", "pinako", mcp_url.as_str(),
     ]);
 
     if !added {
@@ -1010,6 +1039,7 @@ fn main() {
             install,
             open_url,
             quit,
+            mcp_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Pinako installer");

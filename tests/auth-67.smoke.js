@@ -83,6 +83,17 @@ async function main() {
     // 127.0.0.1, so the request arrives on loopback carrying THEIR Host.
     check('non-loopback Host refused',   await rawStatus('/health', { Host: 'evil.example.com' }), 403);
     check('localhost Host still allowed', await rawStatus('/health', { Host: `localhost:${PORT}` }), 200);
+    // Legal Host forms real clients emit that a strict equality check refused.
+    check('portless Host allowed',        await rawStatus('/health', { Host: '127.0.0.1' }), 200);
+    check('trailing-dot Host allowed',    await rawStatus('/health', { Host: 'localhost.' }), 200);
+    check('IPv6 loopback allowed',        await rawStatus('/health', { Host: `[::1]:${PORT}` }), 200);
+    // A rebinding page naming a different port must still be refused.
+    check('loopback name, wrong port refused', await rawStatus('/health', { Host: '127.0.0.1:1234' }), 403);
+
+    // Origin: web pages refused, local app schemes allowed. Blanket refusal
+    // would break Electron clients (VS Code, Cursor, Claude Desktop) entirely.
+    check('http Origin refused',   await status(`${BASE}/health`, { headers: { Origin: 'http://evil.example.com' } }), 403);
+    check('app-scheme Origin OK',  await status(`${BASE}/health`, { headers: { Origin: 'vscode-file://vscode-app' } }), 200);
     check('browser Origin refused',      await status(`${BASE}/health`, { headers: { Origin: 'https://evil.example.com' } }), 403);
     check('/debug is gone',              await status(`${BASE}/debug`), 404);
 
@@ -152,6 +163,73 @@ async function main() {
     // hole; assert the allowlist is the read set, not a superset.
     const writeish = await call('delete_node');
     check('destructive tool also blocked tokenless', writeish.code, 'AUTH_REQUIRED');
+
+    // JSON-RPC batching: the gate originally inspected only parsed.method, so
+    // an ARRAY body had no top-level method and skipped it entirely. One '['
+    // turned the whole Tier B ladder off.
+    console.log('\n  Batch smuggling');
+    const batch = async (tools) => {
+      const r = await fetch(`${BASE}/mcp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'mcp-session-id': sid },
+        body: JSON.stringify(tools.map((name, i) => ({ jsonrpc: '2.0', id: 100 + i, method: 'tools/call', params: { name, arguments: {} } }))),
+      });
+      return JSON.stringify(await r.json());
+    };
+    check('batched write blocked',            /AUTH_REQUIRED/.test(await batch(['set_title'])), true);
+    check('batched destructive write blocked', /AUTH_REQUIRED/.test(await batch(['delete_node'])), true);
+    // A read hidden alongside a write must not smuggle the write through.
+    const mixed = await batch(['list_browsers', 'delete_live_node']);
+    check('mixed read+write batch refused',   /AUTH_REQUIRED/.test(mixed), true);
+    check('mixed batch did not execute the write', /BROWSER_NOT_FOUND/.test(mixed), false);
+    // Every id must be answered: a JSON-RPC client resolves per-id, so an
+    // unanswered id is a hang rather than a visible refusal.
+    const mixedIds = (JSON.parse(mixed) || []).map(m => m.id).sort();
+    check('every batch id gets a reply', JSON.stringify(mixedIds), JSON.stringify([100, 101]));
+
+    // The token travels in the query string, so every log sink has to redact
+    // it. pinako-mcp.log persists, rotates to .old, and is what users paste
+    // into bug reports — a live credential in there would undo the point of
+    // deleting /debug. Exercised above by the tokened calls.
+    // Rotation must revoke, not just re-key. A running bridge memoizes the
+    // token, so without an on-disk change check it would keep honouring the
+    // OLD secret (and every session already marked authed) until restart.
+    console.log('\n  Rotation revokes a live session');
+    const authedSess = await fetch(`${BASE}/mcp?token=${TOKEN}`, initBody);
+    const authedSid  = authedSess.headers.get('mcp-session-id');
+    const callOn = async (sid, query = '') => {
+      const r = await fetch(`${BASE}/mcp${query}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'mcp-session-id': sid },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 42, method: 'tools/call', params: { name: 'set_title', arguments: {} } }),
+      });
+      return (await r.text());
+    };
+    check('authorized session can write before rotation',
+      /AUTH_REQUIRED/.test(await callOn(authedSid)), false);
+
+    const rotated = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(tokenFile, rotated + '\n', 'utf8');
+    await sleep(2200);   // clear the stat-throttle window
+
+    check('old token is rejected after rotation',
+      (await status(`${BASE}/edit?token=${TOKEN}`, editBody)), 401);
+    check('new token is accepted after rotation',
+      (await status(`${BASE}/edit?token=${rotated}`, editBody)) !== 401, true);
+    check('previously authorized session is revoked',
+      /AUTH_REQUIRED/.test(await callOn(authedSid)), true);
+    // Restore so the redaction checks below still use a known value.
+    fs.writeFileSync(tokenFile, TOKEN + '\n', 'utf8');
+    await sleep(2200);
+
+    console.log('\n  Credential redaction');
+    await fetch(`${BASE}/mcp?token=${TOKEN}`, initBody);          // force a logged tokened request
+    await fetch(`${BASE}/mcp`, { ...initBody, headers: { ...initBody.headers, Authorization: `Bearer ${TOKEN}` } });
+    await sleep(300);
+    const logText = fs.readFileSync(path.join(DATA_DIR, 'Pinako', 'pinako-mcp.log'), 'utf8');
+    check('log never contains the token', logText.includes(TOKEN), false);
+    check('log shows the redaction marker', logText.includes('token=<redacted>'), true);
+    check('bearer header redacted in log', /"authorization":"<redacted>"/.test(logText), true);
 
   } finally {
     child.stdin.end();

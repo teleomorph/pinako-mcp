@@ -91,13 +91,23 @@ full access.
 
 To revoke a token that has been shared or pasted somewhere public:
 
+**Linux** (CLI installer) — regenerates the secret *and* rewrites every
+detected client's config in one step:
+
 ```bash
-pinako-ai-bridge-cli rotate-token
+pinako-ai-bridge-cli-linux-x64 rotate-token
 ```
 
-That regenerates the secret and rewrites every detected client's config. Any
-client it cannot reach keeps the old URL and drops to read-only until you
-reconfigure it.
+**Windows / macOS** — the GUI installer has no rotate command, so rotate with
+the service binary and then re-run the installer to update your apps:
+
+```bash
+"%APPDATA%\Pinako\pinako-mcp-service.exe" --rotate-token
+```
+
+The old token stops working immediately: a running Bridge notices the change
+and drops any already-authorized session. Until you re-run the installer, apps
+still holding the old URL fall back to read-only.
 
 ## Build from source
 

@@ -41,11 +41,20 @@ export function readToken() {
 export function readOrCreateToken() {
   const existing = readToken();
   if (existing) return existing;
+  // Distinguish absent from malformed — see the matching comment in host.js.
+  // A file that exists but fails TOKEN_RE can never be replaced under 'wx',
+  // so the old code returned null forever and every install silently wrote
+  // tokenless (read-only) URLs with no way to recover.
+  let malformed = false;
+  try { fs.accessSync(TOKEN_PATH); malformed = true; } catch (_) { /* absent */ }
   const fresh = crypto.randomBytes(32).toString('hex');
   try {
     fs.mkdirSync(PINAKO_DIR, { recursive: true });
-    // wx so a concurrently-starting bridge that just created one wins.
-    fs.writeFileSync(TOKEN_PATH, fresh + '\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    // 'wx' for the absent case keeps the creation race safe; 'w' for the
+    // malformed case, where there is nothing valid to protect.
+    fs.writeFileSync(TOKEN_PATH, fresh + '\n', {
+      encoding: 'utf8', mode: 0o600, flag: malformed ? 'w' : 'wx',
+    });
     if (process.platform !== 'win32') { try { fs.chmodSync(TOKEN_PATH, 0o600); } catch (_) {} }
     return fresh;
   } catch (err) {
@@ -75,7 +84,13 @@ export function rotateToken() {
  * TOML and YAML shapes especially) have no way to express a custom header.
  * host.js also accepts `Authorization: Bearer` for hand-configured clients.
  */
-export function buildMcpUrl(token = readOrCreateToken()) {
+export function buildMcpUrl(token = undefined) {
   const base = 'http://127.0.0.1:37421/mcp';
-  return token ? `${base}?token=${token}` : base;
+  // Escape hatch for the install path where the service binary could NOT be
+  // replaced (Linux ETXTBSY on a running Bridge). The surviving binary predates
+  // the token and 404s a tokened URL, so writing one would break every client
+  // outright rather than leaving it read-only. Bare URL keeps it working.
+  if (process.env.PINAKO_FORCE_BARE_MCP_URL === '1') return base;
+  const t = token === undefined ? readOrCreateToken() : token;
+  return t ? `${base}?token=${t}` : base;
 }

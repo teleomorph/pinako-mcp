@@ -192,6 +192,22 @@
       font-family: 'Consolas', 'Cascadia Code', 'Courier New', monospace;
       font-size: 14px;
       color: var(--accent);
+      /* The URL now carries the access token, so it is long enough to overflow
+         its box on a narrow window. Wrap instead of clipping the secret. */
+      overflow-wrap: anywhere;
+      word-break: break-all;
+    }
+
+    .mcp-secret-note {
+      font-size: 12px;
+      color: var(--sub);
+      margin-top: 8px;
+    }
+
+    .mcp-warn {
+      font-size: 13px;
+      color: #d9822b;
+      margin-top: 8px;
     }
 
     .docs-btn {
@@ -327,8 +343,15 @@
       <p class="lead">Pinako AI Bridge has been installed successfully.</p>
       <div class="mcp-box">
         <span class="mcp-label">MCP Server URL</span>
-        <span class="mcp-url">http://localhost:37421/mcp</span>
+        <!-- Filled in at runtime by wizard.js via the mcp_url command. It
+             carries the access token, so it must never be hardcoded here. -->
+        <span class="mcp-url">http://127.0.0.1:37421/mcp</span>
       </div>
+      <p class="mcp-secret-note">Treat this URL like a password: anyone who has
+      it can read and change your tabs, libraries, and notes.</p>
+      <p id="mcp-url-warning" class="mcp-warn" hidden>The access token could not
+      be created, so apps were configured with read-only access. Re-run this
+      installer to grant write access.</p>
       <p>Restart any configured AI apps to pick up the new settings.</p>
       <p>If your AI app doesn't see your Pinako trees right away, click the
       Pinako icon in your browser toolbar to activate the connection.</p>

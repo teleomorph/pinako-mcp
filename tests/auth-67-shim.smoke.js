@@ -24,8 +24,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HOST_JS   = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'host.js');
-const REAL_PORT = 37801;
-const FAKE_PORT = 37802;
+const REAL_PORT   = 37801;
+const FAKE_PORT   = 37802;
+const SNEAKY_PORT = 37803;
+const LEGACY_PORT = 37804;
 const DATA_DIR  = fs.mkdtempSync(path.join(os.tmpdir(), 'pinako-shim67-'));
 const ENV = { ...process.env, APPDATA: DATA_DIR, HOME: DATA_DIR, USERPROFILE: DATA_DIR };
 
@@ -75,12 +77,26 @@ async function main() {
   });
   bridge.stderr.on('data', () => {});
 
-  // ── Impostor: answers /health like a bridge, but cannot forge the proof ──
+  // ── Impostor A: answers /health like a bridge, but forges a wrong proof ──
   const impostor = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, extensionConnected: true, proof: 'f'.repeat(64) }));
   });
   await new Promise(r => impostor.listen(FAKE_PORT, '127.0.0.1', r));
+
+  // ── Impostor B: answers with NON-JSON, and records anything it receives ──
+  // This is the shape the original code let through: the identity check's
+  // catch-all returned "trusted" on a JSON parse failure, and because the
+  // token had already been appended to the URL, the squatter harvested it on
+  // the very first request. The suite previously modelled only Impostor A —
+  // the one case the code actually handled.
+  const harvested = [];
+  const sneaky = http.createServer((req, res) => {
+    harvested.push(req.url || '');
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('OK not json');
+  });
+  await new Promise(r => sneaky.listen(SNEAKY_PORT, '127.0.0.1', r));
 
   try {
     let up = false;
@@ -89,10 +105,13 @@ async function main() {
       try { up = (await fetch(`http://127.0.0.1:${REAL_PORT}/health`)).ok; } catch (_) {}
     }
     if (!up) throw new Error('bridge never came up');
+    const TOKEN = fs.readFileSync(path.join(DATA_DIR, 'Pinako', 'mcp-auth-token'), 'utf8').trim();
 
     console.log('\n  Token self-heal (bare URL, as in a pre-#67 config)');
     const real = await runShim(`http://127.0.0.1:${REAL_PORT}/mcp`, [INIT, CALL]);
-    check('shim reports attaching the token', /attached local access token/i.test(real.stderr));
+    // Self-heal is proven by the write being authorized, not by a log line:
+    // a proven bridge must NOT be announced as the read-only legacy path.
+    check('proven bridge not treated as legacy', !/without the access token/i.test(real.stderr));
     const callResp = real.out.find(m => m.id === 2);
     const text = JSON.stringify(callResp || {});
     check('handshake answered', real.out.some(m => m.id === 1 && m.result));
@@ -101,15 +120,44 @@ async function main() {
     // was forwarded and authorized rather than blocked at the gate.
     check('write reached the bridge', /BRIDGE_NOT_READY|BROWSER|not ready|no browser/i.test(text) || callResp?.result?.isError === true);
 
-    console.log('\n  Squatter refusal');
+    console.log('\n  Squatter refusal (wrong proof)');
     const fake = await runShim(`http://127.0.0.1:${FAKE_PORT}/mcp`, [INIT, CALL]);
-    check('shim refuses the unproven port-holder', /could not prove it is the Pinako bridge/i.test(fake.stderr));
+    check('shim refuses the unproven port-holder', /answered the identity challenge incorrectly/i.test(fake.stderr));
     check('handshake still answered locally', fake.out.some(m => m.id === 1 && m.result));
     const fakeCall = JSON.stringify(fake.out.find(m => m.id === 2) || {});
     check('tool call not forwarded to the impostor', fakeCall.length > 2);
+
+    console.log('\n  Squatter must never receive the token (non-JSON responder)');
+    // Pass the TOKENED url, i.e. exactly what the installer writes — the
+    // squatter must still never see the secret.
+    const tokenedUrl = `http://127.0.0.1:${SNEAKY_PORT}/mcp?token=${TOKEN}`;
+    harvested.length = 0;
+    await runShim(tokenedUrl, [INIT, CALL]);
+    const leaked = harvested.some(u => u.includes(TOKEN));
+    check('token never sent to the unverified holder', !leaked);
+    check('squatter saw only the tokenless probe', harvested.every(u => !u.includes(TOKEN)));
+
+    console.log('\n  Legacy bridge (no challenge endpoint) degrades, not refuses');
+    // A pre-#67 bridge 404s /health?challenge= — the shape every existing
+    // install produces, and the shape that broke tests/stdio-bridge.test.js.
+    const legacyHits = [];
+    const legacy = http.createServer((req, res) => {
+      legacyHits.push(req.url || '');
+      if ((req.url || '').startsWith('/health?')) { res.writeHead(404); res.end(); return; }
+      if (req.url === '/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{"ok":true}'); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'legacy', version: '1' } } }));
+    });
+    await new Promise(r => legacy.listen(LEGACY_PORT, '127.0.0.1', r));
+    const leg = await runShim(`http://127.0.0.1:${LEGACY_PORT}/mcp`, [INIT]);
+    legacy.close();
+    check('legacy bridge is connected to, not refused', !/REFUSING to connect/i.test(leg.stderr));
+    check('legacy connection is announced as read-only', /without the access token/i.test(leg.stderr));
+    check('legacy bridge never received the token', legacyHits.every(u => !u.includes(TOKEN)));
   } finally {
     bridge.stdin.end(); bridge.kill();
     impostor.close();
+    sneaky.close();
     await sleep(200);
     try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch (_) {}
   }
