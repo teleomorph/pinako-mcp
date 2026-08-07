@@ -2641,12 +2641,15 @@ CONNECTION RECOVERY. If a tool returns "No data yet - open the Pinako extension 
 
 For complete documentation, see: https://pinako.pro/docs/ai-connect`;
 
-// serverInfo advertised in the MCP initialize response. `icons` (SEP-973) is
-// what Claude Desktop renders beside the connector name — without it a local
-// (stdio) connector falls back to a generic lettered avatar while the cloud
-// connector, which does send icons, shows the logo. `title` + `websiteUrl`
-// give clients a human label + link beyond the protocol `name`. Mirrors
-// supabase/functions/mcp-server/index.ts SERVER_INFO.
+// serverInfo advertised in the MCP initialize response. `icons` (SEP-973):
+// Claude renders these for REMOTE connectors (which is why the cloud
+// connector shows the logo) but, as of Claude Desktop 1.26832 (verified in
+// its bundle, 2026-08-07), NOT for local stdio entries — the client keeps
+// only name+version from a local server's serverInfo and shows a lettered
+// avatar. We send them anyway: other MCP clients may render them, and they
+// light up whenever Claude extends rendering to local servers. `title` +
+// `websiteUrl` give clients a human label + link beyond the protocol
+// `name`. Mirrors supabase/functions/mcp-server/index.ts SERVER_INFO.
 const SERVER_INFO = {
   name: 'pinako',
   title: 'Pinako',
