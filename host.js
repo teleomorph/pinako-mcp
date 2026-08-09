@@ -115,6 +115,9 @@ const BULK_APPLY_SUB_OP_TYPES = [
   'set_title',
   'create_group',
   'create_window',
+  'create_tab_group',
+  'update_tab_group',
+  'ungroup_tab_group',
   'create_folder',
   'delete_node',
   'ghost_node',
@@ -2620,7 +2623,7 @@ DATA MODEL. The tab tree is hierarchical: Window Groups (type 'group' - Pinako's
 - Libraries are user-created collections of saved tabs organized into folders - like bookmarks but richer (notes, tags, memos).
 - Main Notes are rich-text documents attached to the main tree. Always call them "Main Notes" to the user (internal names like 'globalNotes' / "owner_type:'global'" are legacy - never surface them).
 
-BROWSER TAB GROUPS - the colored, named chips in the browser's own tab strip. The browser owns their title and color; Pinako mirrors them read-only. In the tree a Tab Group is a CONTAINER NODE (type='tabgroup') directly under a window, holding its member tabs as children (tabs nested under a member are members too); empty title is legal. Membership is exactly containment and is controlled by move_node and nothing else - move a tab INTO or OUT OF the tabgroup node. You cannot create, rename, recolor, or dissolve a browser Tab Group - set_title and set_row_color reject tabgroup nodes. Never confuse browser Tab Groups with Window Groups (type='group') or Library Groups.
+BROWSER TAB GROUPS - the colored, named chips in the browser's own tab strip. In the tree a Tab Group is a CONTAINER NODE (type='tabgroup') directly under a window, holding its member tabs as children (tabs nested under a member are members too); empty title is legal. Full write control: create_tab_group bundles existing tabs into a NEW group (in the first listed tab's window; cross-window tabs are gathered there - they physically move together in the strip); update_tab_group renames / recolors / collapses (the ONLY tool for tabgroup identity - set_title and set_row_color reject tabgroup nodes by design); ungroup_tab_group dissolves the group keeping its tabs open in place; membership is exactly containment and is controlled by move_node - move a tab INTO or OUT OF the tabgroup node (there is no separate join tool). Groups whose members are all ghosts are CLOSED groups - still real, editable, reopenable; creating a group from ghost tabs is legal and stays tree-only until reopened. Shared groups (Chrome 137+) are hands-off for every write. Never confuse browser Tab Groups with Window Groups (type='group') or Library Groups.
 
 DOCS LOOKUP. search_docs(query, max_results?) searches Pinako's bundled user guide (~10ms, local, no internet). Call it BEFORE acting when: (1) a Pinako-specific term is uncertain ("memo" vs "note", "folder" vs "group", "ghost tab", "snapshot"); (2) ordinary-English phrasing doesn't map 1:1 to a write tool ("save this tab", "archive these", "color-code by topic"); (3) a complex request needs a capability check before you design a multi-step plan; (4) BEFORE saying "I can't do that" - Pinako has real limits AND unexpected affordances (library groups, snapshots, three-panel view, sync devices, blockchain backup); (5) the user asks how Pinako behaves ("Can I undo this?", "Why didn't this sync?", "Can Pinako sync to mobile?") - answer from the guide, not generic tab-manager intuition. When citing the guide, include the section anchor (e.g. "see #guide-library-groups in your user guide"). Skip it when the request is direct and the tool is obvious ("tag this 'history'" -> set_tags) or the vocabulary is already established this conversation.
 
@@ -2751,6 +2754,13 @@ function createMcpServer() {
     // SERVER_INSTRUCTIONS "CREATE-* OPS ARE NOT IDEMPOTENT" rule.
     create_group:                   EDIT_NID,
     create_window:                  EDIT_NID,
+    // Slice I: creating a Tab Group relocates tabs; retry duplicates it.
+    create_tab_group:               EDIT_NID,
+    // update converges (same fields, same end state); ungroup on retry hits
+    // NODE_NOT_FOUND (the shell is gone) — safe, but keep the create rule
+    // company since a re-created group would be a different node id.
+    update_tab_group:               EDIT,
+    ungroup_tab_group:              EDIT,
     create_folder:                  EDIT_NID,
     create_library:                 EDIT_NID,
     create_note:                    EDIT_NID,
@@ -3979,7 +3989,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_star_color', args));
 
   srv.registerTool('set_row_color', {
-    description: 'Sets the rowColor of a Window Group node or Folder node. NOT related to browser Tab Group color (the browser owns those; agent has no direct control over them, and tabgroup nodes are rejected with INVALID_NODE_TYPE - tabs join/leave browser Tab Groups via move_node, see that tool). Accepts: "accent2" (theme-tracking default), a named color ("blue", "red", "green", "purple", "yellow", "orange", "pink", "cyan", "grey"), an explicit 6-digit hex ("#1890ff"), or null (reset to "accent2"). Rejects on non-group/non-folder node types (including tabgroup) with INVALID_NODE_TYPE.',
+    description: 'Sets the rowColor of a Window Group node or Folder node. NOT related to browser Tab Group color (a Tab Group\'s color is Chrome identity — use update_tab_group for that; tabgroup nodes are rejected here with INVALID_NODE_TYPE). Accepts: "accent2" (theme-tracking default), a named color ("blue", "red", "green", "purple", "yellow", "orange", "pink", "cyan", "grey"), an explicit 6-digit hex ("#1890ff"), or null (reset to "accent2"). Rejects on non-group/non-folder node types (including tabgroup) with INVALID_NODE_TYPE.',
     inputSchema: {
       nodeId:    z.string().describe('Target group or folder node id.'),
       rowColor:  z.union([z.string(), z.null()]).describe('"accent2", named color, 6-digit hex, or null to reset.'),
@@ -3991,7 +4001,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('set_row_color', args));
 
   srv.registerTool('set_title', {
-    description: 'Sets a custom title on a tab, window, Window Group (type="group"), or folder node. Trimmed; max 200 chars. Sets customTitle=true so the title persists across browser restarts. Rejects tabgroup nodes with INVALID_TARGET (the browser owns a Tab Group name, Pinako does not) and rejects the library container (use set_library_title).',
+    description: 'Sets a custom title on a tab, window, Window Group (type="group"), or folder node. Trimmed; max 200 chars. Sets customTitle=true so the title persists across browser restarts. Rejects tabgroup nodes with INVALID_TARGET (a Tab Group name is Chrome-coupled identity, not a customTitle overlay — use update_tab_group) and rejects the library container (use set_library_title).',
     inputSchema: {
       nodeId:    z.string().describe('Target node id.'),
       title:     z.string().describe('New title (trimmed, non-empty, max 200 chars).'),
@@ -4004,7 +4014,7 @@ function createMcpServer() {
 
   // ─── Tree-structure ops ─────────────────────────────────────────────────────
   srv.registerTool('move_node', {
-    description: 'Moves a node and its FULL subtree under newParentId (null = root, which auto-wraps a tab into a new window). To move a node WITHOUT its children, outdent its FIRST child first (sibling-adoption pulls the rest under it), then move the now-empty target — or wrap both in one bulk_apply. VALID PARENT BY MOVED-NODE TYPE (engine rejects others with INVALID_PARENT): tab → ROOT/window/folder/tabgroup (NEVER directly under a Window Group — move into a window first); window → ROOT/group/folder; group → ROOT/group; folder → ROOT/folder; tabgroup → window only. (Tab-under-tab nesting is reachable only via indent_node, not move_node.) Browser Tab Group membership follows CONTAINMENT: move the tab into a type="tabgroup" node to join, out of it to leave — position within the branch never affects membership; moving the tabgroup node carries the whole group. You cannot create, rename, recolor, or dissolve a browser Tab Group. scope:"bookmarks" moves go through chrome.bookmarks.move and are NOT Pinako-undoable; for batch reorg, suggest a backup first. Example — join a browser Tab Group by inserting between two existing members: {nodeId:"tab-12", newParentId:"<tabgroup node id>", position:1}.',
+    description: 'Moves a node and its FULL subtree under newParentId (null = root, which auto-wraps a tab into a new window). To move a node WITHOUT its children, outdent its FIRST child first (sibling-adoption pulls the rest under it), then move the now-empty target — or wrap both in one bulk_apply. VALID PARENT BY MOVED-NODE TYPE (engine rejects others with INVALID_PARENT): tab → ROOT/window/folder/tabgroup (NEVER directly under a Window Group — move into a window first); window → ROOT/group/folder; group → ROOT/group; folder → ROOT/folder; tabgroup → window only. (Tab-under-tab nesting is reachable only via indent_node, not move_node.) Browser Tab Group membership follows CONTAINMENT: move the tab into a type="tabgroup" node to join, out of it to leave — position within the branch never affects membership; moving the tabgroup node carries the whole group. Create / rename / recolor / dissolve have dedicated tools: create_tab_group, update_tab_group, ungroup_tab_group. scope:"bookmarks" moves go through chrome.bookmarks.move and are NOT Pinako-undoable; for batch reorg, suggest a backup first. Example — join a browser Tab Group by inserting between two existing members: {nodeId:"tab-12", newParentId:"<tabgroup node id>", position:1}.',
     inputSchema: {
       nodeId:      z.string().describe('Node to move (with its subtree).'),
       newParentId: z.union([z.string(), z.null()]).optional().describe('Destination parent id, or null for root.'),
@@ -4017,7 +4027,7 @@ function createMcpServer() {
   }, async (args) => writeToolHandler('move_node', args));
 
   srv.registerTool('create_group', {
-    description: 'Creates a new Window Group node (type="group" — Pinako\'s organizational row for nesting windows). Window Groups can contain other Window Groups and windows but NOT tabs directly (tabs always live under a window, a tabgroup node, or another tab). Position defaults to TOP of the destination siblings (matches the manual UI). This does NOT create a browser Tab Group (the colored-strip groups in the browser tab bar): Pinako mirrors those read-only and has no create op for them — tabs join an EXISTING browser Tab Group via move_node.',
+    description: 'Creates a new Window Group node (type="group" — Pinako\'s organizational row for nesting windows). Window Groups can contain other Window Groups and windows but NOT tabs directly (tabs always live under a window, a tabgroup node, or another tab). Position defaults to TOP of the destination siblings (matches the manual UI). This does NOT create a browser Tab Group (the colored-strip groups in the browser tab bar) — use create_tab_group for those; tabs join an EXISTING browser Tab Group via move_node.',
     inputSchema: {
       title:     z.string().describe('Group title (trimmed, non-empty, max 200 chars).'),
       rowColor:  z.string().optional().describe('Optional row background color: a named color, hex string, or "accent2" (default, theme-tracking).'),
@@ -4043,6 +4053,45 @@ function createMcpServer() {
     },
     annotations: TOOL_ANNOTATIONS.create_window,
   }, async (args) => writeToolHandler('create_window', args));
+
+  // ─── Browser Tab Group ops (slice I) ────────────────────────────────────────
+  srv.registerTool('create_tab_group', {
+    description: 'Creates a NEW browser Tab Group (the colored, named chip in the browser tab strip) by RELOCATING one or more existing tabs into a new type="tabgroup" node — create_window\'s contract one level down. The group forms in the FIRST listed tab\'s window, at that tab\'s position; tabs listed from OTHER windows are gathered there (they physically move in the strip; a window emptied by the gather closes). Tabs are MOVED, not copied, grouped in the given order; a listed tab\'s nested subtree rides along. Live tabs produce a real strip group immediately (title + color applied); all-ghost tabIds produce a CLOSED group that materializes on reopen. collapsed:true is applied after creation and Chrome may refuse it for the group holding the active tab — the result then carries collapseWarning, not an error. Tree scope only. To add tabs to an EXISTING group use move_node into the tabgroup node; for Pinako\'s organizational Window Group rows use create_group instead.',
+    inputSchema: {
+      tabIds:    z.array(z.string()).min(1).describe('Existing tab node ids to group (at least one; moved, not copied; grouped in the given order). List only top-level tabs — listing a tab nested under another listed tab is rejected (NESTED_TAB_ID).'),
+      title:     z.string().optional().describe('Optional group name (trimmed, non-empty, max 200 chars). Omit for an untitled group (the bare color chip).'),
+      color:     z.enum(['grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange']).optional().describe('Chrome group color. Default "grey" (Chrome\'s own default). This is the group\'s strip identity, NOT a Pinako rowColor.'),
+      collapsed: z.boolean().optional().describe('Collapse the group chip after creation. Applied last; a Chrome refusal (active tab\'s group) surfaces as result.collapseWarning.'),
+      scope:     z.string().optional().describe('Only "tree" (the default) is valid — Tab Groups mirror live browser state.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+    annotations: TOOL_ANNOTATIONS.create_tab_group,
+  }, async (args) => writeToolHandler('create_tab_group', args));
+
+  srv.registerTool('update_tab_group', {
+    description: 'Edits a browser Tab Group\'s identity: title (rename; empty string "" clears back to untitled), color (Chrome\'s 9-color enum), and/or collapsed. At least one field required. This is the ONLY tool for tabgroup identity — set_title and set_row_color reject tabgroup nodes by design. LIVE groups: the change is pushed to the browser FIRST; a title/color refusal fails the whole op (CHROME_TAB_GROUP_UPDATE_FAILED — e.g. saved groups are not editable; TAB_GROUP_SHARED for shared groups, which are hands-off), while a COLLAPSE refusal (Chrome keeps the active tab\'s group expanded) is soft: title/color still apply and the result carries collapseWarning — unless collapsed was the only field, which returns TAB_GROUP_COLLAPSE_REFUSED. Closed (all-ghost) groups and library copies: edits the stored identity, applied when the group reopens. Membership is NOT edited here — move_node joins/leaves, ungroup_tab_group dissolves.',
+    inputSchema: {
+      nodeId:    z.string().describe('Target tabgroup node id.'),
+      title:     z.string().optional().describe('New name (trimmed, max 200 chars). Empty string "" clears the name (untitled group).'),
+      color:     z.enum(['grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange']).optional().describe('New Chrome group color.'),
+      collapsed: z.boolean().optional().describe('Collapse/expand the group chip. Chrome may keep the active tab\'s group expanded.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+    annotations: TOOL_ANNOTATIONS.update_tab_group,
+  }, async (args) => writeToolHandler('update_tab_group', args));
+
+  srv.registerTool('ungroup_tab_group', {
+    description: 'Dissolves a browser Tab Group: member tabs stay open (or stay saved, for a closed group) and keep their tree position — promoted in place where the group row was — and the group node is removed. Mirrors the UI\'s "Ungroup (keep tabs open)". NOT a delete: nothing closes and no data is lost, so no confirmation flag; to close or remove the group AND its tabs use ghost_node / delete_node / delete_live_node on the tabgroup node instead. Live groups are ungrouped in the browser too (Chrome auto-deletes the emptied chip). Retry after success returns NODE_NOT_FOUND — treat as done.',
+    inputSchema: {
+      nodeId:    z.string().describe('Target tabgroup node id.'),
+      scope:     z.string().optional().describe(SCOPE_TREE_OR_LIBRARY),
+      libraryId: z.string().optional().describe('Required when scope=library.'),
+      browser:   z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+    annotations: TOOL_ANNOTATIONS.ungroup_tab_group,
+  }, async (args) => writeToolHandler('ungroup_tab_group', args));
 
   srv.registerTool('delete_node', {
     description: 'DESTRUCTIVE — permanently removes a GHOST node (chromeId=null) and its metadata (tags/memos/colors/title); for scope="bookmarks", removes the browser bookmark via chrome.bookmarks.remove. REFUSES subtrees containing any live tab (LIVE_NODE_REFUSED) — ghost_node first, then delete_node, or use delete_live_node. Set confirmedByUser:true ONLY after the user confirmed THIS specific deletion. Idempotent-on-retry (NODE_NOT_FOUND on retry = already deleted; treat as success). RECOVERY ASYMMETRY: tree/library deletes are Pinako-undoable (Ctrl+Z); scope:"bookmarks" deletes are NOT — before the first bookmark delete in a session or any batch over ~3 bookmarks, surface the backup warning from the server instructions (BOOKMARK SCOPE RECOVERY) VERBATIM and get fresh confirmation.',
