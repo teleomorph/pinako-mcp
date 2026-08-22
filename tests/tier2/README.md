@@ -79,7 +79,10 @@ propagation lag per write). Per-test timeout is 180s.
 - **Model:** `claude-haiku-4-5-20251001` — fast and cheap for multi-tool
   chains. Escalate to Sonnet only if a specific test needs frontier
   reasoning that Haiku can't handle.
-- **MCP endpoint:** `http://127.0.0.1:37421/mcp` (streamable HTTP). Override
+- **MCP endpoint:** resolved by `tests/helpers/endpoint.js` — the base URL plus
+  the local access token read from your Pinako data dir (ai-todo #67; write
+  tools return `AUTH_REQUIRED` without it). Set `PINAKO_MCP_ENDPOINT` to
+  override. Base is `http://127.0.0.1:37421/mcp` (streamable HTTP). Override
   per-call via `runAgent({mcpUrl})`.
 - **Permission mode:** `bypassPermissions` — auto-approves every tool call
   so the loop doesn't hang waiting for confirmation.

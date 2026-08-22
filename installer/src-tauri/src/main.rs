@@ -3,9 +3,57 @@
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-const MCP_URL:   &str = "http://127.0.0.1:37421/mcp";
+const MCP_BASE_URL: &str = "http://127.0.0.1:37421/mcp";
 const HOST_NAME: &str = "com.pinako.mcp";
+
+// ── Local access token (ai-todo #67) ─────────────────────────────────────────
+// The URL written into every client config carries a machine-local token; the
+// bridge treats a tokenless connection as read-only. Rather than reimplement
+// token generation here (a third implementation after host.js and
+// setup/token.js — three chances to drift on path or format), ask the service
+// binary we just installed to create-or-read it and print it.
+//
+// Resolved once per run so every client in one install gets the same value.
+// On failure we fall back to the bare URL: those clients still work read-only,
+// which beats failing the whole install.
+// Only a VALIDATED tokened URL is cached. Caching the fallback was a silent
+// read-only trap: if the very first call happened while the service binary was
+// missing or AV-locked (it is written milliseconds earlier and is ~90 MB), the
+// bare URL was memoized for the rest of the process, so every client written
+// afterwards got a tokenless config even though a valid token existed on disk
+// by then — and nothing was shown to the user.
+fn mcp_url_get() -> String {
+    static URL: OnceLock<String> = OnceLock::new();
+    if let Some(u) = URL.get() {
+        return u.clone();
+    }
+    let service = pinako_dir().join(service_binary_name());
+    let token = match std::process::Command::new(&service).arg("--print-token").output() {
+        Ok(out) if out.status.success() => {
+            let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if t.len() >= 32 && t.chars().all(|c| c.is_ascii_hexdigit()) { Some(t) } else { None }
+        }
+        _ => None,
+    };
+    match token {
+        Some(t) => {
+            let url = format!("{MCP_BASE_URL}?token={t}");
+            let _ = URL.set(url.clone()); // cache successes only
+            url
+        }
+        // Do NOT cache: a later call in the same run may succeed once the
+        // binary settles, and that client deserves a working config.
+        None => MCP_BASE_URL.to_string(),
+    }
+}
+
+/// True when the token could not be resolved, so the UI can warn instead of
+/// silently configuring every client read-only.
+fn mcp_url_is_tokenless(url: &str) -> bool {
+    !url.contains("?token=")
+}
 
 // Read-only MCP tools — pre-populated into Cline / Roo Code `autoApprove`
 // arrays so the AI client doesn't prompt the user before each call. Limited
@@ -164,6 +212,7 @@ fn detect_claude_desktop(appdata: &Path) -> ClientInfo {
 }
 
 fn write_claude_desktop_config(path: &Path) -> Result<(), String> {
+    let mcp_url = mcp_url_get();
     let mut cfg = read_json(path);
     ensure_obj(&mut cfg, "mcpServers");
     // Claude Desktop only supports stdio MCP servers (command + args).
@@ -173,7 +222,7 @@ fn write_claude_desktop_config(path: &Path) -> Result<(), String> {
     let service_path = pinako_dir().join(service_binary_name());
     cfg["mcpServers"]["pinako"] = serde_json::json!({
         "command": service_path.to_string_lossy(),
-        "args": ["--stdio-mcp", MCP_URL],
+        "args": ["--stdio-mcp", mcp_url],
     });
     write_json(path, &cfg)
 }
@@ -356,6 +405,17 @@ fn open_url(url: String) -> Result<(), String> {
 #[tauri::command]
 fn quit() {
     std::process::exit(0);
+}
+
+/// The URL a user must paste to hand-configure an app the installer didn't
+/// detect. Must be the TOKENED one: the completion screen used to print a
+/// hardcoded bare URL, which silently grants read-only access, while the
+/// release notes told hand-configuring users to take the URL from that screen.
+/// `tokenless` lets the UI warn instead of handing over a crippled URL.
+#[tauri::command]
+fn mcp_url() -> serde_json::Value {
+    let url = mcp_url_get();
+    serde_json::json!({ "url": url, "tokenless": mcp_url_is_tokenless(&url) })
 }
 
 // ── Native host ───────────────────────────────────────────────────────────────
@@ -558,18 +618,19 @@ fn run_claude_cli(args: &[&str]) -> bool {
 }
 
 fn configure_claude_code(home: &Path) -> Result<(), String> {
+    let mcp_url = mcp_url_get();
     // `claude mcp add` errors when the name is taken; a missing entry makes
     // remove fail harmlessly, so its status is deliberately ignored.
     run_claude_cli(&["mcp", "remove", "pinako", "--scope", "user"]);
     let added = run_claude_cli(&[
-        "mcp", "add", "--scope", "user", "--transport", "http", "pinako", MCP_URL,
+        "mcp", "add", "--scope", "user", "--transport", "http", "pinako", mcp_url.as_str(),
     ]);
 
     if !added {
         let path = home.join(".claude.json");
         let mut cfg = read_json_strict(&path)?.unwrap_or_else(|| serde_json::json!({}));
         ensure_obj(&mut cfg, "mcpServers");
-        cfg["mcpServers"]["pinako"] = serde_json::json!({ "type": "http", "url": MCP_URL });
+        cfg["mcpServers"]["pinako"] = serde_json::json!({ "type": "http", "url": mcp_url });
         write_json(&path, &cfg)?;
     }
 
@@ -602,13 +663,15 @@ fn prune_stale_claude_settings_entry(home: &Path) {
 // `serverUrl` — `url` and `httpUrl` are explicitly unsupported.
 
 fn write_antigravity_config(path: &Path) -> Result<(), String> {
+    let mcp_url = mcp_url_get();
     let mut cfg = read_json(path);
     ensure_obj(&mut cfg, "mcpServers");
-    cfg["mcpServers"]["pinako"] = serde_json::json!({ "serverUrl": MCP_URL });
+    cfg["mcpServers"]["pinako"] = serde_json::json!({ "serverUrl": mcp_url });
     write_json(path, &cfg)
 }
 
 fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String> {
+    let mcp_url = mcp_url_get();
     match id {
         "claude-code" => configure_claude_code(home),
         "claude-desktop" => {
@@ -637,14 +700,14 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let path = home.join(".cursor").join("mcp.json");
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": MCP_URL });
+            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": mcp_url });
             write_json(&path, &cfg)
         }
         "windsurf" => {
             let path = home.join(".codeium").join("windsurf").join("mcp_config.json");
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": MCP_URL });
+            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": mcp_url });
             write_json(&path, &cfg)
         }
         "antigravity" => {
@@ -668,7 +731,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             // flag is remote and can flip on any reload, so write both.
             let entry = serde_json::json!({
                 "type": "streamableHttp",
-                "url": MCP_URL, "disabled": false, "autoApprove": READ_ONLY_TOOLS
+                "url": mcp_url, "disabled": false, "autoApprove": READ_ONLY_TOOLS
             });
             let paths = [
                 appdata
@@ -699,7 +762,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             ensure_obj(&mut cfg, "mcpServers");
             cfg["mcpServers"]["pinako"] = serde_json::json!({
                 "type": "streamable-http",
-                "url": MCP_URL, "disabled": false, "alwaysAllow": READ_ONLY_TOOLS
+                "url": mcp_url, "disabled": false, "alwaysAllow": READ_ONLY_TOOLS
             });
             write_json(&path, &cfg)
         }
@@ -712,7 +775,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             ensure_obj(&mut cfg, "mcpServers");
             cfg["mcpServers"]["pinako"] = serde_json::json!({
                 "type": "streamable-http",
-                "url": MCP_URL, "disabled": false, "alwaysAllow": READ_ONLY_TOOLS
+                "url": mcp_url, "disabled": false, "alwaysAllow": READ_ONLY_TOOLS
             });
             write_json(&path, &cfg)
         }
@@ -728,7 +791,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                     .unwrap_or_else(|| serde_json::json!({}));
                 ensure_obj(&mut cfg, "servers");
                 cfg["servers"]["pinako"] =
-                    serde_json::json!({ "type": "http", "url": MCP_URL });
+                    serde_json::json!({ "type": "http", "url": mcp_url });
                 write_json(&path, &cfg)?;
             }
             Ok(())
@@ -742,7 +805,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let mut cfg = read_json_strict(&path)?
                 .unwrap_or_else(|| serde_json::json!({}));
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "httpUrl": MCP_URL });
+            cfg["mcpServers"]["pinako"] = serde_json::json!({ "httpUrl": mcp_url });
             write_json(&path, &cfg)
         }
         "grok" => {
@@ -750,7 +813,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             // matches the bundled docs' convention for url-form servers.
             upsert_pinako_toml_table(
                 &grok_home().join("config.toml"),
-                &[&format!("url = \"{MCP_URL}\""), "enabled = true"])
+                &[&format!("url = \"{mcp_url}\""), "enabled = true"])
         }
         "kimi-code" => {
             // Dedicated mcp.json (Claude-Desktop-compatible shape); a bare
@@ -758,7 +821,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let path = kimi_code_home().join("mcp.json");
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": MCP_URL });
+            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": mcp_url });
             write_json(&path, &cfg)
         }
         "openclaw" => {
@@ -774,7 +837,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                 cfg["mcp"]["servers"] = serde_json::json!({});
             }
             cfg["mcp"]["servers"]["pinako"] = serde_json::json!({
-                "url": MCP_URL, "transport": "streamable-http", "enabled": true
+                "url": mcp_url, "transport": "streamable-http", "enabled": true
             });
             write_json(&path, &cfg)
         }
@@ -791,14 +854,14 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
             }
             let yaml = format!(
-                "name: Pinako\nversion: 0.0.1\nschema: v1\nmcpServers:\n  - name: Pinako\n    type: streamable-http\n    url: {MCP_URL}\n"
+                "name: Pinako\nversion: 0.0.1\nschema: v1\nmcpServers:\n  - name: Pinako\n    type: streamable-http\n    url: {mcp_url}\n"
             );
             std::fs::write(&path, yaml).map_err(|e| e.to_string())
         }
         "codex" => {
             upsert_pinako_toml_table(
                 &home.join(".codex").join("config.toml"),
-                &[&format!("url = \"{MCP_URL}\""), "startup_timeout_sec = 20"])
+                &[&format!("url = \"{mcp_url}\""), "startup_timeout_sec = 20"])
         }
         other => Err(format!("Unknown client id: {other}")),
     }
@@ -856,7 +919,8 @@ fn upsert_pinako_toml_table(path: &Path, body_lines: &[&str]) -> Result<(), Stri
 /// `code --add-mcp '<json>'` upserts into the active VS Code profile's
 /// mcp.json. Same .cmd-shim spawn rules as the claude CLI.
 fn run_code_add_mcp() -> bool {
-    let entry = serde_json::json!({ "name": "pinako", "type": "http", "url": MCP_URL })
+    let mcp_url = mcp_url_get();
+    let entry = serde_json::json!({ "name": "pinako", "type": "http", "url": mcp_url })
         .to_string();
     #[cfg(target_os = "windows")]
     let out = std::process::Command::new("cmd")
@@ -878,6 +942,7 @@ fn run_code_add_mcp() -> bool {
 // manual hint. YAML forbids tabs in indentation, so space-math is safe.
 
 fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
+    let mcp_url = mcp_url_get();
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let lines: Vec<String> = if text.is_empty() {
@@ -899,10 +964,10 @@ fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
         if lines.iter().any(|l| l.starts_with("mcp_servers:")) {
             return Err(format!(
                 "config.yaml declares mcp_servers in a format this installer does not edit — \
-                 add this entry manually: mcp_servers: {{ pinako: {{ url: \"{MCP_URL}\" }} }}"));
+                 add this entry manually: mcp_servers: {{ pinako: {{ url: \"{mcp_url}\" }} }}"));
         }
         let block = format!(
-            "mcp_servers:{nl}  pinako:{nl}    url: \"{MCP_URL}\"{nl}    enabled: true{nl}");
+            "mcp_servers:{nl}  pinako:{nl}    url: \"{mcp_url}\"{nl}    enabled: true{nl}");
         let base = text.trim_end();
         let next = if base.is_empty() {
             block
@@ -956,7 +1021,7 @@ fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
     let child_indent = format!("{indent}{indent}");
     let mut next_lines: Vec<String> = lines[..idx + 1].to_vec();
     next_lines.push(format!("{indent}pinako:"));
-    next_lines.push(format!("{child_indent}url: \"{MCP_URL}\""));
+    next_lines.push(format!("{child_indent}url: \"{mcp_url}\""));
     next_lines.push(format!("{child_indent}enabled: true"));
     next_lines.extend(kept);
     next_lines.extend_from_slice(&lines[end..]);
@@ -974,6 +1039,7 @@ fn main() {
             install,
             open_url,
             quit,
+            mcp_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Pinako installer");

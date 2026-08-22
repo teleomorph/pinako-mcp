@@ -21,6 +21,7 @@ import { installNativeHost } from './native-host.js';
 import { detectClients } from './detect.js';
 import { configureClients } from './configure.js';
 import { PINAKO_DIR, SERVICE_PATH, PLATFORM } from './paths.js';
+import { readOrCreateToken, rotateToken, buildMcpUrl, TOKEN_PATH } from './token.js';
 // serviceExeBase64 is injected at build time by setup/build.js
 // (generates setup/_service-embedded.js before running esbuild)
 import { serviceExeBase64 } from './_service-embedded.js';
@@ -108,6 +109,7 @@ async function main() {
   console.log('');
 
   // ── Step 1: Extract service binary ──────────────────────────────────────────
+  let serviceWritten = true;
   process.stdout.write('  Installing Pinako MCP service...  ');
   try {
     fs.mkdirSync(PINAKO_DIR, { recursive: true });
@@ -118,12 +120,45 @@ async function main() {
     }
     console.log(ok);
   } catch (e) {
+    serviceWritten = false;
     console.log(err);
     console.log(`  ${c.red}Could not write service binary: ${e.message}${c.reset}`);
-    console.log(dim(PLATFORM === 'win32'
-      ? '  Try running as administrator if the error persists.'
-      : '  Try running with sudo if the error persists.'));
+    if (e && e.code === 'ETXTBSY') {
+      // Linux refuses to overwrite a RUNNING executable. The old binary
+      // survives, and it predates #67 — it will 404 any tokened URL.
+      console.log(yellow('  ⚠  The Bridge is currently running.'));
+      console.log(dim('     Close every browser with the Pinako extension, then re-run this installer.'));
+    } else {
+      console.log(dim(PLATFORM === 'win32'
+        ? '  Try running as administrator if the error persists.'
+        : '  Try running with sudo if the error persists.'));
+    }
     console.log('');
+  }
+
+  // ── Step 1b: Create the local access token (ai-todo #67) ──────────────────
+  // Must run BEFORE configureClients, which bakes the token into every URL
+  // it writes. A failure here is non-fatal: clients get a tokenless URL and
+  // keep read-only access rather than the install failing outright.
+  //
+  // SKIPPED when the binary write failed. Writing tokened URLs against a
+  // surviving OLD binary is worse than doing nothing: that binary has no
+  // token support and 404s the tokened URL, so every client would break
+  // outright instead of merely staying read-only. Bare URLs keep the old
+  // binary working until the user closes their browsers and re-runs.
+  if (!serviceWritten) {
+    console.log(yellow('  ⚠  Skipping token setup — the service binary was not updated.'));
+    console.log(dim('     Apps will be configured for the existing Bridge version.'));
+    process.env.PINAKO_FORCE_BARE_MCP_URL = '1';
+  } else {
+    process.stdout.write('  Creating local access token...  ');
+    if (readOrCreateToken()) {
+      console.log(ok);
+    } else {
+      console.log(err);
+      console.log(yellow(`  ⚠  Could not write ${TOKEN_PATH}`));
+      console.log(dim('     Apps will be configured with read-only access.'));
+    }
   }
 
   // ── Step 2: Register native host ──────────────────────────────────────────
@@ -224,7 +259,10 @@ async function main() {
 }
 
 async function showFinalInstructions() {
-  const MCP_URL = 'http://localhost:37421/mcp';
+  // #67: the manual-configuration URL carries the access token, same as the
+  // one written into detected clients. Without it a hand-configured app gets
+  // read-only access and its write tools return an upgrade message.
+  const MCP_URL = buildMcpUrl();
   const copied = copyToClipboard(MCP_URL);
 
   console.log(`  ${bold(cyan('─────────────────────────────────────────────'))}` );
@@ -233,6 +271,9 @@ async function showFinalInstructions() {
     console.log(dim('    (copied to clipboard)'));
   }
   console.log(`  ${bold(cyan('─────────────────────────────────────────────'))}`);
+  console.log(dim('    Treat this URL as a password — it grants access to'));
+  console.log(dim('    your Pinako data. Anyone you share it with can read'));
+  console.log(dim('    and change your tabs, libraries, and notes.'));
   console.log('');
   console.log(`  For other MCP-capable apps, see:`);
   console.log(`  ${cyan('https://pinako.pro/docs/ai-connect')}`);
@@ -255,7 +296,49 @@ async function finish() {
   process.exit(0);
 }
 
-main().catch(e => {
+// ─── rotate-token (ai-todo #67) ───────────────────────────────────────────────
+// Regenerates the access token and rewrites it into every detected client's
+// config. Use after the URL has been shared, pasted into a bug report, or
+// otherwise exposed. Any client NOT detected here keeps the old URL and drops
+// to read-only until it is reconfigured — which is the intended behavior for
+// a revocation.
+async function rotateTokenCommand() {
+  console.log('');
+  console.log(bold('  Rotating the Pinako AI Bridge access token'));
+  console.log('');
+
+  const fresh = rotateToken();
+  if (!fresh) {
+    console.log(`  ${err}  Could not write ${TOKEN_PATH}`);
+    console.log('');
+    process.exit(1);
+  }
+  console.log(`  ${ok}  New token written`);
+  console.log('');
+
+  const found = detectClients().filter(c => c.found);
+  if (found.length === 0) {
+    console.log(yellow('  No AI apps detected — nothing to reconfigure.'));
+  } else {
+    console.log(bold('  Updating apps:'));
+    console.log('');
+    for (const { client, ok: success, error } of configureClients(found)) {
+      console.log(success
+        ? `    ${ok}  ${client.label}`
+        : `    ${err}  ${client.label}  ${c.red}— ${error}${c.reset}`);
+    }
+  }
+  console.log('');
+  console.log(dim('  The old token is now invalid. Restart the bridge (reopen your'));
+  console.log(dim('  browser) and restart any configured apps.'));
+  console.log('');
+  process.exit(0);
+}
+
+const _cmd = process.argv.slice(2).find(a => !a.startsWith('-'));
+const _entry = _cmd === 'rotate-token' ? rotateTokenCommand : main;
+
+_entry().catch(e => {
   console.error(`\n  ${c.red}Fatal error: ${e.message}${c.reset}\n`);
   process.exit(1);
 });

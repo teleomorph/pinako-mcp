@@ -1,7 +1,11 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { mcpEndpoint } from './endpoint.js';
 
-const DEFAULT_ENDPOINT = 'http://127.0.0.1:37421/mcp';
+// ai-todo #67: write tools are refused on a tokenless connection, so the
+// suites need the tokened URL. Resolution lives in endpoint.js so this and the
+// tier2 harness cannot drift apart.
+const DEFAULT_ENDPOINT = mcpEndpoint();
 
 export async function connectPinakoMcp({ endpoint = DEFAULT_ENDPOINT } = {}) {
   const transport = new StreamableHTTPClientTransport(new URL(endpoint));

@@ -62,6 +62,53 @@ Available installers:
 - Pinako extension installed in your browser ([Chrome Web Store](https://chromewebstore.google.com/detail/pinako/clakbccnkfpmpfooiiffomhknnfcodgd))
 - An active Pinako subscription (Pro or higher) — the bridge is gated by subscription
 
+## Local access and the access token
+
+The bridge listens on `127.0.0.1:37421` and serves only loopback requests — it
+refuses anything carrying a browser `Origin` or a non-loopback `Host`, so a web
+page cannot reach it even via DNS rebinding.
+
+Beyond that, driving the **write** tools requires a machine-local access token.
+The installer generates it and writes it into each AI client's configured URL:
+
+```
+http://127.0.0.1:37421/mcp?token=<your-token>
+```
+
+The token lives in your Pinako data directory next to the service binary
+(`%APPDATA%\Pinako\mcp-auth-token` on Windows, `~/.local/share/pinako/` on
+Linux, `~/Library/Application Support/Pinako/` on macOS), readable only by your
+user account. `Authorization: Bearer <token>` works too, for clients that
+support custom headers.
+
+**Treat the URL like a password.** Anyone who has it can read and change your
+tabs, libraries, and notes.
+
+A client configured *without* the token still connects and still reads — its
+write tools return a message asking you to re-run the installer. That keeps
+existing setups working across the upgrade; re-running the installer restores
+full access.
+
+To revoke a token that has been shared or pasted somewhere public:
+
+**Linux** (CLI installer) — regenerates the secret *and* rewrites every
+detected client's config in one step:
+
+```bash
+pinako-ai-bridge-cli-linux-x64 rotate-token
+```
+
+**Windows / macOS** — the GUI installer has no rotate command, so rotate with
+the service binary and then re-run the installer to update your apps:
+
+```bash
+"%APPDATA%\Pinako\pinako-mcp-service.exe" --rotate-token
+```
+
+The old token stops working immediately: a running Bridge notices the change
+and drops any already-authorized session. Until you re-run the installer, apps
+still holding the old URL fall back to read-only.
+
 ## Build from source
 
 ```bash

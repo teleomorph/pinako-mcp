@@ -1,7 +1,11 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { mcpEndpoint } from '../../helpers/endpoint.js';
 
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
-const DEFAULT_MCP_URL = 'http://127.0.0.1:37421/mcp';
+// ai-todo #67: must carry the access token or every write assertion in this
+// suite fails with AUTH_REQUIRED. Shared with the Tier 1 harness via
+// tests/helpers/endpoint.js.
+const DEFAULT_MCP_URL = mcpEndpoint();
 
 // Drive an LLM-powered agent loop against the live Pinako MCP server.
 // Returns a structured transcript so tests can assert on the tool sequence

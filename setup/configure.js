@@ -10,8 +10,29 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { HOME, APPDATA, SERVICE_PATH } from './paths.js';
+import { buildMcpUrl } from './token.js';
 
-const MCP_URL = 'http://127.0.0.1:37421/mcp';
+// ai-todo #67: the URL carries the machine-local access token.
+//
+// Resolved at the START OF EACH configure run, NOT at module load. It was a
+// module-level const, which broke `rotate-token` — whose entire job is to
+// regenerate the secret and rewrite every client. main.js imports this module
+// (capturing the OLD token), then rotates, then calls configureClients, which
+// wrote the captured value back into all 16 configs. Revocation reported
+// success while leaving every client holding a token the bridge now rejects
+// with a hard 401: strictly worse than not revoking at all.
+//
+// Still resolved ONCE PER RUN rather than per writer, so a rotation racing a
+// configure pass cannot split the client table across two different tokens.
+// Falls back to the bare URL if the token file can't be created — that client
+// still works, read-only, instead of failing the install outright.
+let MCP_URL = buildMcpUrl();
+
+/** Re-read the token so this run writes whatever is currently on disk. */
+function refreshMcpUrl() {
+  MCP_URL = buildMcpUrl();
+  return MCP_URL;
+}
 
 // ─── Read-only tool list (auto-approved by default) ──────────────────────────
 // Cline supports an `autoApprove: [...]` array in its MCP server config;
@@ -520,6 +541,10 @@ export function configureClient(client) {
   if (!writer) {
     return { ok: false, error: `No writer defined for client: ${client.id}` };
   }
+  // #67: pick up a token rotated after this module was imported. Cheap (one
+  // small read) and it makes a single-client configure correct on its own,
+  // not just when it happens to go through configureClients.
+  refreshMcpUrl();
   try {
     writer(client.configPath);
     return { ok: true };
@@ -532,8 +557,15 @@ export function configureClient(client) {
  * Configure multiple clients. Returns array of { client, ok, error? }.
  */
 export function configureClients(clients) {
-  return clients.map(client => ({
-    client,
-    ...configureClient(client),
-  }));
+  // Resolve once for the whole batch so every client in one run gets the same
+  // token even if a rotation lands mid-loop.
+  refreshMcpUrl();
+  const batchUrl = MCP_URL;
+  return clients.map(client => {
+    MCP_URL = batchUrl;
+    const writer = writers[client.id];
+    if (!writer) return { client, ok: false, error: `No writer defined for client: ${client.id}` };
+    try { writer(client.configPath); return { client, ok: true }; }
+    catch (e) { return { client, ok: false, error: e.message }; }
+  });
 }

@@ -50,6 +50,12 @@ export const LOG_PATH = path.join(PINAKO_DIR, 'pinako-mcp.log');
 
 export const MANIFEST_PATH = path.join(PINAKO_DIR, 'pinako-native-host.json');
 
+// ── Local access token (ai-todo #67) ─────────────────────────────────────────
+// Read/write helpers live in setup/token.js; the path is here so all
+// PINAKO_DIR-relative locations stay in one place.
+
+export const TOKEN_PATH = path.join(PINAKO_DIR, 'mcp-auth-token');
+
 // ── Chrome NativeMessagingHosts directories ──────────────────────────────────
 // Windows: registered via registry key (no fixed dir needed)
 // Linux:   file-based — Chrome and Chromium each have a known dir

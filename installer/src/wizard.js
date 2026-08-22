@@ -128,6 +128,25 @@ async function runInstall() {
     appendLog(logBox, `Error: ${err}`);
   }
 
+  // #67: fill in the REAL server URL before showing the done screen. It used
+  // to be hardcoded as the bare URL in index.html, which is the read-only
+  // form — while the release notes tell hand-configuring users to copy the
+  // URL from exactly this screen.
+  try {
+    const { url, tokenless } = await invoke('mcp_url');
+    const urlEl = document.querySelector('#s-done .mcp-url');
+    if (urlEl) urlEl.textContent = url;
+    const warnEl = document.getElementById('mcp-url-warning');
+    if (warnEl) {
+      warnEl.hidden = !tokenless;
+      if (tokenless) {
+        appendLog(logBox, '⚠ Could not create the access token — apps were configured with read-only access.');
+      }
+    }
+  } catch (err) {
+    console.error(err);
+  }
+
   // Brief pause so the user can read the log, then advance to done screen.
   setTimeout(() => showStep(3), 900);
 }
