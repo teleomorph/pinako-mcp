@@ -231,6 +231,40 @@ async function main() {
     check('log shows the redaction marker', logText.includes('token=<redacted>'), true);
     check('bearer header redacted in log', /"authorization":"<redacted>"/.test(logText), true);
 
+    // ── Catalog-wide invariant ──
+    // Every tool the server actually exposes must land on the correct side of
+    // the gate, checked against the LIVE catalog rather than a hardcoded list.
+    // This is what makes the default-deny design hold over time: a tool added
+    // later (main added three Tab Group write tools while this branch was
+    // open) is gated with no one remembering to update the auth code, and a
+    // write tool mislabelled readOnlyHint:true shows up here instead of
+    // shipping as a hole.
+    console.log('\n  Catalog-wide read/write classification');
+    const READ_ONLY_EXPECTED = new Set([
+      'get_tree', 'search_tabs', 'search_pinako', 'list_libraries', 'get_library',
+      'get_main_tree_notes', 'get_bookmarks', 'list_browsers', 'find_duplicates',
+      'get_tree_summary', 'search_docs',
+    ]);
+    const listResp = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'mcp-session-id': sid },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 500, method: 'tools/list', params: {} }),
+    });
+    const toolNames = ((await listResp.json())?.result?.tools || []).map(t => t.name);
+    check('catalog is non-empty', toolNames.length > 0, true);
+
+    const leakedWrites = [];
+    const overGatedReads = [];
+    for (const name of toolNames) {
+      const r = await call(name);
+      const blocked = r.code === 'AUTH_REQUIRED';
+      if (READ_ONLY_EXPECTED.has(name)) { if (blocked) overGatedReads.push(name); }
+      else if (!blocked) leakedWrites.push(name);
+    }
+    check(`every write tool blocked tokenless (${toolNames.length - READ_ONLY_EXPECTED.size} checked)`,
+      leakedWrites.join(',') || 'none', 'none');
+    check('no read tool over-gated', overGatedReads.join(',') || 'none', 'none');
+
   } finally {
     child.stdin.end();
     child.kill();
