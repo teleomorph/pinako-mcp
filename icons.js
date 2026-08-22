@@ -1,8 +1,9 @@
 // Pinako brand icons as data URIs for the MCP serverInfo 'icons' field
-// (SEP-973, spec 2025-11-25). Claude Desktop renders these next to the
-// connector name; without them a local (stdio) connector falls back to a
-// generic lettered avatar. URLs aren't accepted by the field, so the icons
-// are inlined as data URIs.
+// (SEP-973, spec 2025-11-25). Claude renders these for REMOTE connectors;
+// as of Claude Desktop 1.26832 (verified 2026-08-07) local stdio connectors
+// still show a lettered avatar regardless — sent anyway for other MCP
+// clients and for when Claude extends rendering to local servers. URLs
+// aren't accepted by the field, so the icons are inlined as data URIs.
 //
 // KEEP IN SYNC with supabase/functions/mcp-server/icons.ts (the cloud
 // connector's copy) — same bytes, so both Pinako connectors show the same
