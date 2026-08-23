@@ -111,19 +111,6 @@ function readJsonStrict(filePath) {
   }
 }
 
-// Deep-merge src into dst (one level for mcpServers, not recursive)
-function mergeConfig(dst, src) {
-  for (const [key, val] of Object.entries(src)) {
-    if (val && typeof val === 'object' && !Array.isArray(val) &&
-        dst[key] && typeof dst[key] === 'object') {
-      dst[key] = { ...dst[key], ...val };
-    } else {
-      dst[key] = val;
-    }
-  }
-  return dst;
-}
-
 // ─── TOML helpers (Codex + Grok Build) ──────────────────────────────────────
 // Codex (~/.codex/config.toml) and Grok Build (~/.grok/config.toml) both store
 // MCP servers as [mcp_servers.<name>] TOML tables. Those files are usually
