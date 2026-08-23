@@ -159,6 +159,54 @@ function appendLog(box, text) {
   box.appendChild(el);
 }
 
+// ── Copy button on the MCP URL ────────────────────────────────────────────────
+// The URL is the one string users are told to take somewhere else, so it gets a
+// copy button per the house idiom (CLAUDE.md): a U+29C9 glyph that flips to a
+// check for 1.2s. navigator.clipboard can be unavailable or rejected inside a
+// webview depending on the origin's secure-context status, so fall back to the
+// execCommand path rather than failing silently on the one action that matters.
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) { /* fall through */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+function wireCopyButton() {
+  const btn = document.getElementById('mcp-copy-btn');
+  const urlEl = document.querySelector('#s-done .mcp-url');
+  if (!btn || !urlEl) return;
+  let revertTimer = null;
+  btn.addEventListener('click', async () => {
+    const ok = await copyText(urlEl.textContent.trim());
+    // Icon state is a CLASS toggle over two inline SVGs, not textContent —
+    // swapping text would blow away the markup the stylesheet centers.
+    btn.classList.toggle('copied', ok);
+    btn.title = ok ? 'Copied' : 'Copy failed — select the text and copy manually';
+    clearTimeout(revertTimer);
+    revertTimer = setTimeout(() => {
+      btn.classList.remove('copied');
+      btn.title = 'Copy to clipboard';
+    }, 1200);
+  });
+}
+
 // ── External links ────────────────────────────────────────────────────────────
 
 function openLink(url) {
@@ -225,6 +273,7 @@ function initWordmarkAnimation() {
 document.addEventListener('DOMContentLoaded', () => {
   init();
   initWordmarkAnimation();
+  wireCopyButton();
 
   // Show platform-correct install path on welcome screen
   const pathEl = document.getElementById('install-path');
