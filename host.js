@@ -346,6 +346,7 @@ const BULK_APPLY_SUB_OP_TYPES = [
   'ghost_node',
   'delete_live_node',
   'move_node',
+  'move_node_to_library',
   'indent_node',
   'outdent_node',
   'create_library',
@@ -3057,6 +3058,7 @@ function createMcpServer() {
     reorder_library_panel:          EDIT,
     reorder_libraries_in_group:     EDIT,
     move_node:                      EDIT,
+    move_node_to_library:           EDIT,
     add_library_to_group:           EDIT,
     remove_library_from_group:      EDIT,
     // Edit, NOT idempotent (9) — create_* duplicates on retry per
@@ -4337,6 +4339,19 @@ function createMcpServer() {
     },
     annotations: TOOL_ANNOTATIONS.move_node,
   }, async (args) => writeToolHandler('move_node', args));
+
+  srv.registerTool('move_node_to_library', {
+    description: 'Moves a node and its FULL subtree OUT of one Library and INTO another (libraryId -> targetLibraryId). This is the ONLY tool that can cross a Library boundary in one step; move_node with scope:"library" moves within a single library and rejects a foreign destination. Both libraries change atomically, so the node is never in two libraries or neither, and ONE undo reverts the whole move. The node keeps its id. Everything else matches move_node: same VALID PARENT BY MOVED-NODE TYPE rules (tab -> ROOT/window/folder/tabgroup; window -> ROOT/group/folder; group -> ROOT/group; folder -> ROOT/folder; tabgroup -> window only), the same tab-to-ROOT auto-wrap into a new window, and the same position clamping. newParentId is resolved INSIDE targetLibraryId only. Emptied windows and tab-group shells in the source library are pruned. To COPY instead of move (keep it in both), use add_to_library with sourceScope:"library". Example: {nodeId:"node-12", libraryId:"folder-a", targetLibraryId:"folder-b"}.',
+    inputSchema: {
+      nodeId:          z.string().describe('Node to move (with its subtree). Must currently live in libraryId.'),
+      libraryId:       z.string().describe('SOURCE library id — the one the node is in now. Required: without it a mistyped nodeId could match a node in some other library and move that instead.'),
+      targetLibraryId: z.string().describe('DESTINATION library id. Must differ from libraryId.'),
+      newParentId:     z.union([z.string(), z.null()]).optional().describe('Destination parent id INSIDE targetLibraryId, or null/omitted for that library\'s root (a tab landing at root is auto-wrapped in a new window node).'),
+      position:        z.number().optional().describe(POSITION_DESC),
+      browser:         z.string().optional().describe(BROWSER_ARG_DESC),
+    },
+    annotations: TOOL_ANNOTATIONS.move_node_to_library,
+  }, async (args) => writeToolHandler('move_node_to_library', args));
 
   srv.registerTool('create_group', {
     description: 'Creates a new Window Group node (type="group" — Pinako\'s organizational row for nesting windows). Window Groups can contain other Window Groups and windows but NOT tabs directly (tabs always live under a window, a tabgroup node, or another tab). Position defaults to TOP of the destination siblings (matches the manual UI). This does NOT create a browser Tab Group (the colored-strip groups in the browser tab bar) — use create_tab_group for those; tabs join an EXISTING browser Tab Group via move_node.',
