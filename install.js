@@ -99,7 +99,7 @@ console.log('─── Add to Claude Desktop config ─────────�
 console.log('File: %APPDATA%\\Claude\\claude_desktop_config.json\n');
 console.log(JSON.stringify({
   mcpServers: {
-    pinako: {
+    Pinako: {
       // DEPRECATED script (see the header). This bare URL is now the
       // read-only form — the supported installers write a tokened one.
       url: 'http://localhost:37421/mcp',

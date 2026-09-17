@@ -211,6 +211,46 @@ fn detect_claude_desktop(appdata: &Path) -> ClientInfo {
     }
 }
 
+// ── Server key ───────────────────────────────────────────────────────────────
+// The config key is what Claude Desktop, Cursor, Claude Code and most other
+// clients show as the server's name — none of them read serverInfo.title for
+// a local server. Capitalised 2026-09-17 (owner request: every client listed
+// the bridge as "pinako"). Every writer drops the pre-rename key on the way,
+// so a re-install over an older bridge never leaves two local entries.
+// Mirrors SERVER_KEY / LEGACY_SERVER_KEYS in pinako-mcp/setup/configure.js.
+const SERVER_KEY: &str = "Pinako";
+const LEGACY_SERVER_KEYS: &[&str] = &["pinako"];
+
+/// Set our entry on a servers map, removing any pre-rename key first.
+fn put_server_entry(map: &mut serde_json::Value, entry: serde_json::Value) {
+    if let Some(obj) = map.as_object_mut() {
+        for k in LEGACY_SERVER_KEYS {
+            obj.remove(*k);
+        }
+        obj.insert(SERVER_KEY.to_string(), entry);
+    }
+}
+
+/// Drop only the pre-rename keys from `<file>[map_key]` (best effort; an
+/// unparseable file is the user's business, not ours).
+fn prune_legacy_keys(path: &Path, map_key: &str) {
+    let Ok(Some(mut cfg)) = read_json_strict(path) else { return };
+    let Some(map) = cfg[map_key].as_object_mut() else { return };
+    let mut changed = false;
+    for k in LEGACY_SERVER_KEYS {
+        changed |= map.remove(*k).is_some();
+    }
+    if !changed {
+        return;
+    }
+    if map.is_empty() {
+        if let Some(root) = cfg.as_object_mut() {
+            root.remove(map_key);
+        }
+    }
+    let _ = write_json(path, &cfg);
+}
+
 fn write_claude_desktop_config(path: &Path) -> Result<(), String> {
     let mcp_url = mcp_url_get();
     let mut cfg = read_json(path);
@@ -220,10 +260,10 @@ fn write_claude_desktop_config(path: &Path) -> Result<(), String> {
     // self-contained stdio↔HTTP bridge — no Node.js dependency on the
     // end user's machine.
     let service_path = pinako_dir().join(service_binary_name());
-    cfg["mcpServers"]["pinako"] = serde_json::json!({
+    put_server_entry(&mut cfg["mcpServers"], serde_json::json!({
         "command": service_path.to_string_lossy(),
         "args": ["--stdio-mcp", mcp_url],
-    });
+    }));
     write_json(path, &cfg)
 }
 
@@ -621,16 +661,18 @@ fn configure_claude_code(home: &Path) -> Result<(), String> {
     let mcp_url = mcp_url_get();
     // `claude mcp add` errors when the name is taken; a missing entry makes
     // remove fail harmlessly, so its status is deliberately ignored.
-    run_claude_cli(&["mcp", "remove", "pinako", "--scope", "user"]);
+    for k in LEGACY_SERVER_KEYS.iter().copied().chain([SERVER_KEY]) {
+        run_claude_cli(&["mcp", "remove", k, "--scope", "user"]);
+    }
     let added = run_claude_cli(&[
-        "mcp", "add", "--scope", "user", "--transport", "http", "pinako", mcp_url.as_str(),
+        "mcp", "add", "--scope", "user", "--transport", "http", SERVER_KEY, mcp_url.as_str(),
     ]);
 
     if !added {
         let path = home.join(".claude.json");
         let mut cfg = read_json_strict(&path)?.unwrap_or_else(|| serde_json::json!({}));
         ensure_obj(&mut cfg, "mcpServers");
-        cfg["mcpServers"]["pinako"] = serde_json::json!({ "type": "http", "url": mcp_url });
+        put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "type": "http", "url": mcp_url }));
         write_json(&path, &cfg)?;
     }
 
@@ -643,11 +685,14 @@ fn prune_stale_claude_settings_entry(home: &Path) {
     let path = home.join(".claude").join("settings.json");
     // An unparseable settings.json is the user's business, not ours.
     let Ok(Some(mut cfg)) = read_json_strict(&path) else { return };
-    if !cfg["mcpServers"]["pinako"].is_object() {
+    let ours: Vec<&str> = LEGACY_SERVER_KEYS.iter().copied().chain([SERVER_KEY]).collect();
+    if !ours.iter().any(|k| cfg["mcpServers"][*k].is_object()) {
         return;
     }
     if let Some(servers) = cfg["mcpServers"].as_object_mut() {
-        servers.remove("pinako");
+        for k in &ours {
+            servers.remove(*k);
+        }
         if servers.is_empty() {
             if let Some(root) = cfg.as_object_mut() {
                 root.remove("mcpServers");
@@ -666,7 +711,7 @@ fn write_antigravity_config(path: &Path) -> Result<(), String> {
     let mcp_url = mcp_url_get();
     let mut cfg = read_json(path);
     ensure_obj(&mut cfg, "mcpServers");
-    cfg["mcpServers"]["pinako"] = serde_json::json!({ "serverUrl": mcp_url });
+    put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "serverUrl": mcp_url }));
     write_json(path, &cfg)
 }
 
@@ -700,14 +745,14 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let path = home.join(".cursor").join("mcp.json");
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": mcp_url });
+            put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "url": mcp_url }));
             write_json(&path, &cfg)
         }
         "windsurf" => {
             let path = home.join(".codeium").join("windsurf").join("mcp_config.json");
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": mcp_url });
+            put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "url": mcp_url }));
             write_json(&path, &cfg)
         }
         "antigravity" => {
@@ -744,7 +789,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             for path in &paths {
                 let mut cfg = read_json(path);
                 ensure_obj(&mut cfg, "mcpServers");
-                cfg["mcpServers"]["pinako"] = entry.clone();
+                put_server_entry(&mut cfg["mcpServers"], entry.clone());
                 write_json(path, &cfg)?;
             }
             Ok(())
@@ -760,10 +805,10 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                 .join("mcp_settings.json");
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({
+            put_server_entry(&mut cfg["mcpServers"], serde_json::json!({
                 "type": "streamable-http",
                 "url": mcp_url, "disabled": false, "alwaysAllow": READ_ONLY_TOOLS
-            });
+            }));
             write_json(&path, &cfg)
         }
         "zoo-code" => {
@@ -773,10 +818,10 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                 .join("mcp_settings.json");
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({
+            put_server_entry(&mut cfg["mcpServers"], serde_json::json!({
                 "type": "streamable-http",
                 "url": mcp_url, "disabled": false, "alwaysAllow": READ_ONLY_TOOLS
-            });
+            }));
             write_json(&path, &cfg)
         }
         "vscode" => {
@@ -785,16 +830,18 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             // named profile) and lets VS Code own its JSONC parsing. Fallback
             // merges the default profile's mcp.json — top-level key is
             // `servers`, NOT `mcpServers`.
-            if !run_code_add_mcp() {
-                let path = appdata.join("Code").join("User").join("mcp.json");
-                let mut cfg = read_json_strict(&path)?
-                    .unwrap_or_else(|| serde_json::json!({}));
-                ensure_obj(&mut cfg, "servers");
-                cfg["servers"]["pinako"] =
-                    serde_json::json!({ "type": "http", "url": mcp_url });
-                write_json(&path, &cfg)?;
+            let path = appdata.join("Code").join("User").join("mcp.json");
+            if run_code_add_mcp() {
+                // The CLI cannot remove a server, so an older bridge's lowercase
+                // entry in the default profile would sit beside ours.
+                prune_legacy_keys(&path, "servers");
+                return Ok(());
             }
-            Ok(())
+            let mut cfg = read_json_strict(&path)?
+                .unwrap_or_else(|| serde_json::json!({}));
+            ensure_obj(&mut cfg, "servers");
+            put_server_entry(&mut cfg["servers"], serde_json::json!({ "type": "http", "url": mcp_url }));
+            write_json(&path, &cfg)
         }
         "gemini-cli" => {
             // ~/.gemini/settings.json is Gemini CLI's main settings file
@@ -805,11 +852,11 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let mut cfg = read_json_strict(&path)?
                 .unwrap_or_else(|| serde_json::json!({}));
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "httpUrl": mcp_url });
+            put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "httpUrl": mcp_url }));
             write_json(&path, &cfg)
         }
         "grok" => {
-            // Same [mcp_servers.pinako] TOML shape as Codex; `enabled = true`
+            // Same [mcp_servers.Pinako] TOML shape as Codex; `enabled = true`
             // matches the bundled docs' convention for url-form servers.
             upsert_pinako_toml_table(
                 &grok_home().join("config.toml"),
@@ -821,7 +868,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             let path = kimi_code_home().join("mcp.json");
             let mut cfg = read_json(&path);
             ensure_obj(&mut cfg, "mcpServers");
-            cfg["mcpServers"]["pinako"] = serde_json::json!({ "url": mcp_url });
+            put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "url": mcp_url }));
             write_json(&path, &cfg)
         }
         "openclaw" => {
@@ -836,9 +883,9 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             if !cfg["mcp"]["servers"].is_object() {
                 cfg["mcp"]["servers"] = serde_json::json!({});
             }
-            cfg["mcp"]["servers"]["pinako"] = serde_json::json!({
+            put_server_entry(&mut cfg["mcp"]["servers"], serde_json::json!({
                 "url": mcp_url, "transport": "streamable-http", "enabled": true
-            });
+            }));
             write_json(&path, &cfg)
         }
         "hermes" => upsert_hermes_yaml(&hermes_home().join("config.yaml")),
@@ -871,13 +918,18 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
 // Codex stores MCP servers in ~/.codex/config.toml, shared by the CLI, the IDE
 // extension, and the desktop app. The file is usually hand-maintained (model
 // prefs, plugins, other MCP servers, comments), so we do a format-preserving
-// targeted edit — rewrite ONLY the [mcp_servers.pinako] table (and any of its
+// targeted edit — rewrite ONLY the [mcp_servers.Pinako] table (and any of its
 // sub-tables) and leave every other byte untouched. Mirrors the JS writer in
 // pinako-mcp/setup/configure.js. A `url` field makes Codex treat it as a
 // streamable-HTTP server automatically; no experimental flag is written (an
 // unrecognized key would break Codex's --strict-config).
 
-const PINAKO_TABLE: &str = "mcp_servers.pinako";
+fn pinako_table() -> String {
+    format!("mcp_servers.{SERVER_KEY}")
+}
+fn legacy_pinako_tables() -> Vec<String> {
+    LEGACY_SERVER_KEYS.iter().map(|k| format!("mcp_servers.{k}")).collect()
+}
 
 fn strip_toml_table(toml: &str, table: &str) -> String {
     let nl = if toml.contains("\r\n") { "\r\n" } else { "\n" };
@@ -902,9 +954,13 @@ fn strip_toml_table(toml: &str, table: &str) -> String {
 fn upsert_pinako_toml_table(path: &Path, body_lines: &[&str]) -> Result<(), String> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let nl = if existing.contains("\r\n") { "\r\n" } else { "\n" };
-    let stripped = strip_toml_table(&existing, PINAKO_TABLE);
+    let table = pinako_table();
+    let mut stripped = strip_toml_table(&existing, &table);
+    for legacy in legacy_pinako_tables() {
+        stripped = strip_toml_table(&stripped, &legacy);
+    }
     let stripped = stripped.trim_end();
-    let block = format!("[{PINAKO_TABLE}]{nl}{}", body_lines.join(nl));
+    let block = format!("[{table}]{nl}{}", body_lines.join(nl));
     let next = if stripped.is_empty() {
         format!("{block}{nl}")
     } else {
@@ -920,7 +976,7 @@ fn upsert_pinako_toml_table(path: &Path, body_lines: &[&str]) -> Result<(), Stri
 /// mcp.json. Same .cmd-shim spawn rules as the claude CLI.
 fn run_code_add_mcp() -> bool {
     let mcp_url = mcp_url_get();
-    let entry = serde_json::json!({ "name": "pinako", "type": "http", "url": mcp_url })
+    let entry = serde_json::json!({ "name": SERVER_KEY, "type": "http", "url": mcp_url })
         .to_string();
     #[cfg(target_os = "windows")]
     let out = std::process::Command::new("cmd")
@@ -964,10 +1020,10 @@ fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
         if lines.iter().any(|l| l.starts_with("mcp_servers:")) {
             return Err(format!(
                 "config.yaml declares mcp_servers in a format this installer does not edit — \
-                 add this entry manually: mcp_servers: {{ pinako: {{ url: \"{mcp_url}\" }} }}"));
+                 add this entry manually: mcp_servers: {{ {SERVER_KEY}: {{ url: \"{mcp_url}\" }} }}"));
         }
         let block = format!(
-            "mcp_servers:{nl}  pinako:{nl}    url: \"{mcp_url}\"{nl}    enabled: true{nl}");
+            "mcp_servers:{nl}  {SERVER_KEY}:{nl}    url: \"{mcp_url}\"{nl}    enabled: true{nl}");
         let base = text.trim_end();
         let next = if base.is_empty() {
             block
@@ -1000,12 +1056,16 @@ fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
         .map(|l| l.chars().take_while(|c| *c == ' ').collect())
         .unwrap_or_else(|| "  ".to_string());
 
-    // Drop any existing pinako child (its header + every deeper line).
+    // Drop any existing Pinako child, under the current or a pre-rename key
+    // (its header + every deeper line).
+    let headers: Vec<String> = LEGACY_SERVER_KEYS.iter().copied().chain([SERVER_KEY])
+        .map(|k| format!("{indent}{k}:")).collect();
     let mut kept: Vec<String> = Vec::new();
     let mut skipping = false;
     for l in &lines[idx + 1..end] {
-        let header = format!("{indent}pinako:");
-        let after = l.strip_prefix(header.as_str()).map(str::trim);
+        let after = headers.iter()
+            .find_map(|h| l.strip_prefix(h.as_str()))
+            .map(str::trim);
         if matches!(after, Some(rest) if rest.is_empty() || rest.starts_with('#')) {
             skipping = true;
             continue;
@@ -1020,7 +1080,7 @@ fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
 
     let child_indent = format!("{indent}{indent}");
     let mut next_lines: Vec<String> = lines[..idx + 1].to_vec();
-    next_lines.push(format!("{indent}pinako:"));
+    next_lines.push(format!("{indent}{SERVER_KEY}:"));
     next_lines.push(format!("{child_indent}url: \"{mcp_url}\""));
     next_lines.push(format!("{child_indent}enabled: true"));
     next_lines.extend(kept);

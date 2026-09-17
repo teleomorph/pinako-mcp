@@ -13,7 +13,7 @@ You probably don't need this codebase at all:
   `http://127.0.0.1:37421/mcp` (the installer appends a machine-local access
   token to the configured URL; without it the surface is read-only).
 - **No install:** use the hosted Remote MCP Connector at
-  `https://connect.pinako.pro/mcp` (OAuth sign-in).
+  `https://connect.pinako.pro/mcp` (OAuth sign-in; name it "Pinako (cloud)").
 - Tool list with descriptions: https://pinako.pro/.well-known/mcp/server-card.json
 - Setup + troubleshooting: https://pinako.pro/docs/mcp-setup/
   (markdown: https://pinako.pro/docs/mcp-setup/index.md)

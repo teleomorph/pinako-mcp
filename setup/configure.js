@@ -28,6 +28,22 @@ import { buildMcpUrl } from './token.js';
 // still works, read-only, instead of failing the install outright.
 let MCP_URL = buildMcpUrl();
 
+// ─── Server key ──────────────────────────────────────────────────────────────
+// The config key is what Claude Desktop, Cursor, Claude Code and most other
+// clients show as the server's name — none of them read serverInfo.title for a
+// local server. Capitalised 2026-09-17 (owner request: every client listed the
+// bridge as "pinako"). Every writer drops the pre-rename key on the way, so a
+// re-install over an older bridge never leaves a user with two local entries.
+// Mirrors SERVER_KEY / LEGACY_SERVER_KEYS in installer/src-tauri/src/main.rs.
+export const SERVER_KEY = 'Pinako';
+export const LEGACY_SERVER_KEYS = ['pinako'];
+
+/** Set our entry on a servers map, removing any pre-rename key first. */
+function putServerEntry(map, entry) {
+  for (const k of LEGACY_SERVER_KEYS) delete map[k];
+  map[SERVER_KEY] = entry;
+}
+
 /** Re-read the token so this run writes whatever is currently on disk. */
 function refreshMcpUrl() {
   MCP_URL = buildMcpUrl();
@@ -117,17 +133,18 @@ function readJsonStrict(filePath) {
 // hand-maintained (model prefs, plugins, other MCP servers, comments), so we
 // do a FORMAT-PRESERVING targeted edit rather than parsing the whole file and
 // re-serializing it (which would strip comments and reflow every line). We
-// rewrite ONLY the [mcp_servers.pinako] table — and any of its sub-tables —
+// rewrite ONLY the [mcp_servers.Pinako] table — and any of its sub-tables —
 // leaving every other byte of the user's config untouched.
 //
 // Both classify a server with a `url` field as streamable-HTTP transport
 // automatically; no extra flag is needed (and writing an unrecognized key
 // would break Codex's `--strict-config`), so the blocks stay minimal.
 
-const PINAKO_TABLE = 'mcp_servers.pinako';
+const PINAKO_TABLE = `mcp_servers.${SERVER_KEY}`;
+const LEGACY_PINAKO_TABLES = LEGACY_SERVER_KEYS.map(k => `mcp_servers.${k}`);
 const TOML_HEADER_RE = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*$/;
 
-// Remove the [mcp_servers.pinako] table and any [mcp_servers.pinako.<sub>]
+// Remove the [mcp_servers.Pinako] table and any [mcp_servers.Pinako.<sub>]
 // sub-tables from a TOML string, preserving all other content verbatim.
 function stripTomlTable(toml, table) {
   const nl = /\r\n/.test(toml) ? '\r\n' : '\n';
@@ -152,7 +169,9 @@ function upsertPinakoTomlTable(configPath, bodyLines) {
   let existing = '';
   try { existing = fs.readFileSync(configPath, 'utf8'); } catch { existing = ''; }
   const nl = /\r\n/.test(existing) ? '\r\n' : '\n';
-  const stripped = stripTomlTable(existing, PINAKO_TABLE).replace(/\s+$/, '');
+  let stripped = existing;
+  for (const t of [PINAKO_TABLE, ...LEGACY_PINAKO_TABLES]) stripped = stripTomlTable(stripped, t);
+  stripped = stripped.replace(/\s+$/, '');
   const block = [`[${PINAKO_TABLE}]`, ...bodyLines].join(nl);
   const next = stripped
     ? stripped + nl + nl + block + nl
@@ -181,9 +200,9 @@ function upsertHermesYaml(configPath) {
     if (lines.some(l => /^mcp_servers:/.test(l))) {
       throw new Error(
         'config.yaml declares mcp_servers in a format this installer does not edit — ' +
-        `add this entry manually: mcp_servers: { pinako: { url: "${MCP_URL}" } }`);
+        `add this entry manually: mcp_servers: { ${SERVER_KEY}: { url: "${MCP_URL}" } }`);
     }
-    const block = ['mcp_servers:', '  pinako:', `    url: "${MCP_URL}"`, '    enabled: true'];
+    const block = ['mcp_servers:', `  ${SERVER_KEY}:`, `    url: "${MCP_URL}"`, '    enabled: true'];
     const base = text.replace(/\s+$/, '');
     fs.mkdirSync(path.dirname(configPath), { recursive: true });
     fs.writeFileSync(
@@ -205,11 +224,13 @@ function upsertHermesYaml(configPath) {
   const firstChild = blockLines.find(l => l.trim() !== '');
   const indent = firstChild ? firstChild.match(/^(\s*)/)[1] : '  ';
 
-  // Drop any existing pinako child (its header + every deeper line).
+  // Drop any existing Pinako child, under the current or a pre-rename key
+  // (its header + every deeper line).
+  const ours = [SERVER_KEY, ...LEGACY_SERVER_KEYS].join('|');
   const kept = [];
   let skipping = false;
   for (const l of blockLines) {
-    if (new RegExp(`^${indent}pinako:\\s*(#.*)?$`).test(l)) { skipping = true; continue; }
+    if (new RegExp(`^${indent}(?:${ours}):\\s*(#.*)?$`).test(l)) { skipping = true; continue; }
     if (skipping) {
       if (l.trim() === '' || l.match(/^(\s*)/)[1].length > indent.length) continue;
       skipping = false;
@@ -218,7 +239,7 @@ function upsertHermesYaml(configPath) {
   }
 
   const child = [
-    `${indent}pinako:`,
+    `${indent}${SERVER_KEY}:`,
     `${indent}${indent || '  '}url: "${MCP_URL}"`,
     `${indent}${indent || '  '}enabled: true`,
   ];
@@ -262,14 +283,16 @@ function runClaudeCli(args) {
 function addViaClaudeCli() {
   // `claude mcp add` errors when the name is taken, so drop any prior entry
   // first. A missing entry makes remove fail harmlessly — ignore its status.
-  runClaudeCli(['mcp', 'remove', 'pinako', '--scope', 'user']);
-  return runClaudeCli(['mcp', 'add', '--scope', 'user', '--transport', 'http', 'pinako', MCP_URL]);
+  for (const k of [...LEGACY_SERVER_KEYS, SERVER_KEY]) {
+    runClaudeCli(['mcp', 'remove', k, '--scope', 'user']);
+  }
+  return runClaudeCli(['mcp', 'add', '--scope', 'user', '--transport', 'http', SERVER_KEY, MCP_URL]);
 }
 
 function addViaClaudeJsonMerge() {
   const config = readJsonStrict(CLAUDE_JSON_PATH) || {};
   config.mcpServers = config.mcpServers || {};
-  config.mcpServers.pinako = { type: 'http', url: MCP_URL };
+  putServerEntry(config.mcpServers, { type: 'http', url: MCP_URL });
   writeJson(CLAUDE_JSON_PATH, config);
 }
 
@@ -287,7 +310,7 @@ const CLINE_SHARED_SETTINGS_PATH = path.join(
 // `code --add-mcp '<json>'` upserts into the active profile's mcp.json.
 // Same .cmd-shim spawn rules as the claude CLI.
 function addViaVscodeCli() {
-  const entry = JSON.stringify({ name: 'pinako', type: 'http', url: MCP_URL });
+  const entry = JSON.stringify({ name: SERVER_KEY, type: 'http', url: MCP_URL });
   const win = process.platform === 'win32';
   const res = win
     ? spawnSync('cmd', ['/c', 'code', '--add-mcp', entry], { stdio: 'ignore', timeout: 60_000 })
@@ -298,16 +321,30 @@ function addViaVscodeCli() {
 // Remove the entry earlier installers wrote to the file Claude Code ignores, so
 // a stale 127.0.0.1 record can't shadow the real one in a user's mental model.
 function pruneStaleClaudeSettingsEntry() {
+  pruneKeys(CLAUDE_SETTINGS_PATH, 'mcpServers', [SERVER_KEY, ...LEGACY_SERVER_KEYS]);
+}
+
+/** Drop only the pre-rename keys from a servers map the user may still hold. */
+function pruneLegacyKeys(filePath, mapKey) {
+  pruneKeys(filePath, mapKey, LEGACY_SERVER_KEYS);
+}
+
+// Remove the given keys from `<file>[mapKey]`, dropping the map when it
+// empties. Strict read: an unparseable file is the user's business, not ours.
+function pruneKeys(filePath, mapKey, keys) {
   let config;
   try {
-    config = readJsonStrict(CLAUDE_SETTINGS_PATH);
+    config = readJsonStrict(filePath);
   } catch {
-    return; // unparseable settings.json is the user's business, not ours
+    return;
   }
-  if (!config?.mcpServers?.pinako) return;
-  delete config.mcpServers.pinako;
-  if (Object.keys(config.mcpServers).length === 0) delete config.mcpServers;
-  writeJson(CLAUDE_SETTINGS_PATH, config);
+  const map = config?.[mapKey];
+  if (!map || typeof map !== 'object') return;
+  const present = keys.filter(k => k in map);
+  if (!present.length) return;
+  for (const k of present) delete map[k];
+  if (Object.keys(map).length === 0) delete config[mapKey];
+  writeJson(filePath, config);
 }
 
 // ─── Antigravity helpers ─────────────────────────────────────────────────────
@@ -323,7 +360,7 @@ const ANTIGRAVITY_LEGACY_PATH =
 function writeAntigravityConfig(configPath) {
   const config = readJson(configPath);
   config.mcpServers = config.mcpServers || {};
-  config.mcpServers.pinako = { serverUrl: MCP_URL };
+  putServerEntry(config.mcpServers, { serverUrl: MCP_URL });
   writeJson(configPath, config);
 }
 
@@ -345,24 +382,24 @@ const writers = {
     // Use the bundled pinako-mcp-service binary in --stdio-mcp mode as a
     // self-contained stdio↔HTTP bridge — no Node.js dependency on the
     // end user's machine.
-    config.mcpServers.pinako = {
+    putServerEntry(config.mcpServers, {
       command: SERVICE_PATH,
       args: ['--stdio-mcp', MCP_URL],
-    };
+    });
     writeJson(configPath, config);
   },
 
   'cursor'(configPath) {
     const config = readJson(configPath);
     config.mcpServers = config.mcpServers || {};
-    config.mcpServers.pinako = { url: MCP_URL };
+    putServerEntry(config.mcpServers, { url: MCP_URL });
     writeJson(configPath, config);
   },
 
   'windsurf'(configPath) {
     const config = readJson(configPath);
     config.mcpServers = config.mcpServers || {};
-    config.mcpServers.pinako = { url: MCP_URL };
+    putServerEntry(config.mcpServers, { url: MCP_URL });
     writeJson(configPath, config);
   },
 
@@ -394,7 +431,7 @@ const writers = {
     for (const p of [configPath, CLINE_SHARED_SETTINGS_PATH]) {
       const config = readJson(p);
       config.mcpServers = config.mcpServers || {};
-      config.mcpServers.pinako = { ...entry };
+      putServerEntry(config.mcpServers, { ...entry });
       writeJson(p, config);
     }
   },
@@ -407,12 +444,12 @@ const writers = {
     // the identical schema.
     const config = readJson(configPath);
     config.mcpServers = config.mcpServers || {};
-    config.mcpServers.pinako = {
+    putServerEntry(config.mcpServers, {
       type: 'streamable-http',
       url: MCP_URL,
       disabled: false,
       alwaysAllow: [...READ_ONLY_TOOLS],
-    };
+    });
     writeJson(configPath, config);
   },
 
@@ -420,12 +457,12 @@ const writers = {
     // Community successor to Roo Code (official handoff); Roo-style schema.
     const config = readJson(configPath);
     config.mcpServers = config.mcpServers || {};
-    config.mcpServers.pinako = {
+    putServerEntry(config.mcpServers, {
       type: 'streamable-http',
       url: MCP_URL,
       disabled: false,
       alwaysAllow: [...READ_ONLY_TOOLS],
-    };
+    });
     writeJson(configPath, config);
   },
 
@@ -454,7 +491,7 @@ const writers = {
   },
 
   'grok'(configPath) {
-    // Same [mcp_servers.pinako] shape as Codex; `enabled = true` matches the
+    // Same [mcp_servers.Pinako] shape as Codex; `enabled = true` matches the
     // bundled docs' convention for url-form servers.
     upsertPinakoTomlTable(configPath, [`url = "${MCP_URL}"`, 'enabled = true']);
   },
@@ -464,7 +501,7 @@ const writers = {
     // with no `transport` key is treated as streamable HTTP.
     const config = readJson(configPath);
     config.mcpServers = config.mcpServers || {};
-    config.mcpServers.pinako = { url: MCP_URL };
+    putServerEntry(config.mcpServers, { url: MCP_URL });
     writeJson(configPath, config);
   },
 
@@ -477,11 +514,11 @@ const writers = {
     const config = readJsonStrict(configPath) || {};
     config.mcp = config.mcp || {};
     config.mcp.servers = config.mcp.servers || {};
-    config.mcp.servers.pinako = {
+    putServerEntry(config.mcp.servers, {
       url: MCP_URL,
       transport: 'streamable-http',
       enabled: true,
-    };
+    });
     writeJson(configPath, config);
   },
 
@@ -499,9 +536,13 @@ const writers = {
     if (!addViaVscodeCli()) {
       const config = readJsonStrict(VSCODE_MCP_PATH) || {};
       config.servers = config.servers || {};
-      config.servers.pinako = { type: 'http', url: MCP_URL };
+      putServerEntry(config.servers, { type: 'http', url: MCP_URL });
       writeJson(VSCODE_MCP_PATH, config);
+      return;
     }
+    // The CLI cannot remove a server, so an older bridge's lowercase entry
+    // in the default profile would sit beside ours. Prune it there.
+    pruneLegacyKeys(VSCODE_MCP_PATH, 'servers');
   },
 
   'gemini-cli'(configPath) {
@@ -511,7 +552,7 @@ const writers = {
     // `serverUrl` file is a different product that does not serve this CLI).
     const config = readJsonStrict(configPath) || {};
     config.mcpServers = config.mcpServers || {};
-    config.mcpServers.pinako = { httpUrl: MCP_URL };
+    putServerEntry(config.mcpServers, { httpUrl: MCP_URL });
     writeJson(configPath, config);
   },
 
