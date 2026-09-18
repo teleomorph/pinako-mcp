@@ -1020,11 +1020,19 @@ if (!BRIDGE_URL) {
     }
   });
 
+  // A BRIDGE EXIT LEAVES A LINE IN THE LOG (2026-09-17, found live). Both of
+  // these used to be stderr-only, and Chrome's native-messaging stderr goes
+  // wherever the browser feels like putting it: on a user's machine, nowhere
+  // readable. So a Bridge that vanished mid-session left `pinako-mcp.log`
+  // ending at whatever it happened to be doing, indistinguishable from a
+  // process still running and idle. `log()` writes stderr AND appends the
+  // shared file synchronously (no queue, nothing to flush), which is exactly
+  // what an exit path needs, and nothing else logs on either moment.
   process.stdin.on('end', () => {
     extensionConnected = false;
-    process.stderr.write('[pinako-mcp] Extension disconnected. Serving stale cache for 30s.\n');
+    log(`[${process.pid}] native port closed by the browser. Serving stale cache for ${Math.round(STDIN_GRACE_MS / 1000)}s.`);
     shutdownTimer = setTimeout(() => {
-      process.stderr.write('[pinako-mcp] Grace period expired. Exiting.\n');
+      log(`[${process.pid}] exiting: native port closed by the browser, grace period expired.`);
       process.exit(0);
     }, STDIN_GRACE_MS);
   });

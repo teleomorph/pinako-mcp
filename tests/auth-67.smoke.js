@@ -265,6 +265,24 @@ async function main() {
       leakedWrites.join(',') || 'none', 'none');
     check('no read tool over-gated', overGatedReads.join(',') || 'none', 'none');
 
+    // ── A BRIDGE EXIT LEAVES A LINE IN THE LOG (2026-09-17) ──────────────
+    // Chrome owns this process's stderr and puts it somewhere no user can
+    // read, so when a Bridge vanished mid-session `pinako-mcp.log` just
+    // stopped: indistinguishable from a bridge still running and idle. Closing
+    // stdin is exactly what Chrome does when it tears the native port down, so
+    // it is what this asserts. The EXIT line one grace period later is the same
+    // `log()` call on the same handler's timer; pinning it would cost the
+    // suite 30 s of waiting for a second line by construction.
+    // MUST BE LAST: the host is on its way out after this.
+    console.log('\n  Bridge exit is visible in the log');
+    child.stdin.end();
+    await sleep(500);
+    const exitLog = fs.readFileSync(path.join(DATA_DIR, 'Pinako', 'pinako-mcp.log'), 'utf8');
+    const exitLines = exitLog.split('\n').filter(l => l.includes('native port closed by the browser'));
+    check('stdin end writes ONE line to the shared log, not stderr alone', exitLines.length, 1);
+    check('…and it names the pid, so one log can be read across bridges',
+      exitLines.length === 1 && exitLines[0].includes(`[${child.pid}]`), true);
+
   } finally {
     child.stdin.end();
     child.kill();
