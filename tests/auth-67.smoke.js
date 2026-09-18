@@ -25,7 +25,8 @@ const PORT     = 37799;                       // scratch port, not the real 3742
 const BASE     = `http://127.0.0.1:${PORT}`;
 const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pinako-auth67-'));
 
-let passed = 0, failed = 0;
+let passed = 0, failed = 0, skipped = 0;   // `skipped` counts cases this checkout cannot
+                                          // run at all; they are neither pass nor fail.
 function check(label, actual, expected) {
   const ok = actual === expected;
   if (ok) { passed++; console.log(`  \x1b[32m✓\x1b[0m ${label}`); }
@@ -265,6 +266,103 @@ async function main() {
       leakedWrites.join(',') || 'none', 'none');
     check('no read tool over-gated', overGatedReads.join(',') || 'none', 'none');
 
+    // ── C(ii): THE NM HEARTBEAT ONLY FIRES WHEN THERE IS WORK (2026-09-18) ──
+    // Found live: the MV3 service worker idles out after ~5 minutes of no port
+    // traffic, Chrome then closes the native port, and host.js exits one grace
+    // period later — while a background queue in this process still had work
+    // waiting. The heartbeat is now one connection-lifetime interval that
+    // WRITES only when an applyEdit is in flight or a host extension reports a
+    // queue as RUNNING OR SCHEDULED. Three halves have to hold: firing when
+    // something is scheduled, staying silent when nothing is, and never firing
+    // on a leftover count alone — a heartbeat that never stops is a machine
+    // that never sleeps.
+    //
+    // Each run spawns its own host (own scratch port, own data dir) so the
+    // suite's long-lived `child` is untouched, and shortens the interval
+    // through PINAKO_NM_HEARTBEAT_MS. The first passes NO knob at all and lets
+    // the real predicate answer over the extension's own start-up state. The
+    // second sets PINAKO_PENDING_WORK_QUIESCE, which asks the extension not to
+    // ARM the one wake-up it would schedule for itself at start-up: it parks
+    // the schedule, never the predicate, so the answer is still the
+    // extension's own. Only the third stubs the answer, through
+    // PINAKO_PENDING_WORK_FORCE, to prove host.js reaches a registered probe
+    // at all.
+    console.log('\n  NM heartbeat fires for scheduled work and for nothing else');
+    const EXT_PRESENT = fs.existsSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'bridge-ext', 'host-ext.js'));
+    if (!EXT_PRESENT) {
+      // No host extension in this checkout, so nothing can register a probe
+      // and there is no queue to schedule. Skip cleanly: these cases are
+      // neither passed nor failed here.
+      skipped += 4;
+      console.log('  \x1b[33m—\x1b[0m SKIP: heartbeat-with-pending-work cases need the host extension (not present in this checkout)');
+    } else {
+      const HB_MS = 250;
+      // NOTHING RUNNING AND NOTHING SCHEDULED. One neutral knob, honoured by
+      // the extension at exactly one place: it declines to arm the wake-up it
+      // would otherwise schedule for itself at start-up. Whatever counts it is
+      // carrying, the predicate has to answer false.
+      const QUIET = { PINAKO_PENDING_WORK_QUIESCE: '1' };
+      // A CASE SAYS ITS OWN ENV, WHOLE. Every knob this host reads is a
+      // PINAKO_* variable, and any of them may already be set in the shell a
+      // developer runs the suite from — which would decide these cases instead
+      // of the code under test: an inherited knob can silence the armed run
+      // (false FAIL) or, worse, make the quiet run pass for a reason that has
+      // nothing to do with the predicate (false PASS). So strip the whole
+      // prefix out of the inherited environment first, then layer on exactly
+      // what the case means to say. The run with no knobs of its own gets a
+      // genuinely bare one.
+      const baseEnv = () => Object.fromEntries(
+        Object.entries(process.env).filter(([k]) => !k.startsWith('PINAKO_')));
+      const runHost = async (label, port, extraEnv) => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pinako-hb-'));
+        const c = spawn(process.execPath, [HOST_JS], {
+          env: { ...baseEnv(), PINAKO_MCP_PORT: String(port), PINAKO_NM_HEARTBEAT_MS: String(HB_MS),
+                 APPDATA: dir, HOME: dir, USERPROFILE: dir, ...extraEnv },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        c.stderr.on('data', () => {});
+        // stdout is the native-messaging channel: 4-byte LE length + JSON body.
+        let buf = Buffer.alloc(0), beats = 0;
+        c.stdout.on('data', (chunk) => {
+          buf = Buffer.concat([buf, chunk]);
+          while (buf.length >= 4) {
+            const n = buf.readUInt32LE(0);
+            if (buf.length < 4 + n) break;
+            const body = buf.slice(4, 4 + n); buf = buf.slice(4 + n);
+            try { if (JSON.parse(body.toString('utf8')).type === 'heartbeat') beats++; } catch (_) {}
+          }
+        });
+        await sleep(4000);                    // ~16 intervals, minus the extension's load time
+        const whileConnected = beats;
+        c.stdin.end();                        // exactly what Chrome does to tear the port down
+        await sleep(1500);                    // ~6 more intervals, well inside the 30s grace
+        const afterStdinEnd = beats - whileConnected;
+        try { c.kill(); } catch (_) {}
+        await sleep(100);
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+        return { label, whileConnected, afterStdinEnd };
+      };
+
+      // SCHEDULED, WITH NOTHING BEHIND IT. No knob at all, so the extension
+      // arms its own start-up wake-up exactly as it does on a real machine.
+      // That wake-up is a long way outside this window, so nothing runs, no
+      // cycle ever completes, and no count exists anywhere: the armed timer is
+      // the ONLY thing that can hold the heartbeat open. This is the case the
+      // first cut got backwards — it asked each queue for a count, and a
+      // wake-up armed with a count of zero let the bridge die under it.
+      const armed  = await runHost('armed',  PORT - 1, {});
+      const quiet  = await runHost('quiet',  PORT - 2, QUIET);
+      const forced = await runHost('forced', PORT - 3, { ...QUIET, PINAKO_PENDING_WORK_FORCE: '1' });
+      check('a scheduled resume gets heartbeats with no cycle and no count behind it',
+        armed.whileConnected > 0, true);
+      check('…and NOT one per tick more than the interval allows (16 ticks in 4s)',
+        armed.whileConnected <= 20, true);
+      check('nothing running and nothing scheduled gets none at all — this is not a keep-alive',
+        `${quiet.whileConnected}/${forced.whileConnected > 0}`, '0/true');
+      check('nothing is written after stdin ended, work pending or not',
+        `${armed.afterStdinEnd}/${quiet.afterStdinEnd}/${forced.afterStdinEnd}`, '0/0/0');
+    }
+
     // ── A BRIDGE EXIT LEAVES A LINE IN THE LOG (2026-09-17) ──────────────
     // Chrome owns this process's stderr and puts it somewhere no user can
     // read, so when a Bridge vanished mid-session `pinako-mcp.log` just
@@ -290,7 +388,7 @@ async function main() {
     try { fs.rmSync(DATA_DIR, { recursive: true, force: true }); } catch (_) {}
   }
 
-  console.log(`\n  ${passed} passed, ${failed} failed\n`);
+  console.log(`\n  ${passed} passed, ${failed} failed${skipped ? `, ${skipped} skipped` : ''}\n`);
   process.exit(failed === 0 ? 0 : 1);
 }
 

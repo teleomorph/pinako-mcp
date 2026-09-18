@@ -438,20 +438,44 @@ const _myForwarderToken = randomBytes(16).toString('hex');
 // write tools in Phase 3). Each entry resolves when the matching editApplied /
 // editFailed message arrives back over NM, or rejects on timeout. Single-browser
 // only in Slice A; Slice B adds SSE forwarder routing for non-leader browsers.
-const pendingEdits = new Map();   // requestId -> { resolve, timer, heartbeatTimer, browserId, path, dispatchedAt }
+const pendingEdits = new Map();   // requestId -> { resolve, timer, browserId, path, dispatchedAt }
 const EDIT_TIMEOUT_MS = 30_000;
 
-// W-1 defense-in-depth (2026-05-12): NM heartbeat interval. While an applyEdit
-// is in flight on the local NM path, the bridge writes a {type:'heartbeat'}
-// NM message every NM_HEARTBEAT_MS. Each message reaches the SW's mcpPort
-// listener, which is "activity" by Chrome's accounting and resets the 30s
-// idle timer. Belt-and-suspenders complement to the SW→popup port heartbeat
-// (background.js + pinako.js, also 2026-05-12) — that fix handles the common
-// "popup slow but making progress" case; this layer handles "popup event
-// loop completely blocked, can't fire its own setInterval." 25s is well
-// under the 30s idle timer with margin for scheduling jitter. Heartbeats
-// only fire while pendingEdits has at least one entry — no idle traffic.
-const NM_HEARTBEAT_MS = 25_000;
+// W-1 defense-in-depth (2026-05-12): NM heartbeat interval. The bridge writes
+// a {type:'heartbeat'} NM message every NM_HEARTBEAT_MS. Each message reaches
+// the SW's mcpPort listener, which is "activity" by Chrome's accounting and
+// resets the 30s idle timer. Belt-and-suspenders complement to the SW→popup
+// port heartbeat (background.js + pinako.js, also 2026-05-12) — that fix
+// handles the common "popup slow but making progress" case; this layer handles
+// "popup event loop completely blocked, can't fire its own setInterval." 25s
+// is well under the 30s idle timer with margin for scheduling jitter.
+//
+// C(ii) (2026-09-18, owner ruling): the timer is now ONE interval for the life
+// of the native connection instead of one per in-flight edit, and it has a
+// SECOND reason to write. The first is unchanged: an applyEdit is in flight.
+// The second is that a host extension (see the extension point below) reports
+// one of its background queues as busy.
+//
+// Why the second reason exists: such a queue runs in THIS process, and this
+// process only lives as long as Chrome's native port. The port lives as long
+// as the MV3 service worker, which idles out after ~5 minutes of no port
+// traffic; 30s after the port closes (STDIN_GRACE_MS) the bridge exits. A
+// queue that is waiting rather than transferring produces no traffic by
+// definition, so it starved its own port and was killed part-way through.
+// Now a queue with work keeps the pipe warm until the work is done.
+//
+// This is NOT a keep-alive. "Busy" means RUNNING OR SCHEDULED — an extension
+// reports work only while it is processing or has a timer armed to resume, and
+// never merely because a leftover count is above zero. The write is SKIPPED on
+// every tick where neither reason holds, so an idle machine still sleeps
+// exactly as before; the only cost of the always-armed interval is a predicate
+// call every 25s.
+//
+// PINAKO_NM_HEARTBEAT_MS shortens the interval for tests only (same idiom as
+// PINAKO_MCP_PORT above); a value <= 0 is ignored.
+const NM_HEARTBEAT_MS = Number(process.env.PINAKO_NM_HEARTBEAT_MS) > 0
+  ? Number(process.env.PINAKO_NM_HEARTBEAT_MS)
+  : 25_000;
 
 // ─── Slice W-1 diagnostic instrumentation ─────────────────────────────────────
 // Probes SW liveness at the moment EDIT_TIMEOUT fires so we know whether the
@@ -543,7 +567,6 @@ function _markNmStdoutBroken(reason) {
     const summaries = [];
     for (const [requestId, entry] of pendingEdits) {
       try { clearTimeout(entry.timer); } catch (_) {}
-      if (entry.heartbeatTimer) { try { clearInterval(entry.heartbeatTimer); } catch (_) {} }
       const waitedMs = entry.dispatchedAt ? (now - entry.dispatchedAt) : null;
       summaries.push(`${requestId.slice(0,8)}(path=${entry.path},waitedMs=${waitedMs})`);
       try {
@@ -625,6 +648,28 @@ function nmWrite(obj) {
 // Handlers receive the raw NM message and reply via the provided nmWrite.
 const _extNmHandlers = new Map();
 const _extMcpToolRegistrars = [];
+// C(ii): predicates a host extension registers so the NM heartbeat can ask
+// whether one of ITS background queues is still busy (see NM_HEARTBEAT_MS).
+// The contract is RUNNING OR SCHEDULED: an extension answers true while a
+// queue is being processed or a timer is armed to resume it, and never for a
+// leftover count on its own — a count that nothing is committed to consume
+// would hold this heartbeat open forever, which the ruling forbids.
+//
+// The array is EMPTY on a normal install — no extension file exists there, so
+// nothing registers, `_extHasPendingWork()` is a constant false, and the
+// heartbeat keeps exactly its pre-C(ii) behaviour (in-flight applyEdit only).
+// That is the guard the ruling asked for, and it is structural rather than a
+// typeof check at the call site: there is nothing to call.
+const _extPendingWorkProbes = [];
+function _extHasPendingWork() {
+  for (const fn of _extPendingWorkProbes) {
+    // A throwing or slow probe must not take the heartbeat down with it; the
+    // contract with the extension is "cheap, synchronous, boolean".
+    try { if (fn() === true) return true; }
+    catch (e) { try { log(`host-ext pending-work probe error: ${e && e.message ? e.message : e}`); } catch (_) {} }
+  }
+  return false;
+}
 // host.js runs in TWO module systems and must resolve its directory + a
 // require() against whichever primitives the current context provides:
 //   • Dev: raw ES module (`node host.js`, since package.json sets
@@ -712,6 +757,15 @@ if (process.argv.includes('--rotate-token')) {
           nmWrite,
           log: (m) => { try { log(`[host-ext] ${m}`); } catch (_) {} },
           getLocalBrowserId: () => { try { return localBrowserId; } catch (_) { return null; } },
+          // C(ii): register a cheap synchronous predicate that answers "is a
+          // background queue of mine running, or scheduled to run?". The NM
+          // heartbeat asks it once per NM_HEARTBEAT_MS tick and writes a
+          // heartbeat when any registered probe says true, which keeps the SW
+          // — and therefore this process — alive until the work is finished.
+          // It is called on a timer forever: no I/O, no scans, field reads
+          // only. A probe that answers true on a stale count rather than on
+          // live/scheduled state turns this into a keep-alive; don't.
+          onPendingWork: (fn) => { if (typeof fn === 'function') _extPendingWorkProbes.push(fn); },
           // Register extra MCP tools: fn(srv, { z }) is invoked for every server
           // instance createMcpServer() builds (one per MCP session).
           onMcpTools: (fn) => { if (typeof fn === 'function') _extMcpToolRegistrars.push(fn); },
@@ -915,7 +969,6 @@ function handleNmMessage(msg) {
     const pending = pendingEdits.get(msg.requestId);
     if (!pending) return;
     clearTimeout(pending.timer);
-    if (pending.heartbeatTimer) { try { clearInterval(pending.heartbeatTimer); } catch (_) {} }
     pendingEdits.delete(msg.requestId);
     if (msg.type === 'editApplied') {
       pending.resolve(msg.result || { ok: true, requestId: msg.requestId });
@@ -1000,10 +1053,49 @@ function handleNmMessage(msg) {
   }
 }
 
+// C(ii): the ONE NM heartbeat timer (see NM_HEARTBEAT_MS). Armed for the life
+// of the native connection, but it WRITES only when there is a reason to:
+//
+//   1. an applyEdit is in flight  — the original W-1 rule, unchanged; the
+//      pendingEdits entry is now the whole subscription.
+//   2. a host extension reports one of its background queues as running or
+//      scheduled — empty (always false) on a normal install, where no
+//      extension file exists to register a probe.
+//
+// Every other tick does nothing at all, so an idle machine keeps idling out
+// and the bridge keeps exiting 30s later, exactly as before.
+//
+// Two hard guards the ruling named:
+//   • NEVER AFTER STDIN ENDED. The 'end' handler below clears this timer
+//     before it starts the shutdown grace period, so the closing port is not
+//     written to during its last 30 seconds. A broken stdout is covered twice
+//     over: the tick's own first line stops the timer the moment
+//     `_nmStdoutBroken` is set, and `nmWrite` refuses regardless.
+//   • NEVER IN STDIO-BRIDGE MODE. This whole block is inside `!BRIDGE_URL`;
+//     there stdout is the AI client's JSON-RPC stream and an NM frame written
+//     into it corrupts the line protocol (see nmWrite's own guard).
+//
+// `unref()` so an armed heartbeat can never be the reason the process refuses
+// to exit — the HTTP server and stdin are what hold this event loop open.
+let _nmHeartbeatTimer = null;
+function _stopNmHeartbeat() {
+  if (!_nmHeartbeatTimer) return;
+  try { clearInterval(_nmHeartbeatTimer); } catch (_) {}
+  _nmHeartbeatTimer = null;
+}
+
 // Native messaging stdin handlers run only in default mode (Chrome NM host).
 // In stdio-bridge mode, stdin carries MCP JSON-RPC and is owned by
 // StdioServerTransport, not by Chrome's length-prefixed protocol.
 if (!BRIDGE_URL) {
+  _nmHeartbeatTimer = setInterval(() => {
+    if (_nmStdoutBroken) { _stopNmHeartbeat(); return; }
+    const inFlight = pendingEdits.size > 0;
+    if (!inFlight && !_extHasPendingWork()) return;   // nothing to keep warm
+    try { nmWrite({ type: 'heartbeat', reason: inFlight ? 'edit' : 'queue' }); } catch (_) {}
+  }, NM_HEARTBEAT_MS);
+  if (typeof _nmHeartbeatTimer.unref === 'function') _nmHeartbeatTimer.unref();
+
   process.stdin.on('data', (chunk) => {
     stdinBuf = Buffer.concat([stdinBuf, chunk]);
     // Drain complete messages from the buffer
@@ -1030,6 +1122,7 @@ if (!BRIDGE_URL) {
   // what an exit path needs, and nothing else logs on either moment.
   process.stdin.on('end', () => {
     extensionConnected = false;
+    _stopNmHeartbeat();   // C(ii): never write to a port the browser has closed
     log(`[${process.pid}] native port closed by the browser. Serving stale cache for ${Math.round(STDIN_GRACE_MS / 1000)}s.`);
     shutdownTimer = setTimeout(() => {
       log(`[${process.pid}] exiting: native port closed by the browser, grace period expired.`);
@@ -1060,15 +1153,12 @@ function dispatchEdit(op, browserId) {
       return;
     }
     const dispatchedAt = Date.now();
-    // W-1 defense-in-depth: NM heartbeat every 25s while this edit is in
-    // flight. Each heartbeat reaches the SW's mcpPort listener (no-op handler
-    // there), which counts as activity and resets Chrome's 30s SW idle timer
-    // even if the popup-side port heartbeat has stalled.
-    const heartbeatTimer = setInterval(() => {
-      try { nmWrite({ type: 'heartbeat', requestId }); } catch (_) {}
-    }, NM_HEARTBEAT_MS);
+    // W-1 defense-in-depth: the NM heartbeat that kept the SW alive while this
+    // edit is in flight used to be a setInterval created HERE, one per edit.
+    // C(ii) moved it to a single connection-lifetime interval (_nmHeartbeatTimer
+    // near the stdin handlers) whose gate is `pendingEdits.size > 0`, so this
+    // entry being in the map IS the subscription. Nothing to create or clear.
     const timer = setTimeout(async () => {
-      try { clearInterval(heartbeatTimer); } catch (_) {}
       // Slice W-1 diagnostic: probe SW state BEFORE resolving with timeout so
       // we capture ground truth on what was responsive at the 30s mark.
       let probe;
@@ -1082,7 +1172,7 @@ function dispatchEdit(op, browserId) {
         error: { code: 'EDIT_TIMEOUT', message: `applyEdit ${requestId} timed out after ${EDIT_TIMEOUT_MS}ms` },
       });
     }, EDIT_TIMEOUT_MS);
-    pendingEdits.set(requestId, { resolve, timer, heartbeatTimer, browserId, path: 'local', dispatchedAt });
+    pendingEdits.set(requestId, { resolve, timer, browserId, path: 'local', dispatchedAt });
     // The extension's SW NM listener picks this up, opens a long-lived port
     // to the popup (W-1 fix, 2026-05-12), popup runs mutateTreeForAgent and
     // posts the result back. SW relays editApplied/editFailed over NM.
@@ -1092,7 +1182,6 @@ function dispatchEdit(op, browserId) {
     const ok = nmWrite({ type: 'applyEdit', op, requestId, browserId });
     if (!ok) {
       clearTimeout(timer);
-      try { clearInterval(heartbeatTimer); } catch (_) {}
       pendingEdits.delete(requestId);
       resolve({
         ok: false,
