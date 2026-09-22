@@ -406,12 +406,57 @@ fn install(selected_ids: Vec<String>) -> Result<Vec<String>, String> {
     // 5. Configure each selected AI client
     for id in &selected_ids {
         match configure_client(id, &h, &a) {
-            Ok(())  => log.push(format!("✓  Configured {}", client_label(id))),
-            Err(e)  => log.push(format!("⚠  {}: {e}", client_label(id))),
+            Ok(()) => {
+                log.push(format!("✓  Configured {}", client_label(id)));
+                // Claude Code also gets the project-context plugin, which is a
+                // separate artifact from the MCP server entry and lives in the
+                // user's own skills directory. Only after the client itself was
+                // configured: a plugin without a server to talk to is a hook
+                // that can never do anything.
+                if id == "claude-code" {
+                    if let Some(line) = install_claude_plugin(&service_path) {
+                        log.push(line);
+                    }
+                }
+            }
+            Err(e) => log.push(format!("⚠  {}: {e}", client_label(id))),
         }
     }
 
     Ok(log)
+}
+
+/// Ask the service binary we just wrote to install the Claude Code
+/// project-context plugin. Same pattern as `--print-token`: the JavaScript side
+/// owns the five hard-won install rules once, rather than growing a second copy
+/// of them here in a third language.
+///
+/// THIS STEP CAN NEVER FAIL THE INSTALL. Everything else the installer does is
+/// what the user came for; automatic project context is an extra. Three
+/// outcomes, and each returns at most one line for the result log:
+///   exit 0  — installed. Surface the binary's own first line.
+///   exit 3  — this build carries no plugin to install. Say nothing at all.
+///   other   — could not run it. Say so honestly, and say the rest is fine.
+fn install_claude_plugin(service: &Path) -> Option<String> {
+    match std::process::Command::new(service)
+        .arg("--install-claude-plugin")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let line = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if line.is_empty() { None } else { Some(format!("✓  {line}")) }
+        }
+        Ok(out) if out.status.code() == Some(3) => None,
+        _ => Some(format!(
+            "⚠  Automatic project context for Claude Code was not set up, because the AI Bridge program at {} could not be run. Everything else installed normally. Run the installer again after fixing this.",
+            service.display()
+        )),
+    }
 }
 
 /// Open a URL in the system default browser.

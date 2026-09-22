@@ -16,7 +16,7 @@
 
 import readline from 'node:readline';
 import fs from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { installNativeHost } from './native-host.js';
 import { detectClients } from './detect.js';
 import { configureClients } from './configure.js';
@@ -238,6 +238,26 @@ async function main() {
     }
   }
 
+  // ── Step 4b: the Claude Code project-context plugin ───────────────────────
+  // Claude Code gets one more artifact than the other clients: a small plugin
+  // in the user's own skills directory that hands an AI session the context for
+  // the folder it started in. The service binary does the work (see
+  // --install-claude-plugin), so the five install rules live in exactly one
+  // place instead of being copied into every installer.
+  //
+  // Only after Claude Code itself was configured, and never fatal: this is an
+  // extra, and a user who cannot get it is still fully installed.
+  if (results.some((r) => r.client && r.client.id === 'claude-code' && r.ok)) {
+    const plugin = installClaudePlugin();
+    if (plugin.kind === 'ok') {
+      console.log(`    ${ok}  ${plugin.line}`);
+    } else if (plugin.kind === 'failed') {
+      console.log('');
+      console.log(yellow(`  ⚠  Automatic project context for Claude Code was not set up, because the AI Bridge program at ${SERVICE_PATH} could not be run. Everything else installed normally. Run the installer again after fixing this.`));
+    }
+    // plugin.kind === 'absent': this build carries no plugin. Say nothing.
+  }
+
   console.log('');
 
   if (anyFailed) {
@@ -256,6 +276,26 @@ async function main() {
   }
 
   await finish();
+}
+
+// Three outcomes, matching the ones the Windows GUI installer reads:
+//   'ok'      exit 0 — installed; the binary's own first stdout line says where.
+//   'absent'  exit 3 — this build carries no plugin. Nothing to report.
+//   'failed'  anything else, including a binary that will not start at all.
+function installClaudePlugin() {
+  let r = null;
+  try {
+    r = spawnSync(SERVICE_PATH, ['--install-claude-plugin'], { encoding: 'utf8', timeout: 60000, windowsHide: true });
+  } catch (_) {
+    return { kind: 'failed' };
+  }
+  if (!r || r.error) return { kind: 'failed' };
+  if (r.status === 0) {
+    const line = String(r.stdout || '').split(/\r?\n/).find((l) => l.trim());
+    return line ? { kind: 'ok', line: line.trim() } : { kind: 'failed' };
+  }
+  if (r.status === 3) return { kind: 'absent' };
+  return { kind: 'failed' };
 }
 
 async function showFinalInstructions() {

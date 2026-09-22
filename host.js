@@ -396,6 +396,47 @@ const BRIDGE_URL = (() => {
   return url;
 })();
 
+// --hook <name>: run ONE installed Pinako hook script and exit. A hook is a
+// short script an AI coding tool spawns at a known moment; the tool writes JSON
+// to its stdin and reads JSON back from its stdout. This binary carries its own
+// runtime, so it can run that script on a machine where no separate runtime is
+// installed, which is the entire reason the mode exists.
+//
+// ── THE ONE RULE FOR THIS MODE ──
+// Never exit non-zero, and never write to stdout except what the hook script
+// itself prints. The tool renders a visible "hook error" notice on ANY non-zero
+// exit, on every single start, so a Pinako install that went wrong would be a
+// permanent banner in the user's terminal instead of a silent no-op. Silence is
+// the only acceptable degradation, everywhere below.
+//
+// ── WHY THE NAME IS AN ALLOWLIST AND THE PATH IS FIXED ──
+// The script is read from ONE location derived from the home directory, and the
+// name is checked against a frozen list. Nothing about where this looks can be
+// influenced by the caller: a binary that runs whatever script path it is handed
+// is a living-off-the-land primitive that security software rightly dislikes,
+// and the narrow form loses nothing. The dispatcher itself sits at the bottom of
+// this file, after every function it needs is defined.
+const HOOK_NAMES = Object.freeze(['session-start']);
+const HOOK_NAME = (() => {
+  const idx = process.argv.indexOf('--hook');
+  if (idx === -1) return null;
+  const name = process.argv[idx + 1];
+  // Missing or unknown name: exit 0 in silence. Explaining the mistake on
+  // stderr would be friendlier for a human typing it, and would put a "hook
+  // error" notice in front of every user whose install is a version behind.
+  if (!name || !HOOK_NAMES.includes(name)) process.exit(0);
+  return name;
+})();
+if (HOOK_NAME) {
+  // Installed HERE, at detection, rather than beside the dispatcher: everything
+  // between this line and the dispatcher is module evaluation, and an exception
+  // thrown there would otherwise end the process with a non-zero status. The
+  // handlers registered further up only log; these are the ones that keep the
+  // rule. Registered second, so a log line still gets written before we exit.
+  process.on('uncaughtException', () => { try { process.exit(0); } catch (_) {} });
+  process.on('unhandledRejection', () => { try { process.exit(0); } catch (_) {} });
+}
+
 // ─── In-memory cache (per browser) ────────────────────────────────────────────
 // Map<browserId, { tree, libraries, globalNotes, updatedAt, browserId, browserBrand }>.
 // Each Pinako install (Chrome, Brave, Edge, etc.) writes to its own entry,
@@ -608,13 +649,22 @@ function _markNmStdoutBroken(reason) {
   setTimeout(() => process.exit(0), 200);
 }
 
-process.stdout.on('error', (err) => {
-  if (err && (err.code === 'EPIPE' || /EPIPE|broken pipe/i.test(err.message || ''))) {
-    _markNmStdoutBroken('stdout error EPIPE');
-  } else {
-    try { log(`stdout error: ${err && err.message ? err.message : String(err)}`); } catch (_) {}
-  }
-});
+// NOT IN --hook MODE. There stdout belongs to the hook script and to the tool
+// reading it, and an EPIPE (the tool stopped reading, which happens on Ctrl-C
+// during startup) is an ordinary end rather than a broken native-messaging
+// port. `_markNmStdoutBroken` would write log lines and arm a 200 ms exit timer
+// for a bridge that is not running. The hook script installs its own no-op
+// 'error' listeners, and the backstops above turn anything they miss into a
+// clean exit 0.
+if (!HOOK_NAME) {
+  process.stdout.on('error', (err) => {
+    if (err && (err.code === 'EPIPE' || /EPIPE|broken pipe/i.test(err.message || ''))) {
+      _markNmStdoutBroken('stdout error EPIPE');
+    } else {
+      try { log(`stdout error: ${err && err.message ? err.message : String(err)}`); } catch (_) {}
+    }
+  });
+}
 
 function nmWrite(obj) {
   // In --stdio-mcp mode stdout IS the MCP stdio channel to the AI client —
@@ -700,10 +750,16 @@ if (process.argv.includes('--diag')) {
   } catch (e) {
     sqliteState = `unavailable (${e && e.message ? e.message : e})`;
   }
+  // `hook-runner:` is a CAPABILITY PROBE, not decoration. The plugin installer
+  // reads this line to decide whether it may point an installed hook config at
+  // this binary: a build that predates --hook, handed --hook, would ignore the
+  // flag and start its server instead, hanging the hook until its outer
+  // timeout. Absence of the line is the older build's honest answer.
   process.stdout.write(
     `node: ${process.version} (${process.platform}-${process.arch})\n` +
     `packaged: ${process.pkg ? 'yes' : 'no'}\n` +
-    `node:sqlite: ${sqliteState}\n`
+    `node:sqlite: ${sqliteState}\n` +
+    `hook-runner: ${HOOK_NAMES.join(', ')}\n`
   );
   process.exit(0);
 }
@@ -742,7 +798,63 @@ if (process.argv.includes('--rotate-token')) {
   process.exit(0);
 }
 
+// ─── --install-claude-plugin / --uninstall-claude-plugin ─────────────────────
+// Set up (or remove) the Claude Code plugin that gives an AI session the
+// project context for the folder it started in. Same shape as --print-token
+// above and as the host-extension loader below: the installers call the binary
+// they just wrote rather than reimplementing the work in a second and third
+// language, and the delegate is loaded from disk if it is present in this
+// build. A build without it says so and exits 3, which the installers read as
+// "nothing to do here" rather than as a failure.
+//
+// The delegate owns the install rules (never half-install, never clobber a
+// folder Pinako did not create, stage outside the scanned root, move the old
+// copy aside instead of deleting it). Those rules were each learned from a
+// reproduced failure, so they live in exactly one place.
+if (process.argv.includes('--install-claude-plugin') || process.argv.includes('--uninstall-claude-plugin')) {
+  const removing = process.argv.includes('--uninstall-claude-plugin');
+  const candidates = [
+    path.join(_hostDir, 'claude-code-plugin', 'install.js'),
+    path.join(_hostDir, '..', 'bridge-ext', 'claude-code-plugin', 'install.js'),
+  ];
+  let delegate = null;
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) { delegate = _hostRequire(p); break; } } catch (_) { /* try the next one */ }
+  }
+  if (!delegate || typeof delegate.installPlugin !== 'function' || typeof delegate.uninstallPlugin !== 'function') {
+    process.stdout.write('Automatic project context for Claude Code is not included in this build.\n');
+    process.exit(3);
+  }
+  // Where the plugin config should point for the runtime. When this process IS
+  // the packaged binary, it is the answer by definition. Otherwise name the
+  // conventional installed location, which is the same per-OS rule as
+  // SERVICE_PATH in setup/paths.js (one directory up from the log file, which
+  // is already computed per-OS at the top of this file).
+  const servicePath = process.pkg
+    ? process.execPath
+    : path.join(path.dirname(LOG_PATH), process.platform === 'win32' ? 'pinako-mcp-service.exe' : 'pinako-mcp-service');
+  let res = null;
+  try {
+    res = removing ? delegate.uninstallPlugin() : delegate.installPlugin({ servicePath });
+  } catch (e) {
+    process.stderr.write(`[pinako-mcp] ${removing ? 'removing' : 'installing'} the Claude Code plugin failed: ${e && e.message ? e.message : e}\n`);
+    process.exit(1);
+  }
+  const message = (res && typeof res.message === 'string') ? res.message : '';
+  if (res && res.ok) {
+    if (message) process.stdout.write(message.replace(/\n+$/, '') + '\n');
+    process.exit(0);
+  }
+  process.stderr.write((message || 'The Claude Code plugin could not be set up.').replace(/\n+$/, '') + '\n');
+  process.exit(1);
+}
+
 (function loadHostExtensions() {
+  // NOT IN --hook MODE. A hook run must load one script and nothing else: an
+  // extension registers handlers, timers and MCP tools for a server that is
+  // never going to start here, and its own load cost lands on a user waiting at
+  // a blank terminal.
+  if (HOOK_NAME) return;
   const candidates = [
     path.join(_hostDir, 'host-ext.js'),
     path.join(_hostDir, '..', 'bridge-ext', 'host-ext.js'),
@@ -1086,8 +1198,12 @@ function _stopNmHeartbeat() {
 
 // Native messaging stdin handlers run only in default mode (Chrome NM host).
 // In stdio-bridge mode, stdin carries MCP JSON-RPC and is owned by
-// StdioServerTransport, not by Chrome's length-prefixed protocol.
-if (!BRIDGE_URL) {
+// StdioServerTransport, not by Chrome's length-prefixed protocol. In --hook
+// mode stdin carries the tool's event JSON and is owned by the hook script,
+// which reads it and then destroys the handle; a 'data' listener attached here
+// would eat that payload and ref the handle, and the heartbeat would write
+// native-messaging frames into a stdout the tool is parsing as JSON.
+if (!BRIDGE_URL && !HOOK_NAME) {
   _nmHeartbeatTimer = setInterval(() => {
     if (_nmStdoutBroken) { _stopNmHeartbeat(); return; }
     const inFlight = pendingEdits.size > 0;
@@ -5671,7 +5787,11 @@ async function tryBindOrForward(initialAttempt) {
   if (initialAttempt) process.exit(1);
 }
 
-if (!BRIDGE_URL) {
+// NOT IN --hook MODE either: a hook run must never bind the port, forward to a
+// running bridge, or create the access token. It is a short-lived client of
+// whatever bridge already exists, and binding here would make every session
+// start briefly claim the leader role.
+if (!BRIDGE_URL && !HOOK_NAME) {
   tryBindOrForward(true);
 }
 
@@ -6149,4 +6269,33 @@ if (BRIDGE_URL) {
     process.stderr.write(`[pinako-mcp stdio bridge] fatal: ${err.message}\n`);
     process.exit(1);
   });
+}
+
+// ─── --hook <name>: the dispatcher ───────────────────────────────────────────
+// Declared at the top with the other modes; run here, last, so every function
+// it might touch is already defined and every side effect above is gated off.
+//
+// The location is FIXED and derived from the home directory only. It is never
+// taken from an argument and never from an environment variable a caller could
+// set: the whole safety argument for this mode is that no one can steer it.
+// The name was checked against the allowlist at detection.
+//
+// In the packaged build `_hostRequire` is the real CommonJS require, and a
+// require of an absolute real-filesystem path steps outside the snapshot (the
+// snapshot test is a plain path-prefix check). That is the same mechanism the
+// host-extension loader above has used since it shipped.
+//
+// The script runs its own main() as it loads and owns the process from there:
+// it reads stdin, writes its own stdout, and lets the event loop drain. Every
+// outcome here is exit 0 in silence, per THE ONE RULE.
+if (HOOK_NAME) {
+  const hookPath = path.join(os.homedir(), '.claude', 'skills', 'pinako', 'hooks', HOOK_NAME + '.js');
+  let present = false;
+  try { present = fs.existsSync(hookPath); } catch (_) { present = false; }
+  if (!present) process.exit(0);   // no plugin installed: nothing to run
+  try {
+    _hostRequire(hookPath);
+  } catch (_) {
+    process.exit(0);
+  }
 }
