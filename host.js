@@ -2278,7 +2278,10 @@ function _summarizeTreeStructure(roots, opts = {}) {
   const MAX_TITLE_POOL = 500;
 
   function walk(node, depth) {
-    if (!node) return;
+    // Incognito nodes never reach the AI (getTree's rule); roots here are raw
+    // cached nodes, so without this the counts, topDomains and sampleTitles
+    // carried incognito windows' tabs.
+    if (!node || node.incognito) return;
     totalNodes++;
     if (depth > maxDepth) maxDepth = depth;
     const url = typeof node.url === 'string' ? node.url : '';
@@ -2779,6 +2782,61 @@ function getTree(data, includeGhost = true) {
   return filterNodes(tree);
 }
 
+// Container outline for get_tree / get_library `containers_only:true`: every
+// non-tab node (window, group, tabgroup, folder, library-folder), nested as in
+// the tree, each with the count of tabs anywhere beneath it (tabs nested under
+// tabs included) and no tab rows at all. A whole tree is a few hundred tokens
+// this way, where even minimal:true still lists every title and URL.
+//   - opts.split (main tree): each row also carries `live` (open in the
+//     browser) and `ghost` (closed via Pinako, chromeId === null). Library
+//     tabs are saved copies, never open, so library rows carry `tabs` only.
+//   - Every tab is counted whatever include_ghost_tabs says; the split IS the
+//     answer to "open vs closed", and dropping ghosts here would also drop the
+//     live tabs nested under them, the way getTree's filter does.
+//   - A container under a tab (legal in libraries) is lifted into the nearest
+//     container above, since its tab parent is not emitted.
+//   - Incognito nodes are skipped at every depth, as in getTree.
+// No tab sits at the root of either tree (every write path wraps a root tab in
+// a new window), so the rows account for every tab in `tabs`.
+// Takes RAW nodes (not getTree output). Returns
+// {outline, containers, tabs, live?, ghost?}. No helper calls, so the smoke
+// harness can slice it out alone. Mirrors the extension's
+// _containerOutlineForChat (Pinako/pinako.js); keep the two in step
+// (Pinako/tests/container-outline.smoke.js in the extension repo diffs them).
+function containerOutline(rootNodes, opts) {
+  const split = !!(opts && opts.split);
+  let containers = 0;
+  function walk(nodes, into) {
+    const c = { tabs: 0, live: 0, ghost: 0 };
+    if (!Array.isArray(nodes)) return c;
+    for (const n of nodes) {
+      if (!n || typeof n !== 'object' || n.incognito) continue;
+      if (n.type === 'tab') {
+        c.tabs++;
+        if (n.ghost === true || n.chromeId === null) c.ghost++; else c.live++;
+        const sub = walk(n.children, into);
+        c.tabs += sub.tabs; c.live += sub.live; c.ghost += sub.ghost;
+        continue;
+      }
+      containers++;
+      const row = { id: n.id, type: n.type, title: n.title || '' };
+      const kids = [];
+      const sub = walk(n.children, kids);
+      row.tabs = sub.tabs;
+      if (split) { row.live = sub.live; row.ghost = sub.ghost; }
+      if (kids.length) row.children = kids;
+      into.push(row);
+      c.tabs += sub.tabs; c.live += sub.live; c.ghost += sub.ghost;
+    }
+    return c;
+  }
+  const outline = [];
+  const t = walk(rootNodes, outline);
+  const out = { outline, containers, tabs: t.tabs };
+  if (split) { out.live = t.live; out.ghost = t.ghost; }
+  return out;
+}
+
 // ─── Browser routing helpers ─────────────────────────────────────────────────
 // `selectBrowser(arg)` resolves a `browser` tool argument (browserId or
 // case-insensitive brand name like "Brave") to a single cached entry.
@@ -3087,8 +3145,11 @@ ROUTING - when the user expresses one of these intents, CALL THE LISTED TOOL FIR
   "find all my items tagged X" / "memo containing Z" / "search my bookmarks/libraries/notes for ..."
     -> search_pinako (literal substring; scope param picks the surface: "libraries-all" for cross-library lookups, "bookmarks", "notes", "all"). For a named specific tag MUST pass exact_tag:true (substring "food" over-matches "football"). Do NOT call list_libraries({include_tabs:true}) and grep in your head when search_pinako does it bridge-side in one call.
 
-  "how many tabs / items do I have" / "how big is X" / any pure COUNT question
-    -> get_tree_summary({scope}) FIRST. Exact counts + cheap structural overview. Never count by searching (search tools are substring finders, not counters) and never pull the whole tree just to tally it.
+  ANY question or action that needs only the CONTAINERS, not individual tabs: how many tabs are open / closed (whole tree or per window), how many tabs in window / group / folder X, how many windows, which window is biggest or empty, which window holds what, or the ids of windows / groups / folders to move or rename
+    -> get_tree({containers_only:true}) or get_library({library_id, containers_only:true}) FIRST. Returns only windows, Window Groups, Tab Groups and folders, nested, each with its tab counts already computed (tabs, and live/ghost on the main tree), plus whole-surface totals, in a few hundred tokens. Read the number off totals or the row; never tally tabs yourself from a full read. Read tabs only for the part that needs titles or URLs.
+
+  "how big is X" / top domains / a bookmarks or library size check
+    -> get_tree_summary({scope}) FIRST (whole-surface node and link counts, no open/closed split). Never count by searching (search tools are substring finders, not counters) and never pull the whole tree just to tally it.
 
   Questions about Pinako features / terminology / "how does X work"
     -> search_docs FIRST. "Group", "folder", "memo", "ghost tab", "library group", "snapshot" have product-specific meanings; never guess from the term alone. Excerpts are 500 chars, so pass full_sections:true when you need the whole answer rather than the section's name. search_docs({query:"orientation", full_sections:true}) returns the capabilities map if you're starting cold.
@@ -3315,9 +3376,11 @@ function createMcpServer() {
       description:
         'Returns the tab tree (Window Groups → Windows → Tabs; type="tabgroup" container nodes mirror the browser\'s own Tab Groups, holding their member tabs as children). Default "lite": tree shape with children/collapsed/ghost, full URLs, plus tags, memos, openedDate, Tab Group metadata, and colors when present. Shape control: minimal:true = basics-only (id/type/title/url/ghost — cheap large-tree scans); individual include_*:false opts drop a field group; include_favicons:true opts INTO per-tab favIconUrl base64 (heavy, 1-3KB/tab, useful only for favicon-color workflows). Legacy mode enum: "minimal" (FLAT compact list — best for semantic scans across 500+ tab trees), "lite" (default), "full" (everything except favicons); composable opts take precedence over mode. ' +
         'PAGINATION: pass `after` (last-seen node id) and/or `limit` (default 500) for a FLAT paged response {items[], nextCursor, totalItems}; items carry parentId to reconstruct hierarchy; if the cursor node moved between calls, pagination restarts from 0 (moved items no longer appear, so progress continues). ' +
-        'For counts or a structural overview prefer get_tree_summary; for a substring lookup prefer search_pinako (cheaper than enumerating).' +
+        'CONTAINERS ONLY: containers_only:true returns just the windows / Window Groups / tabgroups, nested, each with tab counts {tabs, live, ghost} (all tabs beneath it, nested included) and NO tab rows — a few hundred tokens for any tree size. Use it FIRST for anything that needs only containers: open vs closed totals, counts per window or group, "which window holds what", window / group ids for moves and renames; then read tabs only where you need them. ' +
+        'For whole-surface totals, top domains, and sample titles use get_tree_summary; for a substring lookup prefer search_pinako (cheaper than enumerating).' +
         FRESHNESS_HINT,
       inputSchema: {
+        containers_only: z.boolean().optional().describe('Return ONLY container nodes (window, group, tabgroup), nested, each {id, type, title, tabs, live, ghost} with deep tab counts, plus top-level totals {containers, tabs, live, ghost}. No tab rows, no URLs. Every tab is counted (include_ghost_tabs is ignored; read live/ghost for open vs closed). Other shape, mode and pagination opts are ignored.'),
         mode: z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "lite". Composable opts (minimal + include_*) take precedence when both are passed.'),
         include_ghost_tabs: z.boolean().optional().describe('Include closed/ghost tabs (chromeId=null). Default true.'),
         include_favicons:   z.boolean().optional().describe('Include favIconUrl base64 data per tab. Default false. Heavy: 1-3KB per tab. Set true only for color-organize workflows that sample favicon colors.'),
@@ -3343,6 +3406,20 @@ function createMcpServer() {
       const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
+
+      if (args.containers_only === true) {
+        const o = containerOutline(r.data.tree || [], { split: true });
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:         r.data.browserBrand,
+          browserId:       r.data.browserId,
+          scope:           'tree',
+          containers_only: true,
+          totals:          { containers: o.containers, tabs: o.tabs, live: o.live, ghost: o.ghost },
+          tree:            o.outline,
+          updatedAt:       r.data.updatedAt,
+        }) }] };
+      }
+
       const tree = getTree(r.data, include_ghost_tabs);
 
       // Slice S2a: paginated path. Returns a flat items[] + nextCursor.
@@ -3690,9 +3767,11 @@ function createMcpServer() {
     'get_library',
     {
       description: 'Returns ONE library\'s contents (children tree + notes). Find the id via list_libraries first. Legacy modes: "minimal" (FLAT compact scan), "lite" (DEFAULT — tree shape, no favicons or note content), "full" (adds rich-text note bodies; favicons still need include_favicons:true). Children use the same composable shape opts as get_tree (opts take precedence over mode). ' +
-        'PAGINATION: `after` + `limit` (default 500) return flat items + library metadata + note titles at top level.' + FRESHNESS_HINT,
+        'PAGINATION: `after` + `limit` (default 500) return flat items + library metadata + note titles at top level. ' +
+        'CONTAINERS ONLY: containers_only:true returns just the library\'s windows / Window Groups / folders / tabgroups, nested, each with a deep `tabs` count, and NO tab rows (a few hundred tokens) — use it FIRST for per-folder counts and "what\'s where".' + FRESHNESS_HINT,
       inputSchema: {
         library_id: z.string().describe('Library id from list_libraries'),
+        containers_only: z.boolean().optional().describe('Return ONLY container nodes (window, group, library-folder, tabgroup), nested, each {id, type, title, tabs} with deep tab counts, plus totals {containers, tabs} and note id+title. No tab rows, no URLs. Library tabs are saved copies, so there is no live/ghost split. Other shape, mode and pagination opts are ignored.'),
         mode:       z.enum(['minimal', 'lite', 'full']).optional().describe('Legacy response mode. Default "lite". Composable opts (minimal + include_*) take precedence when both are passed.'),
         include_favicons: z.boolean().optional().describe('Include favIconUrl base64. Default false. Heavy: 1-3KB per tab.'),
         after:      z.string().optional().describe('Pagination cursor: last-seen node id from a previous paginated call. Omit on the first call.'),
@@ -3719,6 +3798,18 @@ function createMcpServer() {
       if (r.error) return r.error;
       const lib = (r.data.libraries || []).find(l => l.id === library_id);
       if (!lib) return { content: [{ type: 'text', text: `Library not found: ${library_id} (in ${r.data.browserBrand})` }], isError: true };
+
+      if (args.containers_only === true) {
+        const o = containerOutline(lib.children || []);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          browser:         r.data.browserBrand,
+          scope:           'library',
+          libraryId:       library_id,
+          containers_only: true,
+          totals:          { containers: o.containers, tabs: o.tabs },
+          library:         { id: lib.id, title: lib.title, description: lib.description || '', children: o.outline, notes: liteNotes(lib.notes) },
+        }) }] };
+      }
 
       // Slice S2a: paginated path. Returns flat items + library metadata.
       // Library notes (titles only) are returned alongside, never paginated
@@ -4082,7 +4173,7 @@ function createMcpServer() {
   srv.registerTool(
     'get_tree_summary',
     {
-      description: 'Returns a lightweight structural summary of a tree/bookmarks/library WITHOUT returning the actual nodes. Bridge-side; no LLM. THIS IS THE RIGHT TOOL FOR "how many tabs / windows / items" and "how big is X" questions: counts.nodes is the total node count and counts.url_bearing_nodes is the tab/link count — never count by searching (an empty/broad search is not a counter) or by pulling the whole tree. Also designed for the "should I read this whole tree?" decision the agent faces before any large read: the summary fits in <2KB regardless of tree size and lets the agent decide whether to proceed, what scope makes sense, and ballpark the cost.\n\n' +
+      description: 'Returns a lightweight structural summary of a tree/bookmarks/library WITHOUT returning the actual nodes. Bridge-side; no LLM. THIS IS THE RIGHT TOOL FOR whole-surface totals ("how many tabs in total", "how big is X"): counts.nodes is the total node count and counts.url_bearing_nodes is the tab/link count — never count by searching (an empty/broad search is not a counter) or by pulling the whole tree. It counts the WHOLE surface only and does NOT split open vs closed: for "how many tabs are open" (totals.live) and for counts per window, Window Group, tabgroup or library folder use get_tree / get_library with containers_only:true. Also designed for the "should I read this whole tree?" decision the agent faces before any large read: the summary fits in <2KB regardless of tree size and lets the agent decide whether to proceed, what scope makes sense, and ballpark the cost.\n\n' +
         'Response shape: {browser, browserId, scope, libraryId?, counts:{nodes, url_bearing_nodes}, depth:{max, median}, topDomains:[{domain,count},...up to 15], samplePatterns:[{pattern,token,count},...up to 15], sampleTitles:[...up to 20]}. ' +
         'topDomains = highest-frequency hostnames (www-stripped). samplePatterns = path-token frequency across all URLs (stop-words filtered: html, www, login, etc.); token of "recipe" with pattern "*recipe*" means 389 URLs had "recipe" somewhere in their path. sampleTitles = a deterministic stride sample of node titles (stable across calls — safe to cite back to the user).\n\n' +
         'For scope:"library", library_id is required. For scope:"bookmarks", returns the cached browser bookmark tree summary (empty if user hasn\'t opened the bookmarks panel since the bridge started). For scope:"tree", summarizes the live tab tree.',
