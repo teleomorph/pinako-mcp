@@ -1,6 +1,6 @@
 {
   "productName": "Pinako AI Bridge",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "identifier": "pro.pinako.installer",
   "build": {
     "frontendDist": "../src"
