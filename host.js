@@ -12,7 +12,7 @@
  * cached data to AI clients. No Supabase, no network calls.
  */
 
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -5026,7 +5026,7 @@ function createMcpServer() {
   // MCP tools. Run per server instance so every MCP session sees them; a
   // throwing registrar is logged and never breaks the built-in surface.
   for (const fn of _extMcpToolRegistrars) {
-    try { fn(srv, { z }); }
+    try { fn(srv, { z, ResourceTemplate }); }
     catch (e) { try { log(`host-ext tool registration failed: ${e && e.message ? e.message : e}`); } catch (_) {} }
   }
 
