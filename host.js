@@ -733,7 +733,8 @@ function nmWrite(obj) {
 // session). Absent in normal installs; load failures are non-fatal and logged.
 // Handlers receive the raw NM message and reply via the provided nmWrite.
 const _extNmHandlers = new Map();
-const _extMcpToolRegistrars = [];
+const _extMcpToolRegistrars = [];   // { fn, profiles }
+const _mcpProfiles = new Map();     // MCP profiles host extensions define (see "MCP profiles")
 // C(ii): predicates a host extension registers so the NM heartbeat can ask
 // whether one of ITS background queues is still busy (see NM_HEARTBEAT_MS).
 // The contract is RUNNING OR SCHEDULED: an extension answers true while a
@@ -916,7 +917,17 @@ if (process.argv.includes('--install-claude-plugin') || process.argv.includes('-
           onPendingWork: (fn) => { if (typeof fn === 'function') _extPendingWorkProbes.push(fn); },
           // Register extra MCP tools: fn(srv, { z }) is invoked for every server
           // instance createMcpServer() builds (one per MCP session).
-          onMcpTools: (fn) => { if (typeof fn === 'function') _extMcpToolRegistrars.push(fn); },
+          // opts.profiles lists the MCP profiles that get them (default:
+          // ['default'], the /mcp server); see defineMcpProfile.
+          onMcpTools: (fn, opts) => {
+            if (typeof fn !== 'function') return;
+            const profiles = (opts && Array.isArray(opts.profiles) && opts.profiles.length)
+              ? opts.profiles.filter((p) => typeof p === 'string') : ['default'];
+            _extMcpToolRegistrars.push({ fn, profiles });
+          },
+          // Define another MCP server identity, served at /mcp/<name>, that
+          // carries only the tools registered for it (see "MCP profiles").
+          defineMcpProfile: (name, opts) => defineMcpProfile(name, opts),
           // #67: extension-registered tools are treated as writes by default
           // (fail-closed). An extension declares its READ tools here so they
           // stay reachable for tokenless clients during the migration window.
@@ -3596,7 +3607,51 @@ const SERVER_INFO = {
   icons: PINAKO_ICONS,
 };
 
-function createMcpServer() {
+// ─── MCP profiles: more than one server identity on one bridge ───────────────
+// `/mcp` serves the DEFAULT profile: every built-in tool plus the host-extension
+// tools registered for it (all of them, unless an extension says otherwise). A
+// host extension may define another profile, served at `/mcp/<name>` (and by
+// `--stdio-mcp <bridge>/mcp/<name>`), with its own server name and instructions
+// and ONLY the tools registered for that profile. That lets an AI client list a
+// domain as its own server entry, under the tool-count ceiling where model
+// tool selection stays accurate, instead of every tool arriving in one list.
+// (_mcpProfiles is declared beside _extMcpToolRegistrars, near the top: host
+// extensions define profiles while they load, long before this line runs.)
+function defineMcpProfile(name, opts) {
+  const o = opts || {};
+  if (typeof name !== 'string' || !/^[a-z0-9-]{1,32}$/.test(name) || name === 'default') return false;
+  if (typeof o.serverName !== 'string' || !/^[a-z0-9-]{1,48}$/.test(o.serverName)) return false;
+  _mcpProfiles.set(name, {
+    serverName: o.serverName,
+    title: typeof o.title === 'string' ? o.title.slice(0, 80) : null,
+    instructions: typeof o.instructions === 'string' ? o.instructions.slice(0, 64 * 1024) : '',
+  });
+  return true;
+}
+// '/mcp' → 'default'; '/mcp/<defined name>' → that name; anything else → null.
+function _mcpProfileForPath(p) {
+  if (p === '/mcp') return 'default';
+  const m = /^\/mcp\/([a-z0-9-]{1,32})$/.exec(p || '');
+  return (m && _mcpProfiles.has(m[1])) ? m[1] : null;
+}
+function _applyExtRegistrars(srv, profile) {
+  for (const reg of _extMcpToolRegistrars) {
+    if (!reg.profiles.includes(profile)) continue;
+    try { reg.fn(srv, { z, ResourceTemplate }); }
+    catch (e) { try { log(`host-ext tool registration failed (${profile}): ${e && e.message ? e.message : e}`); } catch (_) {} }
+  }
+}
+
+function createMcpServer(profile) {
+  const named = (profile && profile !== 'default') ? _mcpProfiles.get(profile) : null;
+  if (named) {
+    const nsrv = new McpServer(
+      { ...SERVER_INFO, name: named.serverName, title: named.title || SERVER_INFO.title },
+      { instructions: named.instructions }
+    );
+    _applyExtRegistrars(nsrv, profile);
+    return nsrv;
+  }
   const srv = new McpServer(
     SERVER_INFO,
     { instructions: SERVER_INSTRUCTIONS }
@@ -5376,10 +5431,7 @@ function createMcpServer() {
   // Local host extensions (see loadHostExtensions) may contribute additional
   // MCP tools. Run per server instance so every MCP session sees them; a
   // throwing registrar is logged and never breaks the built-in surface.
-  for (const fn of _extMcpToolRegistrars) {
-    try { fn(srv, { z, ResourceTemplate }); }
-    catch (e) { try { log(`host-ext tool registration failed: ${e && e.message ? e.message : e}`); } catch (_) {} }
-  }
+  _applyExtRegistrars(srv, 'default');
 
   return srv;
 }
@@ -5393,6 +5445,7 @@ const activeSessions = new Map(); // sessionId → StreamableHTTPServerTransport
 // every connected client. Populated alongside activeSessions in the
 // onsessioninitialized callback; cleaned up in transport.onclose.
 const activeServers = new Map();  // sessionId → McpServer
+const activeSessionProfiles = new Map(); // sessionId → MCP profile ('default' or a defined name)
 
 // Resource URI scheme. Five fixed URIs mirror the five cache slices the
 // bridge tracks. Clients can subscribe to any subset; notifications fire
@@ -5412,7 +5465,9 @@ function broadcastResourceUpdated(fields) {
   for (const field of fields) {
     const uri = RESOURCE_URIS[field];
     if (!uri) continue;
-    for (const srv of activeServers.values()) {
+    for (const [sid, srv] of activeServers) {
+      // Only the default server carries the tab resources.
+      if (activeSessionProfiles.get(sid) !== 'default') continue;
       try {
         // sendResourceUpdated returns a Promise; swallow errors so a
         // disconnected client's send failure doesn't break the broadcast
@@ -6034,7 +6089,10 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  if (reqPath !== '/mcp') { res.writeHead(404); res.end(); return; }
+  // '/mcp' is the default server; '/mcp/<name>' a profile a host extension
+  // defined (see "MCP profiles"). A session belongs to the path that made it.
+  const mcpProfile = _mcpProfileForPath(reqPath);
+  if (!mcpProfile) { res.writeHead(404); res.end(); return; }
 
   if (req.method === 'POST') {
     const chunks = [];
@@ -6104,12 +6162,12 @@ const httpServer = http.createServer(async (req, res) => {
           }
         }
 
-        if (sessionId && activeSessions.has(sessionId)) {
+        if (sessionId && activeSessions.has(sessionId) && activeSessionProfiles.get(sessionId) === mcpProfile) {
           // Existing session — reuse its transport
           transport = activeSessions.get(sessionId);
         } else if (parsed?.method === 'initialize') {
           // New session — create a fresh transport + McpServer pair
-          const srv = createMcpServer();
+          const srv = createMcpServer(mcpProfile);
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (id) => {
@@ -6118,6 +6176,7 @@ const httpServer = http.createServer(async (req, res) => {
               // Slice Y bonus: register the server so broadcastResourceUpdated
               // can reach it on subsequent cache mutations.
               activeServers.set(id, srv);
+              activeSessionProfiles.set(id, mcpProfile);
               log(`MCP session created: ${id}`);
             },
             enableJsonResponse: true,
@@ -6127,6 +6186,7 @@ const httpServer = http.createServer(async (req, res) => {
             if (id) {
               activeSessions.delete(id);
               activeServers.delete(id);
+              activeSessionProfiles.delete(id);
               authedSessions.delete(id);
               log(`MCP session closed: ${id}`);
             }
@@ -6168,7 +6228,7 @@ const httpServer = http.createServer(async (req, res) => {
         return;
       }
       const sessionId = req.headers['mcp-session-id'];
-      const transport = sessionId ? activeSessions.get(sessionId) : undefined;
+      const transport = (sessionId && activeSessionProfiles.get(sessionId) === mcpProfile) ? activeSessions.get(sessionId) : undefined;
       if (!transport) {
         // Spec-compliant 404 for unknown session — see POST /mcp handler for
         // the rationale. Lets compliant MCP SDKs re-handshake transparently
@@ -6514,7 +6574,11 @@ async function runStdioBridge(httpUrl) {
     onerror: null,
     onclose: null,
   };
-  const localServer = createMcpServer();
+  // The profile the bridge URL names (/mcp/<name>), so a locally answered
+  // handshake presents the same server identity and catalog the bridge would.
+  let shimProfile = 'default';
+  try { shimProfile = _mcpProfileForPath(new URL(httpUrl).pathname) || 'default'; } catch (_) {}
+  const localServer = createMcpServer(shimProfile);
   await localServer.connect(loopback);
   const feedLocal = (msg) => {
     // The SDK's onmessage is async — catch rejections too, not just sync throws.
