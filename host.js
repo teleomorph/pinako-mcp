@@ -1836,9 +1836,9 @@ function _onLocalHello(msg) {
   const what = `${hello.browserBrand} (${hello.browserId.slice(0,16)}…)${hello.product ? ` [${hello.product}]` : ''}${hello.tabs ? '' : ', shares no tabs'}`;
   if (localBrowserId !== hello.browserId) {
     localBrowserId = hello.browserId;
-    log(`Local browser identified by hello: ${what}`);
+    log(`[${process.pid}] Local browser identified by hello: ${what}`);
   } else if (first) {
-    log(`Local connection introduced itself: ${what}`);
+    log(`[${process.pid}] Local connection introduced itself: ${what}`);
   }
   if (forwardToExisting) {
     _announceHelloToLeader();
@@ -1864,7 +1864,7 @@ function _registerHello(hello, forwarderToken, local) {
     local: !!local,
   });
   if (!sameProcess) {
-    log(`Connection registered: ${hello.browserBrand} (${hello.browserId.slice(0,16)}…)${hello.product ? ` [${hello.product}]` : ''}${local ? ', local' : ''}${hello.tabs ? '' : ', shares no tabs'}`);
+    log(`[${process.pid}] Connection registered: ${hello.browserBrand} (${hello.browserId.slice(0,16)}…)${hello.product ? ` [${hello.product}]` : ''}${local ? ', local' : ''}${hello.tabs ? '' : ', shares no tabs'}`);
   }
   // A browser id that now says it shares no tabs must not keep serving tab
   // data cached under it earlier.
