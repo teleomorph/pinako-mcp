@@ -570,6 +570,9 @@ let localBrowserId = null;
 // is the leader's registry: its own local hello plus every forwarder that
 // registered one via POST /hello.
 let _localHello = null;
+// Set when our browser closes the native port (stdin 'end'): from then on our
+// own connection is not reachable, whatever else this process still serves.
+let _stdinEnded = false;
 const helloConnections = new Map(); // browserId -> { hello, forwarderToken, registeredAt, local }
 
 // Leader → forwarder message relay, for host extensions (see
@@ -949,8 +952,6 @@ if (process.argv.includes('--install-claude-plugin') || process.argv.includes('-
           // port, or a forwarder's SSE channel when this process leads). See
           // sendToConnection for replyType / timeoutMs / onLost.
           sendToConnection: (browserId, msg, opts) => sendToConnection(browserId, msg, opts),
-          // True while this process holds the port and serves MCP clients.
-          isLeader: () => { try { return !forwardToExisting && !BRIDGE_URL; } catch (_) { return false; } },
         });
         try { log(`Host extension loaded: ${p}`); } catch (_) {}
       }
@@ -1315,7 +1316,16 @@ if (!BRIDGE_URL && !HOOK_NAME) {
   // what an exit path needs, and nothing else logs on either moment.
   process.stdin.on('end', () => {
     extensionConnected = false;
+    _stdinEnded = true;
     _stopNmHeartbeat();   // C(ii): never write to a port the browser has closed
+    // A forwarder whose browser left has nothing to deliver: give the leader
+    // its channel back now, so requests for this browser fail fast (and a new
+    // process for the same browser can subscribe) instead of waiting out the
+    // grace period on a port nobody reads.
+    if (forwardToExisting) {
+      if (sseClientReconnect) { clearTimeout(sseClientReconnect); sseClientReconnect = null; }
+      if (sseClientReq) { try { sseClientReq.destroy(); } catch (_) {} sseClientReq = null; }
+    }
     log(`[${process.pid}] native port closed by the browser. Serving stale cache for ${Math.round(STDIN_GRACE_MS / 1000)}s.`);
     shutdownTimer = setTimeout(() => {
       log(`[${process.pid}] exiting: native port closed by the browser, grace period expired.`);
@@ -1589,6 +1599,7 @@ let _sseVerifyPending = false;
 
 function _ensureSseConnection() {
   if (!forwardToExisting) return; // leader doesn't connect to itself
+  if (_stdinEnded) return;        // our browser left (see the stdin 'end' handler)
   if (!localBrowserId) return;    // need our browserId first
   if (sseClientReq) return;       // already connecting/connected
   if (_sseVerifyPending) return;  // a verification for this slot is in flight
@@ -1657,6 +1668,7 @@ function _openSseConnection() {
 
 function _scheduleSseReconnect() {
   if (sseClientReconnect) return;
+  if (_stdinEnded) return;        // our browser left; nothing to reconnect for
   if (!forwardToExisting) return; // we may have promoted to leader; no need to reconnect
   // #67: losing the channel means the process we verified may be gone. A clean
   // leader exit followed by an impostor binding the port would otherwise sail
@@ -1998,34 +2010,37 @@ function listConnections() {
   const out = [];
   for (const e of helloConnections.values()) {
     const local = e.hello.browserId === localBrowserId;
-    out.push({ ...e.hello, local, reachable: local ? !_nmStdoutBroken : forwarders.has(e.hello.browserId), registeredAt: e.registeredAt });
+    out.push({ ...e.hello, local, reachable: local ? (!_nmStdoutBroken && !_stdinEnded) : forwarders.has(e.hello.browserId), registeredAt: e.registeredAt });
   }
   if (_localHello && !helloConnections.has(_localHello.browserId)) {
-    out.push({ ..._localHello, local: true, reachable: !_nmStdoutBroken, registeredAt: 0 });
+    out.push({ ..._localHello, local: true, reachable: !_nmStdoutBroken && !_stdinEnded, registeredAt: 0 });
   }
   return out;
 }
 
 // True when `token` is the forwarderToken of the process that registered this
-// browser, by /update (tab data) or by /hello. Both are accepted because a
-// connection can have both, and a stale one of the two must not lock out the
-// live process that owns the other.
+// browser. Once a browser registered by /hello (which needs the access token),
+// ONLY that registration's token counts. /update takes no token, so letting its
+// token stand beside the hello's would let any local process re-key a
+// connection that serves sessions and answer its relayed requests (SP5
+// adversarial pass). A browser with no hello keeps the /update rule.
 function _connectionTokenMatches(browserId, token) {
   if (typeof token !== 'string' || !token) return false;
+  const h = helloConnections.get(browserId);
+  if (h && h.forwarderToken) return h.forwarderToken === token;
   const a = cachedData.get(browserId)?.forwarderToken;
-  const b = helloConnections.get(browserId)?.forwarderToken;
-  return (!!a && a === token) || (!!b && b === token);
+  return !!a && a === token;
 }
 function _connectionHasToken(browserId) {
   return !!(cachedData.get(browserId)?.forwarderToken || helloConnections.get(browserId)?.forwarderToken);
 }
 
-// A connection is here that shares no tabs (so "no tab data" is not "no
-// extension connected").
+// A connection is here NOW that shares no tabs (so "no tab data" is not "no
+// extension connected"). Reachable only: a registration outlives its process,
+// and a long-gone connection must not turn the usual reconnect advice into a
+// wrong one.
 function _hasNonTabConnection() {
-  if (_localHello && !_localHello.tabs) return true;
-  for (const e of helloConnections.values()) if (!e.hello.tabs) return true;
-  return false;
+  return listConnections().some((c) => !c.tabs && c.reachable);
 }
 
 // ─── Phase 3 Slice D: destructive-op confirmation gate ───────────────────────
@@ -3213,7 +3228,7 @@ function noDataError() {
   // extension" advice would send the user in a circle.
   if (_hasNonTabConnection()) {
     return {
-      content: [{ type: 'text', text: 'No tab data: the Pinako extension connected to this Bridge does not share browser tabs, so tab, library, bookmark and Main Notes tools have nothing to read or change here. They need the Pinako extension that manages tabs, connected to this Bridge.' }],
+      content: [{ type: 'text', text: 'No tab data: the Pinako extension connected to this Bridge does not share browser tabs, so tab, library, bookmark and Main Notes tools have nothing to read or change here. They need the Pinako extension that manages tabs: if it is installed, open its popup to connect it to this Bridge.' }],
       isError: true,
     };
   }
