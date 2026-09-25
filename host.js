@@ -1597,6 +1597,47 @@ let sseClientReconnect = null;
 // the same proof the /update relay uses.
 let _sseVerifyPending = false;
 
+// RE-REGISTER AFTER A LEADER CHANGE (2026-09-25, found live). The leader only
+// learns our forwarderToken from a relayed /update, and keeps it in memory. So
+// when the leader changes hands (it exits and another bridge takes the port, or
+// our own relay landed on a stale leader that exited right after), the new
+// leader has never heard of us and answers every subscribe with 401
+// TOKEN_REQUIRED. Before this, nothing re-sent the registration until our
+// browser happened to push a tree change, which on an idle browser meant hours:
+// 776 rejected retries in one day of a real log, and that browser missing
+// from list_browsers and unreachable for writes the whole time.
+//
+// The answer is to register again with a FRESH snapshot: ask our extension for
+// one (getTree, the same request we send at start-up and on promotion); its
+// treeResponse goes through the normal relay, which carries our token.
+//
+// Two guards keep that from turning into a flood, since each snapshot carries
+// the whole tree and bookmarks:
+//   - a relay that went out moments ago may simply not have been read yet (the
+//     subscribe raced its larger body), so give it RELAY_SETTLE_MS first;
+//   - repeated asks back off, from 30 s up to 10 min, and the backoff clears
+//     once a channel opens.
+// TOKEN_MISMATCH is deliberately not handled: it means a newer bridge for the
+// same browser registered after us, and taking the registration back would
+// make the two fight over it.
+const RELAY_SETTLE_MS = 10_000;
+let _lastRelayAt = 0;
+let _reRegisterAt = 0;
+let _reRegisterBackoffMs = 0;
+
+function _reRegisterWithLeader() {
+  const now = Date.now();
+  if (now - _lastRelayAt < RELAY_SETTLE_MS) return;
+  if (now - _reRegisterAt < _reRegisterBackoffMs) return;
+  // Nobody would answer: the browser has closed our port (we are in the exit
+  // grace period) or stdout is gone.
+  if (_nmStdoutBroken || process.stdin.readableEnded) return;
+  _reRegisterAt = now;
+  _reRegisterBackoffMs = Math.min(_reRegisterBackoffMs ? _reRegisterBackoffMs * 2 : 30_000, 10 * 60_000);
+  log('The leader has no registration for this browser (it changed hands). Asking the browser for a fresh snapshot to register again.');
+  nmWrite({ type: 'getTree' });
+}
+
 function _ensureSseConnection() {
   if (!forwardToExisting) return; // leader doesn't connect to itself
   if (_stdinEnded) return;        // our browser left (see the stdin 'end' handler)
@@ -1637,16 +1678,26 @@ function _openSseConnection() {
   sseClientReq = req;
   req.on('response', (res) => {
     if (res.statusCode !== 200) {
-      log(`SSE channel rejected: HTTP ${res.statusCode}`);
       sseClientReq = null;
       // 401 = the leader has no registration for us. A connection with a
       // hello can simply register again; the reconnect below then succeeds.
       if (res.statusCode === 401) _reannounceHelloAfterRefusal();
       _scheduleSseReconnect();
-      res.resume();
+      // Read the (small) error body: the leader's code says whether this is
+      // "never heard of you" (re-register) or something to wait out.
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { if (body.length < 4096) body += c; });
+      res.on('end', () => {
+        let code = null;
+        try { code = JSON.parse(body)?.error?.code || null; } catch (_) {}
+        log(`SSE channel rejected: HTTP ${res.statusCode}${code ? ` ${code}` : ''}`);
+        if (res.statusCode === 401 && code === 'TOKEN_REQUIRED') _reRegisterWithLeader();
+      });
       return;
     }
     log('SSE channel open.');
+    _reRegisterBackoffMs = 0;
     res.setEncoding('utf8');
     res.on('data', (chunk) => {
       sseBuf += chunk;
@@ -6404,6 +6455,7 @@ async function tryBindOrForward(initialAttempt) {
           // can token-bind this browserId's SSE subscription + /edit-result
           // posts to THIS process. Without it, any local process could spoof.
           const body = JSON.stringify({ ...payload, forwarderToken: _myForwarderToken });
+          _lastRelayAt = Date.now();
           const req = http.request(
             { hostname: '127.0.0.1', port: MCP_PORT, path: '/update', method: 'POST',
               headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
