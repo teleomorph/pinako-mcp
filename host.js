@@ -1619,6 +1619,9 @@ function _openSseConnection() {
   if (!forwardToExisting) return;
   if (!localBrowserId) return;
   if (sseClientReq) return;
+  // The port can close while the leader proof is in flight (Grok round 2):
+  // re-checked here, at the one place a channel is opened.
+  if (_stdinEnded) return;
   log(`Opening SSE channel to leader for browserId=${localBrowserId.slice(0,16)}…`);
   let sseBuf = '';
   const req = http.request({
