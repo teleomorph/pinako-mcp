@@ -555,6 +555,42 @@ function _dispatchDiagnosticPing(reason) {
 // forwarder that owns the target browser.
 let localBrowserId = null;
 
+// ─── Connections that introduce themselves ────────────────────────────────────
+// An extension may answer `getTree` with a `productHello` instead of (or as
+// well as) a tree: { product, browserId, browserBrand, extensionId, version,
+// tabs, userTier, userId }. The bridge records who the connection is, lets it
+// open the same token-bound SSE channel a tab forwarder uses, and hands the
+// hello to any host extension. It never caches a hello as tab data, and a
+// connection whose hello says `tabs: false` is never cached as a tab browser
+// at all, so tab tools and `list_browsers` only ever see installs that share
+// tabs. What a product serves beyond that is the host extension's business;
+// this file does not interpret `product`.
+//
+// `_localHello` is the hello our own native connection sent. `helloConnections`
+// is the leader's registry: its own local hello plus every forwarder that
+// registered one via POST /hello.
+let _localHello = null;
+const helloConnections = new Map(); // browserId -> { hello, forwarderToken, registeredAt, local }
+
+// Leader → forwarder message relay, for host extensions (see
+// `sendToConnection`). A relayed message that carries a requestId and names a
+// replyType is remembered here until the forwarder posts the reply back to
+// /relay-reply, the connection drops, or the entry times out.
+const pendingRelays = new Map();    // requestId -> { browserId, replyType, timer, onLost }
+// Forwarder side: requestIds the leader relayed to OUR extension, so the reply
+// goes back to the leader instead of to this process's own handlers.
+const relayedHere = new Map();      // requestId -> expiresAt
+const RELAY_REPLY_WINDOW_MS = 10 * 60_000;
+const RELAY_DEFAULT_TIMEOUT_MS = 5 * 60_000;
+// Message types that belong to this file's own protocol. They never travel
+// through the relay, in either direction: a relay can carry a host
+// extension's messages, not an edit, a tree request or an agent command.
+const HOST_PROTOCOL_TYPES = new Set([
+  'getTree', 'applyEdit', 'enqueueAgentCommand', 'heartbeat', 'diagnosticPing',
+  'treeUpdate', 'treeResponse', 'editApplied', 'editFailed', 'applyEditReceived',
+  'diagnosticPong', 'organizeStateUpdate', 'productHello',
+]);
+
 // ─── Phase 2 Slice B: SSE forwarder infrastructure (leader-side) ──────────────
 // `forwarders` tracks open SSE channels keyed by browserId. Forwarder bridges
 // open `GET /edits?browserId=X` after their first /update succeeds; the leader
@@ -892,7 +928,18 @@ if (process.argv.includes('--install-claude-plugin') || process.argv.includes('-
           // Dispatch an agent edit op through the same pipeline the built-in
           // write tools use (browser resolution, confirmation/tier gates, local
           // NM or SSE-forwarder routing). Returns the executeEdit result object.
-          executeEdit: (op, browserArg) => executeEdit(op, browserArg),
+          // opts.connection addresses a connection from listConnections().
+          executeEdit: (op, browserArg, opts) => executeEdit(op, browserArg, opts),
+          // Connections that introduced themselves with a hello (see
+          // "Connections that introduce themselves"), with whether each is
+          // reachable now. On a forwarder this is only its own connection.
+          listConnections: () => listConnections(),
+          // Send one message to the extension behind a connection (our own
+          // port, or a forwarder's SSE channel when this process leads). See
+          // sendToConnection for replyType / timeoutMs / onLost.
+          sendToConnection: (browserId, msg, opts) => sendToConnection(browserId, msg, opts),
+          // True while this process holds the port and serves MCP clients.
+          isLeader: () => { try { return !forwardToExisting && !BRIDGE_URL; } catch (_) { return false; } },
         });
         try { log(`Host extension loaded: ${p}`); } catch (_) {}
       }
@@ -908,9 +955,28 @@ if (process.argv.includes('--install-claude-plugin') || process.argv.includes('-
 let stdinBuf = Buffer.alloc(0);
 
 function handleNmMessage(msg) {
+  // A reply to a message the leader relayed to our extension goes back to the
+  // leader (see the relay section). Checked first so the reply never reaches
+  // this process's own host-extension handlers, which did not ask for it.
+  if (forwardToExisting && msg && typeof msg.requestId === 'string'
+      && relayedHere.has(msg.requestId) && !HOST_PROTOCOL_TYPES.has(msg.type)) {
+    relayedHere.delete(msg.requestId);
+    _postRelayReplyToLeader(msg);
+    return;
+  }
+  if (msg.type === 'productHello') {
+    _onLocalHello(msg);
+    return;
+  }
   if (msg.type === 'treeUpdate' || msg.type === 'treeResponse') {
     const browserId    = msg.browserId    || 'unknown';
     const browserBrand = msg.browserBrand || 'Unknown';
+    // A connection that said it shares no tabs never becomes a tab browser,
+    // whatever it sends later. Its hello is the only identity it has here.
+    if (_localHello && _localHello.tabs === false) {
+      log(`Ignored ${msg.type} from ${browserBrand}: this connection said it shares no tabs.`);
+      return;
+    }
     // Phase 3 Slice B: per-browser tier (and userId for Phase 3C audit log)
     // travels alongside browser identity. Tier defaults to 0 when missing
     // (fail-closed for the per-content-cap check). userId may be empty for
@@ -1386,6 +1452,7 @@ function _dropForwarder(browserId, reason) {
   if (f.heartbeatTimer) clearInterval(f.heartbeatTimer);
   forwarders.delete(browserId);
   log(`Forwarder dropped: browserId=${(browserId||'').slice(0,16)}… reason=${reason}`);
+  _failPendingRelaysFor(browserId, reason);
   for (const [requestId, entry] of pendingEdits) {
     if (entry.path === 'sse' && entry.browserId === browserId) {
       clearTimeout(entry.timer);
@@ -1547,6 +1614,9 @@ function _openSseConnection() {
     if (res.statusCode !== 200) {
       log(`SSE channel rejected: HTTP ${res.statusCode}`);
       sseClientReq = null;
+      // 401 = the leader has no registration for us. A connection with a
+      // hello can simply register again; the reconnect below then succeeds.
+      if (res.statusCode === 401) _reannounceHelloAfterRefusal();
       _scheduleSseReconnect();
       res.resume();
       return;
@@ -1601,6 +1671,23 @@ function _handleSseEvent(eventText) {
     else if (line.startsWith('data: ')) dataParts.push(line.slice(6));
   }
   if (eventName === 'ready') return;
+  // Host-extension relay (see sendToConnection): write the message to our
+  // extension, remembering its requestId so the reply goes back to the leader.
+  // This file's own message types never ride it.
+  if (eventName === 'relay') {
+    let data;
+    try { data = JSON.parse(dataParts.join('\n')); }
+    catch (e) { log(`SSE: bad relay data: ${e.message}`); return; }
+    const msg = data && data.msg;
+    if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') { log('SSE: relay without a message type'); return; }
+    if (HOST_PROTOCOL_TYPES.has(msg.type)) { log(`SSE: relay of ${msg.type} refused (bridge protocol message)`); return; }
+    if (typeof msg.requestId === 'string' && msg.requestId) _rememberRelayed(msg.requestId);
+    if (!nmWrite(msg)) {
+      if (typeof msg.requestId === 'string') relayedHere.delete(msg.requestId);
+      log(`SSE relay of ${msg.type} could not be written to this browser's extension.`);
+    }
+    return;
+  }
   // S2g #2 (2026-05-14): agent-command relay. Leader bridge SSE-writes
   // {type:'enqueueAgentCommand', ...} payloads when the targeted browser is
   // not the leader's local browser. Forwarder relays the same shape to its
@@ -1691,6 +1778,243 @@ function _postOrganizeStateToLeader(msg) {
     req.write(body);
     req.end();
   }).catch(() => {});
+}
+
+// ─── Connection hellos + the host-extension relay ─────────────────────────────
+// See "Connections that introduce themselves" near the top for the state.
+//
+// Flow when the extension on a FORWARDER introduces itself:
+//   1. its hello arrives on our stdin → _onLocalHello records it and POSTs it
+//      to the leader's /hello (after the leader proves who it is, and with the
+//      access token, because a registered connection can be handed requests);
+//   2. the leader records it in helloConnections; we open the usual SSE
+//      channel, which the leader now accepts on that registration's token;
+//   3. a host extension on the leader calls sendToConnection(browserId, msg)
+//      → `event: relay` on that channel → we write msg to our extension;
+//   4. our extension's reply carries msg.requestId → handleNmMessage sends it
+//      to the leader's /relay-reply instead of handling it here → the leader
+//      checks it against what it relayed and hands it to its host extension.
+// Nothing here reads a relayed message beyond its type and requestId.
+
+function _sanitizeHello(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const str = (v, max) => (typeof v === 'string' ? v.slice(0, max) : '');
+  const browserId = str(raw.browserId, 128);
+  if (!browserId || browserId === 'unknown' || !/^[\x21-\x7e]+$/.test(browserId)) return null;
+  const product = str(raw.product, 32);
+  const extensionId = str(raw.extensionId, 32);
+  return {
+    product: /^[a-z0-9_-]+$/.test(product) ? product : '',
+    browserId,
+    browserBrand: str(raw.browserBrand, 64) || 'Unknown',
+    extensionId: /^[a-p]{32}$/.test(extensionId) ? extensionId : '',
+    version: str(raw.version, 32),
+    // Only an explicit false opts out: a connection that says nothing about
+    // tabs is treated exactly as before.
+    tabs: raw.tabs !== false,
+    userTier: Number.isFinite(raw.userTier) ? raw.userTier : 0,
+    userId: str(raw.userId, 128),
+  };
+}
+
+function _onLocalHello(msg) {
+  const hello = _sanitizeHello(msg);
+  if (!hello) { log('productHello ignored: it carried no usable browserId.'); return; }
+  const first = !_localHello;
+  _localHello = hello;
+  const what = `${hello.browserBrand} (${hello.browserId.slice(0,16)}…)${hello.product ? ` [${hello.product}]` : ''}${hello.tabs ? '' : ', shares no tabs'}`;
+  if (localBrowserId !== hello.browserId) {
+    localBrowserId = hello.browserId;
+    log(`Local browser identified by hello: ${what}`);
+  } else if (first) {
+    log(`Local connection introduced itself: ${what}`);
+  }
+  if (forwardToExisting) {
+    _announceHelloToLeader();
+  } else {
+    if (shutdownTimer) { clearTimeout(shutdownTimer); shutdownTimer = null; }
+    extensionConnected = true;
+    _registerHello(hello, null, true);
+  }
+  const handler = _extNmHandlers.get('productHello');
+  if (handler) {
+    try { handler({ type: 'productHello', ...hello }); }
+    catch (e) { try { log(`host-ext handler error (productHello): ${e && e.message ? e.message : e}`); } catch (_) {} }
+  }
+}
+
+function _registerHello(hello, forwarderToken, local) {
+  const prior = helloConnections.get(hello.browserId);
+  const sameProcess = prior && prior.forwarderToken === (forwarderToken || null);
+  helloConnections.set(hello.browserId, {
+    hello,
+    forwarderToken: forwarderToken || null,
+    registeredAt: sameProcess ? prior.registeredAt : Date.now(),
+    local: !!local,
+  });
+  if (!sameProcess) {
+    log(`Connection registered: ${hello.browserBrand} (${hello.browserId.slice(0,16)}…)${hello.product ? ` [${hello.product}]` : ''}${local ? ', local' : ''}${hello.tabs ? '' : ', shares no tabs'}`);
+  }
+  // A browser id that now says it shares no tabs must not keep serving tab
+  // data cached under it earlier.
+  if (!hello.tabs && cachedData.delete(hello.browserId)) {
+    log(`Dropped cached tab data for ${hello.browserId.slice(0,16)}…: that connection shares no tabs.`);
+  }
+}
+
+// Forwarder → leader: register our hello. Repeated calls are cheap and
+// idempotent (the leader overwrites the entry), which is how a changed tier
+// or a new leader gets told.
+let _helloAnnounceSeq = 0;
+let _helloReannounceAt = 0;
+function _announceHelloToLeader() {
+  if (!forwardToExisting || !_localHello) return;
+  const seq = ++_helloAnnounceSeq;
+  verifyLeaderIdentity().then((ok) => {
+    if (!ok) { log('Hello withheld — the process holding the port did not prove it is the Pinako bridge.'); return; }
+    if (seq !== _helloAnnounceSeq || !forwardToExisting || !_localHello) return;
+    const secret = loadOrCreateAuthToken();
+    if (!secret) { log('Hello not sent: there is no access token on disk to authenticate with.'); return; }
+    const body = JSON.stringify({ hello: _localHello, forwarderToken: _myForwarderToken });
+    const req = http.request(
+      { hostname: '127.0.0.1', port: MCP_PORT, path: '/hello', method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          // Sent only to a leader that just proved it holds the same secret.
+          'Authorization': `Bearer ${secret}`,
+        } },
+      (res) => {
+        res.resume();
+        if (res.statusCode === 200) { log('Registered with the leader by hello.'); _ensureSseConnection(); }
+        else log(`Hello refused by the leader: HTTP ${res.statusCode}`);
+      }
+    );
+    req.on('error', (err) => { _leaderVerified = false; log(`Hello post error: ${err.message}`); });
+    req.write(body); req.end();
+  }).catch(() => {});
+}
+
+// The SSE channel was refused because the leader has no registration for us
+// (a new leader after a handover). Register again, at most once per 30s, so a
+// leader that keeps refusing is not hammered.
+function _reannounceHelloAfterRefusal() {
+  if (!_localHello || !forwardToExisting) return false;
+  const now = Date.now();
+  if (now - _helloReannounceAt < 30_000) return false;
+  _helloReannounceAt = now;
+  log('SSE channel refused and this connection has a hello — registering with the leader again.');
+  _announceHelloToLeader();
+  return true;
+}
+
+function _rememberRelayed(requestId) {
+  const now = Date.now();
+  if (relayedHere.size >= 500) {
+    for (const [id, exp] of relayedHere) if (exp < now) relayedHere.delete(id);
+    // Still full of live entries: forget the oldest rather than grow forever.
+    while (relayedHere.size >= 2000) relayedHere.delete(relayedHere.keys().next().value);
+  }
+  relayedHere.set(requestId, now + RELAY_REPLY_WINDOW_MS);
+}
+
+function _postRelayReplyToLeader(msg) {
+  verifyLeaderIdentity().then((ok) => {
+    if (!ok) { log('Relay reply withheld — leader identity not proven.'); return; }
+    const body = JSON.stringify({ browserId: localBrowserId, forwarderToken: _myForwarderToken, msg });
+    const req = http.request(
+      { hostname: '127.0.0.1', port: MCP_PORT, path: '/relay-reply', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+      (res) => { res.resume(); if (res.statusCode !== 200) log(`/relay-reply refused: HTTP ${res.statusCode} (${msg.type})`); }
+    );
+    req.on('error', (err) => { _leaderVerified = false; log(`/relay-reply post error: ${err.message}`); });
+    req.write(body); req.end();
+  }).catch(() => {});
+}
+
+// Host-extension API: send one message to the extension behind a connection.
+// `browserId` falsy or ours → our own native port. Any other id → the SSE
+// channel of the forwarder that registered it (leader only). With
+// opts.replyType and a msg.requestId, the reply the forwarder posts back is
+// accepted once, and only if its type matches; opts.onLost(reason) runs if the
+// connection drops first. Returns true when the message was handed on.
+const RELAY_MAX_BYTES = 1_000_000;   // what a native host may send an extension
+function sendToConnection(browserId, msg, opts) {
+  const o = opts || {};
+  if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string' || HOST_PROTOCOL_TYPES.has(msg.type)) return false;
+  if (!browserId || browserId === localBrowserId) return nmWrite(msg);
+  if (forwardToExisting) return false;   // only the leader reaches other connections
+  const fwd = forwarders.get(browserId);
+  if (!fwd) return false;
+  const data = JSON.stringify({ msg });
+  if (Buffer.byteLength(data) > RELAY_MAX_BYTES) {
+    log(`Relay refused: ${msg.type} is over ${RELAY_MAX_BYTES} bytes.`);
+    return false;
+  }
+  const requestId = (typeof msg.requestId === 'string' && msg.requestId) ? msg.requestId : null;
+  const replyType = (typeof o.replyType === 'string' && o.replyType && !HOST_PROTOCOL_TYPES.has(o.replyType)) ? o.replyType : null;
+  if (requestId && replyType) {
+    const wait = Number(o.timeoutMs) > 0 ? Math.min(Number(o.timeoutMs) + 5_000, RELAY_DEFAULT_TIMEOUT_MS) : RELAY_DEFAULT_TIMEOUT_MS;
+    const timer = setTimeout(() => { pendingRelays.delete(requestId); }, wait);
+    if (typeof timer.unref === 'function') timer.unref();
+    pendingRelays.set(requestId, { browserId, replyType, timer, onLost: typeof o.onLost === 'function' ? o.onLost : null });
+  }
+  try {
+    fwd.sseRes.write(`event: relay\ndata: ${data}\n\n`);
+    return true;
+  } catch (err) {
+    if (requestId) {
+      const p = pendingRelays.get(requestId);
+      if (p) { clearTimeout(p.timer); pendingRelays.delete(requestId); }
+    }
+    log(`Relay to ${browserId.slice(0,16)}… failed: ${err.message}`);
+    return false;
+  }
+}
+
+function _failPendingRelaysFor(browserId, reason) {
+  for (const [requestId, p] of pendingRelays) {
+    if (p.browserId !== browserId) continue;
+    clearTimeout(p.timer);
+    pendingRelays.delete(requestId);
+    if (p.onLost) { try { p.onLost(reason); } catch (_) {} }
+  }
+}
+
+// Host-extension API: every connection that introduced itself. `reachable`
+// means a message can be delivered now (our own port, or an open SSE channel).
+function listConnections() {
+  const out = [];
+  for (const e of helloConnections.values()) {
+    const local = e.hello.browserId === localBrowserId;
+    out.push({ ...e.hello, local, reachable: local ? !_nmStdoutBroken : forwarders.has(e.hello.browserId), registeredAt: e.registeredAt });
+  }
+  if (_localHello && !helloConnections.has(_localHello.browserId)) {
+    out.push({ ..._localHello, local: true, reachable: !_nmStdoutBroken, registeredAt: 0 });
+  }
+  return out;
+}
+
+// True when `token` is the forwarderToken of the process that registered this
+// browser, by /update (tab data) or by /hello. Both are accepted because a
+// connection can have both, and a stale one of the two must not lock out the
+// live process that owns the other.
+function _connectionTokenMatches(browserId, token) {
+  if (typeof token !== 'string' || !token) return false;
+  const a = cachedData.get(browserId)?.forwarderToken;
+  const b = helloConnections.get(browserId)?.forwarderToken;
+  return (!!a && a === token) || (!!b && b === token);
+}
+function _connectionHasToken(browserId) {
+  return !!(cachedData.get(browserId)?.forwarderToken || helloConnections.get(browserId)?.forwarderToken);
+}
+
+// A connection is here that shares no tabs (so "no tab data" is not "no
+// extension connected").
+function _hasNonTabConnection() {
+  if (_localHello && !_localHello.tabs) return true;
+  for (const e of helloConnections.values()) if (!e.hello.tabs) return true;
+  return false;
 }
 
 // ─── Phase 3 Slice D: destructive-op confirmation gate ───────────────────────
@@ -2373,11 +2697,30 @@ function _checkNoteContentTierAtBridge(op, browserData, fallbackScope, fallbackL
 // uniform result shape: { ok: true, ...wrapperResult } or { ok: false, error }.
 // The MCP write tools registered in createMcpServer() call this directly; /edit also calls it and translates
 // the result into an HTTP response via httpStatusForEditResult.
-async function executeEdit(op, browserArg) {
+async function executeEdit(op, browserArg, opts) {
   if (!op || typeof op !== 'object' || typeof op.type !== 'string') {
     return { ok: false, error: { code: 'BAD_REQUEST', message: 'op must be an object with a string `type` field' } };
   }
-  const r = resolveBrowserData(browserArg);
+  // opts.connection: a host extension addressing one connection that
+  // introduced itself (listConnections) rather than a tab browser picked by
+  // `browser`. Its hello supplies the identity and tier the checks below read.
+  let r;
+  if (opts && typeof opts.connection === 'string' && opts.connection) {
+    const entry = listConnections().find((c) => c.browserId === opts.connection);
+    if (!entry) {
+      return { ok: false, error: { code: 'CONNECTION_NOT_FOUND', message: `No connected extension has the id ${opts.connection.slice(0,16)}…. It may have disconnected; open it and try again.` } };
+    }
+    // A connection that also shares tabs keeps its tier (and userId) fresh on
+    // every tree push; a hello is sent once per connect, so prefer the cache.
+    const tab = cachedData.get(entry.browserId);
+    r = { data: {
+      browserId: entry.browserId, browserBrand: entry.browserBrand,
+      userTier: tab ? tab.userTier : entry.userTier, userId: tab ? tab.userId : entry.userId,
+      tree: [], libraries: [], globalNotes: [],
+    } };
+  } else {
+    r = resolveBrowserData(browserArg);
+  }
   if (r.error) {
     return { ok: false, error: { code: 'BROWSER_NOT_FOUND', message: r.error.content[0].text } };
   }
@@ -2855,6 +3198,14 @@ function selectBrowser(arg) {
 }
 
 function noDataError() {
+  // Something IS connected, it just shares no tabs: the usual "open the
+  // extension" advice would send the user in a circle.
+  if (_hasNonTabConnection()) {
+    return {
+      content: [{ type: 'text', text: 'No tab data: the Pinako extension connected to this Bridge does not share browser tabs, so tab, library, bookmark and Main Notes tools have nothing to read or change here. They need the Pinako extension that manages tabs, connected to this Bridge.' }],
+      isError: true,
+    };
+  }
   return {
     content: [{ type: 'text', text: 'No data yet — open the Pinako extension first.' }],
     isError: true,
@@ -5167,6 +5518,15 @@ const httpServer = http.createServer(async (req, res) => {
         browserId:    d.browserId,
         dataAge:      Date.now() - d.updatedAt,
       }));
+      // Connections that introduced themselves, including ones with no tab
+      // data (which `browsers` above never lists).
+      body.connections = listConnections().map(c => ({
+        browserBrand: c.browserBrand,
+        browserId:    c.browserId,
+        product:      c.product,
+        tabs:         c.tabs,
+        reachable:    c.reachable,
+      }));
     } else {
       body.browserCount = cachedData.size;
     }
@@ -5200,6 +5560,14 @@ const httpServer = http.createServer(async (req, res) => {
             process.stderr.write('[pinako-mcp] Stale-leader exit (zombie-bridge recovery).\n');
             process.exit(0);
           }, 100);
+          return;
+        }
+        // A browser registered by a hello that said it shares no tabs is never
+        // cached as a tab browser (see "Connections that introduce themselves").
+        if (data && browserId && helloConnections.get(browserId)?.hello.tabs === false) {
+          log(`/update from ${browserBrand || 'unknown'} ignored: that connection said it shares no tabs.`);
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: { code: 'SHARES_NO_TABS', message: 'This connection registered as sharing no tabs.' } }));
           return;
         }
         if (data) {
@@ -5333,13 +5701,120 @@ const httpServer = http.createServer(async (req, res) => {
         reqPath === '/edit' ||
         reqPath === '/edit-result' ||
         reqPath === '/organize-state-update' ||
-        reqPath === '/edits'
+        reqPath === '/edits' ||
+        reqPath === '/hello' ||
+        reqPath === '/relay-reply'
       )) {
     res.writeHead(503, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: false,
       error: { code: 'LEADER_ONLY', message: 'This endpoint is served by the leader bridge only. Forwarders are read-only.' },
     }));
+    return;
+  }
+
+  // ─── POST /hello — a forwarder registers the connection behind it ─────────
+  // Body: { hello, forwarderToken }. Requires the access token: a registered
+  // connection can be sent a host extension's requests (see
+  // sendToConnection), so an unauthenticated process must not be able to
+  // stand one up and have those requests routed to it. The forwarder sends
+  // the token only after this leader has proven it holds the same secret.
+  if (reqPath === '/hello' && req.method === 'POST') {
+    if (!requestIsAuthed(req)) {
+      log('/hello refused: missing or wrong access token.');
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED', message: 'POST /hello requires the Pinako access token.' } }));
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => { size += c.length; if (size <= 64 * 1024) chunks.push(c); });
+    req.on('end', () => {
+      try {
+        if (size > 64 * 1024) { res.writeHead(413); res.end(); return; }
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const hello = _sanitizeHello(body && body.hello);
+        const fwToken = (typeof body?.forwarderToken === 'string' && /^[0-9a-f]{16,128}$/.test(body.forwarderToken)) ? body.forwarderToken : null;
+        if (!hello || !fwToken) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: { code: 'BAD_REQUEST', message: 'POST /hello requires { hello: { browserId, ... }, forwarderToken }' } }));
+          return;
+        }
+        // Same zombie-leader rule as /update: a forwarder speaking for OUR
+        // browser means another process now owns its live native port.
+        if (hello.browserId === localBrowserId) {
+          log(`/hello from ${hello.browserBrand}: stale-leader detected (incoming browserId matches our localBrowserId ${(localBrowserId||'').slice(0,16)}…). Exiting so the new bridge can promote.`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, note: 'stale-leader, exiting' }));
+          setTimeout(() => {
+            process.stderr.write('[pinako-mcp] Stale-leader exit (zombie-bridge recovery).\n');
+            process.exit(0);
+          }, 100);
+          return;
+        }
+        _registerHello(hello, fwToken, false);
+        extensionConnected = true;
+        if (shutdownTimer) { clearTimeout(shutdownTimer); shutdownTimer = null; }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: { code: 'BAD_REQUEST', message: e.message } }));
+      }
+    });
+    return;
+  }
+
+  // ─── POST /relay-reply — a forwarder returns its extension's reply ────────
+  // Body: { browserId, forwarderToken, msg }. Token-bound like /edit-result,
+  // and accepted only as the ONE reply to a message this leader relayed to
+  // that browser, of the type it said to expect. Anything else is dropped:
+  // this endpoint must never become a way to deliver an arbitrary message to
+  // a host extension's handlers.
+  if (reqPath === '/relay-reply' && req.method === 'POST') {
+    const MAX = 96 * 1024 * 1024;   // an extension may send its host up to 64 MiB
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => { size += c.length; if (size <= MAX) chunks.push(c); });
+    req.on('end', () => {
+      try {
+        if (size > MAX) { res.writeHead(413); res.end(); return; }
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const browserId = typeof body?.browserId === 'string' ? body.browserId : '';
+        const msg = body && body.msg;
+        const requestId = (msg && typeof msg.requestId === 'string') ? msg.requestId : '';
+        if (!browserId || !requestId || typeof msg.type !== 'string') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: { code: 'BAD_REQUEST', message: 'POST /relay-reply requires { browserId, forwarderToken, msg: { type, requestId } }' } }));
+          return;
+        }
+        if (!_connectionTokenMatches(browserId, body.forwarderToken)) {
+          log(`/relay-reply rejected for browserId=${browserId.slice(0,16)}… — token mismatch`);
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: { code: 'TOKEN_MISMATCH', message: 'forwarderToken does not match the token recorded for this browserId.' } }));
+          return;
+        }
+        const pending = pendingRelays.get(requestId);
+        if (!pending || pending.browserId !== browserId || pending.replyType !== msg.type) {
+          log(`/relay-reply dropped: ${msg.type} ${requestId.slice(0,12)} was not relayed to ${browserId.slice(0,16)}… (or already answered).`);
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: { code: 'NOT_PENDING', message: 'No relayed request is waiting for this reply.' } }));
+          return;
+        }
+        clearTimeout(pending.timer);
+        pendingRelays.delete(requestId);
+        const handler = _extNmHandlers.get(msg.type);
+        if (handler) {
+          try { handler(msg); }
+          catch (e) { log(`host-ext handler error (${msg.type}, relayed): ${e && e.message ? e.message : e}`); }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: { code: 'BAD_REQUEST', message: e.message } }));
+      }
+    });
     return;
   }
 
@@ -5365,8 +5840,9 @@ const httpServer = http.createServer(async (req, res) => {
     // any local process could subscribe to a victim browserId's edit
     // stream, observe full set_note_content payloads, and spoof results
     // via /edit-result. The expected token was stored when /update arrived.
-    const expectedToken = cachedData.get(browserId)?.forwarderToken || null;
-    if (!expectedToken) {
+    // A connection registered by /hello (no tab data) binds its channel the
+    // same way; _connectionTokenMatches accepts either registration's token.
+    if (!_connectionHasToken(browserId)) {
       // No /update has registered for this browserId yet (or registered
       // without a token — pre-2026-05-11 forwarders). Reject so the
       // attacker can't subscribe before the legitimate forwarder
@@ -5375,7 +5851,7 @@ const httpServer = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ ok: false, error: { code: 'TOKEN_REQUIRED', message: 'No forwarder is registered for this browserId yet. Re-POST /update with forwarderToken first.' } }));
       return;
     }
-    if (!token || token !== expectedToken) {
+    if (!_connectionTokenMatches(browserId, token)) {
       log(`SSE /edits rejected for browserId=${browserId.slice(0,16)}… — token mismatch`);
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: { code: 'TOKEN_MISMATCH', message: 'forwarderToken does not match the token recorded on the most recent /update for this browserId.' } }));
@@ -5492,8 +5968,7 @@ const httpServer = http.createServer(async (req, res) => {
           // (entry.path === 'local') bypass the token — no /edit-result
           // post comes from a separate process for those.
           if (pending.path === 'sse') {
-            const expectedToken = cachedData.get(pending.browserId)?.forwarderToken || null;
-            if (!expectedToken || forwarderToken !== expectedToken) {
+            if (!_connectionTokenMatches(pending.browserId, forwarderToken)) {
               log(`/edit-result rejected for requestId=${requestId.slice(0,8)} — token mismatch (browserId=${(pending.browserId||'').slice(0,16)}…)`);
               res.writeHead(401, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ ok: false, error: { code: 'TOKEN_MISMATCH', message: 'forwarderToken does not match the token recorded for this browserId.' } }));
