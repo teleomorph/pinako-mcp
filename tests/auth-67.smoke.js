@@ -8,7 +8,7 @@
  *
  * Covers the three things the design promises:
  *   Tier A — loopback-only: bad Host and any browser Origin are refused.
- *   Tier B — a tokenless connection reads but cannot write; a tokened one can.
+ *   Tier C — a connection without the token gets the catalog and no data.
  *   Squat  — /health answers an HMAC challenge only a token-holder can forge.
  */
 
@@ -121,7 +121,7 @@ async function main() {
       ...editBody, headers: { ...editBody.headers, Authorization: `Bearer ${TOKEN}` },
     }) !== 401, true);
 
-    console.log('\n  Tier B — /mcp');
+    console.log('\n  Tier C — /mcp');
     const initBody = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
@@ -130,44 +130,90 @@ async function main() {
         params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'auth67', version: '0' } },
       }),
     };
-    check('bad token refused',        await status(`${BASE}/mcp?token=deadbeef`, initBody), 401);
+    // A 401 makes clients start OAuth and hides the reason, so neither a
+    // missing nor a wrong token is refused at the handshake; the refusal comes
+    // in-band on the first data request.
+    check('wrong-token handshake answers (no 401)', await status(`${BASE}/mcp?token=deadbeef`, initBody), 200);
     check('tokened URL still routes', await status(`${BASE}/mcp?token=${TOKEN}`, initBody), 200);
 
-    // Open a TOKENLESS session and exercise the read/write split on it.
-    const sess = await fetch(`${BASE}/mcp`, initBody);
-    const sid  = sess.headers.get('mcp-session-id');
-    const call = async (tool, query = '') => {
+    const openSession = async (query = '') => (await fetch(`${BASE}/mcp${query}`, initBody)).headers.get('mcp-session-id');
+    const rpc = async (sid, method, params, query = '') => {
       const r = await fetch(`${BASE}/mcp${query}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'mcp-session-id': sid },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: tool, arguments: {} } }),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 9, method, params }),
       });
-      const j = await r.json();
-      let inner = null;
-      try { inner = JSON.parse(j?.result?.content?.[0]?.text); } catch (_) {}
-      return { json: j, code: inner?.error?.code ?? null };
+      return r.json();
     };
+    const innerCode = (j) => { try { return JSON.parse(j?.result?.content?.[0]?.text)?.error?.code ?? null; } catch (_) { return null; } };
 
-    const readAnon  = await call('list_browsers');
-    check('tokenless READ works',    readAnon.json?.result?.isError === true, false);
-    const writeAnon = await call('set_title');
-    check('tokenless WRITE blocked', writeAnon.code, 'AUTH_REQUIRED');
-    check('block is in-band (not a protocol error)', writeAnon.json?.result?.isError, true);
-    check('block names the fix', /re-run the Pinako AI Bridge installer/i.test(JSON.stringify(writeAnon.json)), true);
+    // A TOKENLESS session: catalog yes, data no.
+    const sid = await openSession();
+    const call = async (tool, query = '') => {
+      const j = await rpc(sid, 'tools/call', { name: tool, arguments: {} }, query);
+      return { json: j, code: innerCode(j) };
+    };
+    const catalog = await rpc(sid, 'tools/list', {});
+    check('tokenless catalog (tools/list) answers', (catalog?.result?.tools || []).length > 0, true);
+    const readAnon = await call('list_browsers');
+    check('tokenless READ refused', readAnon.code, 'AUTH_REQUIRED');
+    check('refusal is in-band (not a protocol error)', readAnon.json?.result?.isError, true);
+    check('refusal names the fix', /re-run the Pinako AI Bridge installer/i.test(JSON.stringify(readAnon.json)), true);
+    check('tokenless WRITE refused', (await call('set_title')).code, 'AUTH_REQUIRED');
+    const resRead = await rpc(sid, 'resources/read', { uri: 'pinako://tree' });
+    check('tokenless resources/read refused', resRead?.error?.code, -32011);
+    check('…and it carries no tree', /"tree"/.test(JSON.stringify(resRead)), false);
+    const resList = await rpc(sid, 'resources/list', {});
+    check('tokenless resources/list answered empty', JSON.stringify(resList?.result), JSON.stringify({ resources: [] }));
 
-    // Same session, now presenting the token: the gate must let it through to
-    // real argument validation (which then rejects the empty args).
+    // The push stream: none for an unauthorized connection (405, which the
+    // spec requires clients to accept), but an authorized one still gets it.
+    const getStatus = async (sidForGet, query = '') => {
+      const ac = new AbortController();
+      try {
+        const r = await fetch(`${BASE}/mcp${query}`, { headers: { Accept: 'text/event-stream', 'mcp-session-id': sidForGet }, signal: ac.signal });
+        return r.status;
+      } catch (e) { return `ERR ${e.message}`; }
+      finally { ac.abort(); }
+    };
+    check('tokenless GET stream refused with 405', await getStatus(sid), 405);
+    const tokSid = await openSession(`?token=${TOKEN}`);
+    check('tokened GET stream still opens', await getStatus(tokSid, `?token=${TOKEN}`), 200);
+
+    // Same tokenless session, now presenting the token: the gate lets it
+    // through to real argument validation (which then rejects the empty args).
     const writeAuthed = await call('set_title', `?token=${TOKEN}`);
     check('tokened WRITE passes the gate', writeAuthed.code === 'AUTH_REQUIRED', false);
 
-    // A write tool the annotation table marks read-only would be a silent
-    // hole; assert the allowlist is the read set, not a superset.
-    const writeish = await call('delete_node');
-    check('destructive tool also blocked tokenless', writeish.code, 'AUTH_REQUIRED');
+    // A WRONG token: another OS user's app reaching this user's bridge, or a
+    // stale config. Refused in-band, with a message that names that cause.
+    const wrongSid = await openSession('?token=deadbeef');
+    const wrong = await rpc(wrongSid, 'tools/call', { name: 'list_browsers', arguments: {} }, '?token=deadbeef');
+    check('wrong-token READ refused', innerCode(wrong), 'WRONG_ACCESS_TOKEN');
+    check('…naming another user account on this computer', /another user account/.test(JSON.stringify(wrong)), true);
+    // A wrong token is never rescued by a session that was authorized.
+    const rescued = await rpc(tokSid, 'tools/call', { name: 'list_browsers', arguments: {} }, '?token=deadbeef');
+    check('wrong token on an authorized session still refused', innerCode(rescued), 'WRONG_ACCESS_TOKEN');
+
+    console.log('\n  POST /update (the relay between bridges)');
+    const updBody = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' };
+    check('tokenless /update refused', await status(`${BASE}/update`, updBody), 401);
+    check('tokened /update accepted', await status(`${BASE}/update`, {
+      ...updBody, headers: { ...updBody.headers, Authorization: `Bearer ${TOKEN}` },
+    }), 200);
+    // Bridges prove the token instead of sending it (a relay can land on
+    // whoever grabbed the port), and the proof is bound to its body.
+    const proofFor = (body, ts = Date.now()) =>
+      `${ts}.${crypto.createHmac('sha256', TOKEN).update(`pinako-relay|/update|${ts}|`).update(body).digest('hex')}`;
+    check('/update with a relay proof accepted', await status(`${BASE}/update`, {
+      ...updBody, headers: { ...updBody.headers, 'x-pinako-relay-proof': proofFor('{}') },
+    }), 200);
+    check('a proof made for another body refused', await status(`${BASE}/update`, {
+      ...updBody, headers: { ...updBody.headers, 'x-pinako-relay-proof': proofFor('{"x":1}') },
+    }), 401);
 
     // JSON-RPC batching: the gate originally inspected only parsed.method, so
-    // an ARRAY body had no top-level method and skipped it entirely. One '['
-    // turned the whole Tier B ladder off.
+    // an ARRAY body had no top-level method and skipped it entirely.
     console.log('\n  Batch smuggling');
     const batch = async (tools) => {
       const r = await fetch(`${BASE}/mcp`, {
@@ -179,10 +225,9 @@ async function main() {
     };
     check('batched write blocked',            /AUTH_REQUIRED/.test(await batch(['set_title'])), true);
     check('batched destructive write blocked', /AUTH_REQUIRED/.test(await batch(['delete_node'])), true);
-    // A read hidden alongside a write must not smuggle the write through.
     const mixed = await batch(['list_browsers', 'delete_live_node']);
-    check('mixed read+write batch refused',   /AUTH_REQUIRED/.test(mixed), true);
-    check('mixed batch did not execute the write', /BROWSER_NOT_FOUND/.test(mixed), false);
+    check('mixed batch refused',              /AUTH_REQUIRED/.test(mixed), true);
+    check('mixed batch did not execute anything', /BROWSER_NOT_FOUND/.test(mixed), false);
     // Every id must be answered: a JSON-RPC client resolves per-id, so an
     // unanswered id is a hang rather than a visible refusal.
     const mixedIds = (JSON.parse(mixed) || []).map(m => m.id).sort();
@@ -232,39 +277,65 @@ async function main() {
     check('log shows the redaction marker', logText.includes('token=<redacted>'), true);
     check('bearer header redacted in log', /"authorization":"<redacted>"/.test(logText), true);
 
-    // ── Catalog-wide invariant ──
-    // Every tool the server actually exposes must land on the correct side of
-    // the gate, checked against the LIVE catalog rather than a hardcoded list.
-    // This is what makes the default-deny design hold over time: a tool added
-    // later (main added three Tab Group write tools while this branch was
-    // open) is gated with no one remembering to update the auth code, and a
-    // write tool mislabelled readOnlyHint:true shows up here instead of
-    // shipping as a hole.
-    console.log('\n  Catalog-wide read/write classification');
-    const READ_ONLY_EXPECTED = new Set([
-      'get_tree', 'search_tabs', 'search_pinako', 'list_libraries', 'get_library',
-      'get_main_tree_notes', 'get_bookmarks', 'list_browsers', 'find_duplicates',
-      'get_tree_summary', 'search_docs',
-    ]);
-    const listResp = await fetch(`${BASE}/mcp`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'mcp-session-id': sid },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 500, method: 'tools/list', params: {} }),
-    });
-    const toolNames = ((await listResp.json())?.result?.tools || []).map(t => t.name);
+    // ── Catalog-wide invariants ──
+    // Checked against the LIVE catalog rather than a hardcoded list, so a tool
+    // added later is covered with no one remembering to update the auth code.
+    //   Tier C: EVERY tool is refused on a tokenless connection.
+    //   Escape hatch (PINAKO_MCP_ALLOW_TOKENLESS_READS=1, Tier B): exactly the
+    //   read-only tools answer; a write mislabelled readOnlyHint:true would
+    //   show up here instead of shipping as a hole.
+    console.log('\n  Catalog-wide: every tool refused tokenless');
+    const toolNames = (catalog?.result?.tools || []).map(t => t.name);
     check('catalog is non-empty', toolNames.length > 0, true);
-
-    const leakedWrites = [];
-    const overGatedReads = [];
+    const leaked = [];
     for (const name of toolNames) {
-      const r = await call(name);
-      const blocked = r.code === 'AUTH_REQUIRED';
-      if (READ_ONLY_EXPECTED.has(name)) { if (blocked) overGatedReads.push(name); }
-      else if (!blocked) leakedWrites.push(name);
+      if ((await call(name)).code !== 'AUTH_REQUIRED') leaked.push(name);
     }
-    check(`every write tool blocked tokenless (${toolNames.length - READ_ONLY_EXPECTED.size} checked)`,
-      leakedWrites.join(',') || 'none', 'none');
-    check('no read tool over-gated', overGatedReads.join(',') || 'none', 'none');
+    check(`every tool refused tokenless (${toolNames.length} checked)`, leaked.join(',') || 'none', 'none');
+
+    console.log('\n  Escape hatch: tokenless reads (Tier B) on request');
+    {
+      const HATCH_PORT = PORT + 1;
+      const HATCH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pinako-auth67-hatch-'));
+      const hatch = spawn(process.execPath, [HOST_JS], {
+        env: { ...process.env, PINAKO_MCP_PORT: String(HATCH_PORT), APPDATA: HATCH_DIR, HOME: HATCH_DIR, USERPROFILE: HATCH_DIR, PINAKO_MCP_ALLOW_TOKENLESS_READS: '1' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      hatch.stderr.on('data', () => {});
+      try {
+        const HB = `http://127.0.0.1:${HATCH_PORT}`;
+        let hup = false;
+        for (let i = 0; i < 50 && !hup; i++) { await sleep(100); try { hup = (await fetch(`${HB}/health`)).ok; } catch (_) {} }
+        const hsid = (await fetch(`${HB}/mcp`, initBody)).headers.get('mcp-session-id');
+        const hcall = async (tool, query = '') => {
+          const r = await fetch(`${HB}/mcp${query}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', 'mcp-session-id': hsid },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: tool, arguments: {} } }),
+          });
+          return innerCode(await r.json());
+        };
+        const READ_ONLY_EXPECTED = new Set([
+          'get_tree', 'search_tabs', 'search_pinako', 'list_libraries', 'get_library',
+          'get_main_tree_notes', 'get_bookmarks', 'list_browsers', 'find_duplicates',
+          'get_tree_summary', 'search_docs',
+        ]);
+        const leakedWrites = [], overGatedReads = [];
+        for (const name of toolNames) {
+          const blocked = (await hcall(name)) === 'AUTH_REQUIRED';
+          if (READ_ONLY_EXPECTED.has(name)) { if (blocked) overGatedReads.push(name); }
+          else if (!blocked) leakedWrites.push(name);
+        }
+        check(`hatch: every write tool still blocked (${toolNames.length - READ_ONLY_EXPECTED.size} checked)`, leakedWrites.join(',') || 'none', 'none');
+        check('hatch: no read tool over-gated', overGatedReads.join(',') || 'none', 'none');
+        check('hatch: a WRONG token is still refused', await hcall('list_browsers', '?token=deadbeef'), 'WRONG_ACCESS_TOKEN');
+      } finally {
+        hatch.stdin.end();
+        hatch.kill();
+        await sleep(200);
+        try { fs.rmSync(HATCH_DIR, { recursive: true, force: true }); } catch (_) {}
+      }
+    }
 
     // ── C(ii): THE NM HEARTBEAT ONLY FIRES WHEN THERE IS WORK (2026-09-18) ──
     // Found live: the MV3 service worker idles out after ~5 minutes of no port

@@ -107,7 +107,7 @@ the service binary and then re-run the installer to update your apps:
 
 The old token stops working immediately: a running Bridge notices the change
 and drops any already-authorized session. Until you re-run the installer, apps
-still holding the old URL fall back to read-only.
+still holding the old URL are refused, with a message saying so.
 
 ## Build from source
 

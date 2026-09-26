@@ -65,8 +65,8 @@ const TOKEN_BYTES = 32;
 let _authToken = null;
 
 // Read the token, creating it if absent. Returns null only if the filesystem
-// is unusable — callers treat that as "auth unavailable" and fail OPEN on
-// reads / CLOSED on writes rather than bricking the bridge.
+// is unusable — callers treat that as "auth unavailable" and fail CLOSED: no
+// caller can be judged, so none is served (see "Tier C" below).
 function loadOrCreateAuthToken() {
   if (_authToken) return _authToken;
   // Two distinct states, and conflating them was a permanent-wedge bug:
@@ -108,7 +108,7 @@ function loadOrCreateAuthToken() {
         if (/^[0-9a-f]{32,128}$/i.test(raced)) { _authToken = raced; _stampTokenMtime(); return _authToken; }
       } catch (_) {}
     }
-    log(`Auth token unavailable (${err && err.message ? err.message : err}) — write tools will be refused for tokenless callers.`);
+    log(`Auth token unavailable (${err && err.message ? err.message : err}) — AI app requests will be refused until the token file can be read.`);
     return null;
   }
   return _authToken;
@@ -184,20 +184,72 @@ function extractRequestToken(req) {
   return null;
 }
 
+// The token as it is on disk NOW. A forwarder never runs tokenMatches (the
+// path that notices a rotation), so everything it signs or sends with the
+// token reads it through here; a stale one would get every relay refused
+// while the leader keeps serving this browser's old tree.
+function currentAuthToken() {
+  refreshAuthTokenIfRotated();
+  return loadOrCreateAuthToken();
+}
+
 function requestIsAuthed(req) {
   return tokenMatches(extractRequestToken(req));
 }
 
-// ─── Tier B: tokenless sessions are read-only (ai-todo #67) ──────────────────
-// The migration state. Clients configured before the tokened URL shipped keep
-// working for reads; write attempts return an actionable in-band tool error
-// (the model relays it verbatim, so the error message IS the upgrade prompt).
-// Flip to token-required-for-reads in a later release — tokenless reads still
-// expose the whole tree, so this is a migration state, not the end state.
+// One /mcp request's standing: { authed } or { authed:false, reason } with a
+// reason from AUTH_REFUSALS. A presented token decides on its own (a wrong one
+// is never rescued by the session). A request with none rides on its session
+// having presented the right token at `initialize`, for a client that drops the
+// query string after the handshake.
+function mcpAuthState(req, sessionId) {
+  // First, so a rotation revokes authed sessions before one is trusted below.
+  refreshAuthTokenIfRotated();
+  const presented = extractRequestToken(req);
+  if (presented) {
+    if (tokenMatches(presented)) return { authed: true };
+    return { authed: false, reason: loadOrCreateAuthToken() ? 'wrong' : 'unavailable' };
+  }
+  if (sessionId && authedSessions.has(sessionId)) return { authed: true };
+  return { authed: false, reason: (loadOrCreateAuthToken() || ALLOW_TOKENLESS_READS) ? 'none' : 'unavailable' };
+}
+
+// ─── Tier C: an unauthenticated connection gets no data (ai-todo #67) ────────
+// Every request that returns or changes the user's data needs the access
+// token: tools/call (reads too), resources/read, subscriptions. Tier B let a
+// tokenless connection READ, which left the whole tree, notes and bookmarks
+// open to any process on the machine, including another OS user's (loopback
+// port 37421 is shared by every signed-in OS user).
 //
-// Default-DENY: anything not positively known to be read-only counts as a
-// write. That covers tools registered by host extensions too, which a
-// hardcoded write-list would silently miss.
+// What an unauthenticated connection still gets is the handshake and the tool
+// CATALOG (initialize, ping, tools/list, notifications). Both come from code,
+// not from the user's data, and they are what let the refusal reach a person:
+// the model calls a tool and relays our in-band message. Refusing the
+// handshake itself (HTTP 401) reaches no one — clients read a 401 as "start
+// OAuth" and show "needs authentication" or "failed to connect" without our
+// text (research 2026-09-26: Claude Code docs; Cursor forum 2026-03-27;
+// honcho#792). The resource and prompt LISTS are answered empty by the gate,
+// so a future listing that enumerates user data cannot leak through them.
+//
+// Default-DENY: a method not named here as catalog is refused.
+//
+// Escape hatch: PINAKO_MCP_ALLOW_TOKENLESS_READS=1 restores Tier B for a
+// connection that presents NO token (reads flow, writes are refused), for a
+// client that cannot carry one. A WRONG token is refused either way.
+const ALLOW_TOKENLESS_READS = process.env.PINAKO_MCP_ALLOW_TOKENLESS_READS === '1';
+const TOKENLESS_CATALOG_METHODS = new Set(['initialize', 'ping', 'tools/list']);
+const TOKENLESS_EMPTY_LISTS = {
+  'resources/list':           { resources: [] },
+  'resources/templates/list': { resourceTemplates: [] },
+  'prompts/list':             { prompts: [] },
+};
+// JSON-RPC server-error code for "this connection may not do that".
+const AUTH_ERROR_CODE = -32011;
+
+// Tier B's read set, used only under the escape hatch. Default-DENY: anything
+// not positively known to be read-only counts as a write. That covers tools
+// registered by host extensions too, which a hardcoded write-list would
+// silently miss.
 const READ_ONLY_TOOL_NAMES = new Set([
   'get_tree', 'search_tabs', 'search_pinako', 'list_libraries', 'get_library',
   'get_main_tree_notes', 'get_bookmarks', 'list_browsers', 'find_duplicates',
@@ -224,14 +276,98 @@ const WRITE_AUTH_MESSAGE =
   'Tell the user (verbatim, do not paraphrase the fix): re-run the Pinako AI Bridge installer to refresh ' +
   'this client\'s configuration, then restart this client. Reads keep working in the meantime.';
 
-function writeToolBlockedResponse(id, toolName) {
+// "a Windows user account" and so on: the words a user knows for the thing
+// that separates two people on one computer.
+function osUserAccountWords() {
+  switch (process.platform) {
+    case 'win32':  return 'a Windows user account';
+    case 'darwin': return 'a Mac user account';
+    case 'linux':  return 'a Linux user account';
+    default:       return 'a user account on this computer';
+  }
+}
+
+// Why a request is unauthenticated decides what the user is told to do.
+//   'none'        — no token presented: a configuration from before the token.
+//   'wrong'       — a token that is not this bridge's. Usually another OS
+//                   user's AI app reaching the bridge of whoever holds the
+//                   shared port; otherwise a stale config.
+//   'unavailable' — our own token file cannot be read, so no one can be judged.
+const AUTH_REFUSALS = {
+  none: {
+    code: 'AUTH_REQUIRED',
+    message:
+      'Pinako refused this request: this app is connected to the Pinako AI Bridge without its access token, ' +
+      'and the Bridge shares nothing without it. Tell the user (verbatim, do not paraphrase the fix): re-run the ' +
+      'Pinako AI Bridge installer to refresh this app\'s configuration, then restart this app.',
+  },
+  wrong: {
+    code: 'WRONG_ACCESS_TOKEN',
+    message: () =>
+      'Pinako refused this request: this app\'s access token does not match the Pinako AI Bridge that answered ' +
+      'on this computer. Tell the user (verbatim, do not paraphrase the fix): "If someone else is signed in to ' +
+      `this computer in another user account with Pinako running, their Pinako is using the connection (every ` +
+      `user account on a computer shares it), so yours cannot connect until they close their browser or sign out. ` +
+      `Each person needs ${osUserAccountWords()} of their own. Otherwise, re-run the Pinako AI Bridge installer ` +
+      'to refresh this app\'s configuration, then restart this app."',
+  },
+  unavailable: {
+    code: 'AUTH_UNAVAILABLE',
+    message:
+      'Pinako refused this request: the Pinako AI Bridge could not read its access token file, so it cannot check ' +
+      'this connection and shares nothing. Tell the user (verbatim, do not paraphrase the fix): close and reopen the ' +
+      'browser that runs Pinako; if this keeps happening, re-run the Pinako AI Bridge installer.',
+  },
+};
+
+function _refusal(reason) {
+  const r = AUTH_REFUSALS[reason] || AUTH_REFUSALS.none;
+  return { code: r.code, message: typeof r.message === 'function' ? r.message() : r.message };
+}
+
+// A refused tools/call is answered IN-BAND (a tool result with isError), which
+// the model reads and relays; a protocol error is shown as a server failure.
+function toolRefusedResponse(id, toolName, refusal) {
   return {
     jsonrpc: '2.0',
     id: id === undefined ? null : id,
     result: {
-      content: [{ type: 'text', text: JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED', tool: toolName, message: WRITE_AUTH_MESSAGE } }) }],
+      content: [{ type: 'text', text: JSON.stringify({ ok: false, error: { code: refusal.code, tool: toolName, message: refusal.message } }) }],
       isError: true,
     },
+  };
+}
+
+function writeToolBlockedResponse(id, toolName) {
+  return toolRefusedResponse(id, toolName, { code: 'AUTH_REQUIRED', message: WRITE_AUTH_MESSAGE });
+}
+
+// The gate's answer to ONE message on an unauthenticated connection:
+//   null                  → let it through to the server
+//   { reply }             → answer it here (reply is null for a notification)
+//   { reply, refused }    → refused; `refused` names the method or tool
+function gateUnauthedMessage(m, reason) {
+  if (!m || typeof m !== 'object' || typeof m.method !== 'string') return null; // a client RESPONSE, not a request
+  const hasId = m.id !== undefined && m.id !== null;
+  // Tier B, exactly, under the escape hatch: a tokenless (not wrong-token)
+  // connection may do anything but call a tool not known to be read-only.
+  if (ALLOW_TOKENLESS_READS && reason === 'none') {
+    const name = m?.params?.name;
+    if (m.method !== 'tools/call' || READ_ONLY_TOOL_NAMES.has(name)) return null;
+    return { reply: hasId ? writeToolBlockedResponse(m.id, name) : null, refused: name };
+  }
+  if (m.method.startsWith('notifications/') || TOKENLESS_CATALOG_METHODS.has(m.method)) return null;
+  if (Object.prototype.hasOwnProperty.call(TOKENLESS_EMPTY_LISTS, m.method)) {
+    return { reply: hasId ? { jsonrpc: '2.0', id: m.id, result: TOKENLESS_EMPTY_LISTS[m.method] } : null };
+  }
+  const refusal = _refusal(reason);
+  if (m.method === 'tools/call') {
+    const name = m?.params?.name;
+    return { reply: hasId ? toolRefusedResponse(m.id, name, refusal) : null, refused: name };
+  }
+  return {
+    reply: hasId ? { jsonrpc: '2.0', id: m.id, error: { code: AUTH_ERROR_CODE, message: refusal.message } } : null,
+    refused: m.method,
   };
 }
 
@@ -243,6 +379,30 @@ function challengeProof(nonce) {
   const secret = loadOrCreateAuthToken();
   if (!secret || !nonce) return null;
   return createHmac('sha256', secret).update(String(nonce)).digest('hex');
+}
+
+// Proof-of-token for a bridge-to-bridge POST (/update, /hello), in place of
+// the token itself. A forwarder trusts a CACHED leader verdict, and between a
+// leader's exit and our promotion poll whoever binds 37421 first receives the
+// next relay; a bearer token sent there would hand another OS user permanent
+// access to this user's bridge. This proof is bound to one path, one body and
+// a two-minute window, so capturing it gains nothing: replayed, it re-sends the
+// same body to the same route. Header: `x-pinako-relay-proof: <ts>.<hex mac>`.
+const RELAY_PROOF_HEADER = 'x-pinako-relay-proof';
+const RELAY_PROOF_WINDOW_MS = 120_000;
+function relayProof(secret, pathName, body, ts = Date.now()) {
+  return `${ts}.${createHmac('sha256', secret).update(`pinako-relay|${pathName}|${ts}|`).update(body).digest('hex')}`;
+}
+function relayProofOk(req, pathName, body) {
+  const raw = req.headers && req.headers[RELAY_PROOF_HEADER];
+  const m = typeof raw === 'string' ? /^(\d{1,16})\.([0-9a-f]{64})$/.exec(raw) : null;
+  if (!m) return false;
+  const ts = Number(m[1]);
+  if (!(Math.abs(Date.now() - ts) <= RELAY_PROOF_WINDOW_MS)) return false;
+  const secret = currentAuthToken();
+  if (!secret) return false;
+  const want = relayProof(secret, pathName, body, ts).split('.')[1];
+  return timingSafeEqual(Buffer.from(m[2], 'utf8'), Buffer.from(want, 'utf8'));
 }
 let logBytesWritten = 0;
 let logSizeSeeded = false;
@@ -1950,7 +2110,7 @@ function _announceHelloToLeader() {
   verifyLeaderIdentity().then((ok) => {
     if (!ok) { log('Hello withheld — the process holding the port did not prove it is the Pinako bridge.'); return; }
     if (seq !== _helloAnnounceSeq || !forwardToExisting || !_localHello) return;
-    const secret = loadOrCreateAuthToken();
+    const secret = currentAuthToken();
     if (!secret) { log('Hello not sent: there is no access token on disk to authenticate with.'); return; }
     const body = JSON.stringify({ hello: _localHello, forwarderToken: _myForwarderToken });
     const req = http.request(
@@ -1958,8 +2118,9 @@ function _announceHelloToLeader() {
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
-          // Sent only to a leader that just proved it holds the same secret.
-          'Authorization': `Bearer ${secret}`,
+          // A proof, never the token: the leader verdict is cached, and the
+          // port may have changed hands since (see relayProof).
+          [RELAY_PROOF_HEADER]: relayProof(secret, '/hello', body),
         } },
       (res) => {
         res.resume();
@@ -5661,11 +5822,28 @@ const httpServer = http.createServer(async (req, res) => {
 
   // Internal: new host instance forwards fresh data here when EADDRINUSE
   if (reqPath === '/update' && req.method === 'POST') {
+    // #67 Tier C: requires the access token, like /hello. A tokenless /update
+    // let any local process (another OS user's included) plant a browser whose
+    // "tabs" the user's AI apps would read, then subscribe to /edits with its
+    // own forwarderToken and receive the writes aimed at it. Our forwarders
+    // prove the token with a relay proof (see relayProof) instead of sending
+    // it; a bearer token is accepted too, for tests and hand-driven calls.
+    const refuse = () => {
+      log('/update refused: missing or wrong access token.');
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED', message: 'POST /update requires the Pinako access token.' } }));
+    };
+    const bearerOk = requestIsAuthed(req);
+    if (!bearerOk && !req.headers[RELAY_PROOF_HEADER]) { refuse(); return; }
+    const MAX = 96 * 1024 * 1024;   // bounds what an unproven sender makes us buffer
     const chunks = [];
-    req.on('data', c => chunks.push(c));
+    let size = 0;
+    req.on('data', (c) => { size += c.length; if (bearerOk || size <= MAX) chunks.push(c); });
     req.on('end', () => {
+      const raw = Buffer.concat(chunks);
+      if (!bearerOk && (size > MAX || !relayProofOk(req, '/update', raw))) { refuse(); return; }
       try {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const body = JSON.parse(raw.toString('utf8'));
         const { data, browserId, browserBrand, userTier, userId, forwarderToken } = body;
         // 2026-05-15 zombie-leader detection. If a forwarder POSTs /update
         // for a browserId that matches OUR localBrowserId, another process
@@ -5844,19 +6022,23 @@ const httpServer = http.createServer(async (req, res) => {
   // stand one up and have those requests routed to it. The forwarder sends
   // the token only after this leader has proven it holds the same secret.
   if (reqPath === '/hello' && req.method === 'POST') {
-    if (!requestIsAuthed(req)) {
+    // Our forwarders send a relay proof, not the token (see relayProof).
+    const refuse = () => {
       log('/hello refused: missing or wrong access token.');
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: { code: 'AUTH_REQUIRED', message: 'POST /hello requires the Pinako access token.' } }));
-      return;
-    }
+    };
+    const bearerOk = requestIsAuthed(req);
+    if (!bearerOk && !req.headers[RELAY_PROOF_HEADER]) { refuse(); return; }
     const chunks = [];
     let size = 0;
     req.on('data', (c) => { size += c.length; if (size <= 64 * 1024) chunks.push(c); });
     req.on('end', () => {
       try {
         if (size > 64 * 1024) { res.writeHead(413); res.end(); return; }
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const raw = Buffer.concat(chunks);
+        if (!bearerOk && !relayProofOk(req, '/hello', raw)) { refuse(); return; }
+        const body = JSON.parse(raw.toString('utf8'));
         const hello = _sanitizeHello(body && body.hello);
         const fwToken = (typeof body?.forwarderToken === 'string' && /^[0-9a-f]{16,128}$/.test(body.forwarderToken)) ? body.forwarderToken : null;
         if (!hello || !fwToken) {
@@ -6175,58 +6357,44 @@ const httpServer = http.createServer(async (req, res) => {
         const sessionId = req.headers['mcp-session-id'];
         let transport;
 
-        // ── #67 auth ──
-        // A WRONG token is always fatal (someone is probing); an ABSENT one
-        // downgrades to read-only for the migration window.
-        const presentedToken = extractRequestToken(req);
-        // A wrong token is fatal ONLY when there is a real token to be wrong
-        // against. If the token file is unreadable we cannot judge the caller,
-        // and 401-ing a correctly-configured client would take away its READS
-        // too — the opposite of the documented "fail open on reads, closed on
-        // writes" contract. Unjudgeable means unauthed: reads flow, writes are
-        // refused by the gate below.
-        if (presentedToken && loadOrCreateAuthToken() && !tokenMatches(presentedToken)) {
-          log('POST /mcp 401: invalid access token');
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Invalid Pinako access token.' }, id: parsed?.id ?? null }));
-          return;
-        }
-        // Authed only when the presented token actually VALIDATED. `!!presentedToken`
-        // alone would have granted writes on any non-empty string had the 401
-        // branch above ever been bypassed; make the positive check explicit.
-        const authed = (!!presentedToken && tokenMatches(presentedToken))
-                    || (!!sessionId && authedSessions.has(sessionId));
+        // ── #67 auth (Tier C) ──
+        // An unauthenticated request gets the handshake and the catalog and
+        // nothing else; see "Tier C" at the top. A wrong token is refused the
+        // same in-band way rather than with a 401, because a 401 makes clients
+        // start OAuth and the user never learns the real cause (usually another
+        // OS user's bridge holding the shared port).
+        const auth = mcpAuthState(req, sessionId);
+        const authed = auth.authed;
         if (!authed) {
           // JSON-RPC allows a BATCH: the body may be an ARRAY of messages.
           // Checking `parsed.method` alone missed that entirely — an array has
-          // no top-level .method, so wrapping a write call in `[ ]` skipped
-          // the gate and reached real dispatch. Inspect every message.
-          const messages = Array.isArray(parsed) ? parsed : [parsed];
-          const blocked = messages.find(m =>
-            m && m.method === 'tools/call' && !READ_ONLY_TOOL_NAMES.has(m?.params?.name));
-          if (blocked) {
-            const toolName = blocked?.params?.name;
-            log(`POST /mcp: write tool "${toolName}" refused — connection is tokenless (read-only).`);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            // Refuse the WHOLE batch: a partially-applied batch would be worse
-            // than a clean refusal, and the caller cannot act on half a result.
+          // no top-level .method, so wrapping a call in `[ ]` skipped the gate
+          // and reached real dispatch. Inspect every message.
+          const isBatch = Array.isArray(parsed);
+          const messages = isBatch ? parsed : [parsed];
+          const verdicts = messages.map(m => gateUnauthedMessage(m, auth.reason));
+          const firstRefused = verdicts.find(v => v && v.refused !== undefined);
+          if (firstRefused) {
+            log(`POST /mcp: "${firstRefused.refused}" refused — connection is not authorized (${auth.reason}).`);
+          }
+          if (verdicts.some(Boolean)) {
+            // The gate answers the WHOLE batch once it answers any part: a
+            // partially-applied batch would be worse than a clean refusal.
             //
-            // Every message with an id gets a reply. Answering only the blocked
+            // Every message with an id gets a reply. Answering only the gated
             // ids leaves the caller waiting forever on the others — JSON-RPC
             // clients resolve per-id, so a missing id is a hang, not an error.
             // Notifications (no id) correctly get no reply.
-            const payload = Array.isArray(parsed)
-              ? parsed
-                  .filter(m => m && m.id !== undefined && m.id !== null)
-                  .map(m => (m.method === 'tools/call' && !READ_ONLY_TOOL_NAMES.has(m?.params?.name))
-                    ? writeToolBlockedResponse(m.id, m?.params?.name)
-                    : {
-                        jsonrpc: '2.0',
-                        id: m.id,
-                        error: { code: -32001, message: `Batch refused: it contained the write tool "${toolName}" and this connection is read-only. ${WRITE_AUTH_MESSAGE}` },
-                      })
-              : writeToolBlockedResponse(parsed?.id, toolName);
-            res.end(JSON.stringify(payload));
+            const replies = [];
+            messages.forEach((m, i) => {
+              if (!m || m.id === undefined || m.id === null) return;
+              if (verdicts[i]) { if (verdicts[i].reply) replies.push(verdicts[i].reply); return; }
+              const what = firstRefused ? `"${firstRefused.refused}"` : 'a request this connection may not make';
+              replies.push({ jsonrpc: '2.0', id: m.id, error: { code: AUTH_ERROR_CODE, message: `Batch refused: it contained ${what}. ${_refusal(auth.reason).message}` } });
+            });
+            if (!isBatch && replies.length === 0) { res.writeHead(202); res.end(); return; }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(isBatch ? replies : replies[0]));
             return;
           }
         }
@@ -6287,16 +6455,21 @@ const httpServer = http.createServer(async (req, res) => {
     // GET (SSE stream) / DELETE / OPTIONS
     logRequest(`${req.method} /mcp`, req, null);
     try {
-      // #67: a wrong token is fatal here too. No read-only downgrade needed —
-      // these carry no tool calls, only stream/teardown for an existing session.
-      const presented = extractRequestToken(req);
-      if (presented && loadOrCreateAuthToken() && !tokenMatches(presented)) {
-        log(`${req.method} /mcp 401: invalid access token`);
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Invalid Pinako access token.' }, id: null }));
-        return;
-      }
       const sessionId = req.headers['mcp-session-id'];
+      // #67 Tier C: the push stream (GET) carries change notifications about
+      // the user's data, so an unauthorized connection is told there is none:
+      // 405, which the streamable-HTTP spec requires clients to accept. Not a
+      // 401, which would start OAuth in the client. DELETE only ends the
+      // caller's own session and stays open.
+      if (req.method === 'GET') {
+        const auth = mcpAuthState(req, sessionId);
+        if (!auth.authed && !(ALLOW_TOKENLESS_READS && auth.reason === 'none')) {
+          log(`GET /mcp 405: no push stream for an unauthorized connection (${auth.reason}).`);
+          res.writeHead(405, { Allow: 'POST, DELETE' });
+          res.end();
+          return;
+        }
+      }
       const transport = (sessionId && activeSessionProfiles.get(sessionId) === mcpProfile) ? activeSessions.get(sessionId) : undefined;
       if (!transport) {
         // Spec-compliant 404 for unknown session — see POST /mcp handler for
@@ -6355,9 +6528,7 @@ function attemptListen() {
 // bookmarks) plus its forwarderToken — which is itself the key to that
 // browser's edit stream. If a squatter grabbed 37421 before the real bridge,
 // an unverified relay donates all of it. Challenge the port-holder to prove
-// it knows the shared token first. Fails open only when no token exists on
-// disk (nothing to verify against), so a broken filesystem can't wedge
-// multi-browser sync.
+// it knows the shared token first. With no token on disk nothing is sent.
 let _leaderVerified = false;
 let _leaderVerifyInFlight = null;
 const LEADER_PROBE_TIMEOUT_MS = 5_000;
@@ -6366,10 +6537,12 @@ function verifyLeaderIdentity() {
   if (_leaderVerified) return Promise.resolve(true);
   if (_leaderVerifyInFlight) return _leaderVerifyInFlight;
   const p = (async () => {
-    const secret = loadOrCreateAuthToken();
-    // No secret on disk: nothing to verify against. Fail open so a broken
-    // filesystem can't wedge multi-browser sync — this is the pre-#67 status quo.
-    if (!secret) return true;
+    const secret = currentAuthToken();
+    // No secret on disk: nothing to verify against, so nothing is sent. This
+    // used to fail open (the pre-#67 status quo), which handed the tree to
+    // whoever held the port; under Tier C the leader refuses an unauthenticated
+    // relay anyway, so failing open bought nothing and cost the tree.
+    if (!secret) { log('Leader identity not checked: there is no access token on disk — withholding tree data.'); return false; }
     const nonce = randomBytes(16).toString('hex');
     let resp;
     try {
@@ -6454,12 +6627,23 @@ async function tryBindOrForward(initialAttempt) {
           // 2026-05-11: include forwarderToken on every /update so the leader
           // can token-bind this browserId's SSE subscription + /edit-result
           // posts to THIS process. Without it, any local process could spoof.
+          const secret = currentAuthToken();
+          if (!secret) { log('Relay not sent: there is no access token on disk to authenticate with.'); return; }
           const body = JSON.stringify({ ...payload, forwarderToken: _myForwarderToken });
           _lastRelayAt = Date.now();
           const req = http.request(
             { hostname: '127.0.0.1', port: MCP_PORT, path: '/update', method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
-            () => { process.stderr.write(`[pinako-mcp] Relayed tree update from ${payload.browserBrand || 'unknown'}.\n`); }
+              headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+                // A proof, never the token (see relayProof).
+                [RELAY_PROOF_HEADER]: relayProof(secret, '/update', body),
+              } },
+            (res) => {
+              res.resume();
+              if (res.statusCode === 200) process.stderr.write(`[pinako-mcp] Relayed tree update from ${payload.browserBrand || 'unknown'}.\n`);
+              else log(`Relay refused by the leader: HTTP ${res.statusCode}`);
+            }
           );
           req.on('error', (err) => {
             // The leader we verified may have died and been replaced; re-prove
@@ -6608,7 +6792,7 @@ async function runStdioBridge(httpUrl) {
       _identityWarned = true;
       process.stderr.write(
         `[stdio-mcp] REFUSING to connect: the process holding ${_cfg.base} answered the identity challenge incorrectly. ` +
-        'Another program may be occupying the port. Serving catalog locally instead.\n'
+        'Another program holds the port, most often the Pinako Bridge of another user account signed in to this computer. Serving catalog locally instead.\n'
       );
     }
     return 'impostor';
@@ -6670,6 +6854,7 @@ async function runStdioBridge(httpUrl) {
   let clientProtocolVersion = '2025-03-26'; // the client's negotiated version, echoed to the bridge
   let servedLocalToolsList = false;  // catalog was answered locally → notify list_changed on reconnect
   let downLogged = false;            // log unreachability once per outage, not per retry
+  let lastVerdict = null;            // the last identity verdict; 'impostor' changes what the model is told
   let retryTimer = null;
   let shimIdCounter = 0;
   const shimSuppressIds = new Set(); // shim-originated request ids; swallow their responses
@@ -6754,6 +6939,7 @@ async function runStdioBridge(httpUrl) {
     // session (and, on write tools, user data).
     // #67: decide what this port-holder has earned BEFORE handing it anything.
     const verdict = await bridgeIdentityVerdict();
+    lastVerdict = verdict;
     if (verdict === 'impostor') throw new Error('ECONNREFUSED (bridge identity challenge answered incorrectly)');
     if (verdict === 'unreachable') throw new Error('fetch failed (bridge identity probe unreachable)');
     if (verdict === 'legacy') noteLegacy();
@@ -6844,7 +7030,16 @@ async function runStdioBridge(httpUrl) {
     if (!isRequest) return; // notification or stray response — nothing to answer
     if (msg.method === 'tools/call') {
       let text;
-      if (detail === null || detail === undefined || NEVER_SENT_RE.test(detail)) {
+      const neverSent = detail === null || detail === undefined || NEVER_SENT_RE.test(detail);
+      if (neverSent && lastVerdict === 'impostor') {
+        // Something answers on the port but cannot prove it holds OUR token.
+        // On a shared computer that is almost always another OS user's own
+        // Pinako Bridge (every signed-in user shares loopback port 37421).
+        text = 'Pinako could not connect: the Pinako connection on this computer is held by a program that is not this user\'s Pinako AI Bridge. ' +
+          'Tell the user (verbatim, do not paraphrase the fix): "If someone else is signed in to this computer in another user account with Pinako running, ' +
+          'their Pinako is using the connection (every user account on a computer shares it), so yours cannot connect until they close their browser or sign out. ' +
+          `Each person needs ${osUserAccountWords()} of their own." This request was NOT executed.`;
+      } else if (neverSent) {
         // Connect-phase failure: the request provably never left this process,
         // so the definitive claim is safe and the model may retry freely.
         text = 'Pinako Bridge isn\'t running — no browser with the Pinako extension is connected right now. Ask the user to open their browser (with the Pinako extension enabled); the bridge reconnects automatically within a few seconds. This request was NOT executed.';
