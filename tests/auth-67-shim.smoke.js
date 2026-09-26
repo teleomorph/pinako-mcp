@@ -126,6 +126,10 @@ async function main() {
     check('handshake still answered locally', fake.out.some(m => m.id === 1 && m.result));
     const fakeCall = JSON.stringify(fake.out.find(m => m.id === 2) || {});
     check('tool call not forwarded to the impostor', fakeCall.length > 2);
+    // On a shared computer the "impostor" is almost always another OS user's
+    // own bridge; "the Bridge isn't running" would send the user the wrong way.
+    check('the tool result names another user account, not a stopped Bridge',
+      /another user account/.test(fakeCall) && !/isn't running/.test(fakeCall));
 
     console.log('\n  Squatter must never receive the token (non-JSON responder)');
     // Pass the TOKENED url, i.e. exactly what the installer writes — the

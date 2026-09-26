@@ -36,7 +36,8 @@ export function readToken() {
 /**
  * Read the token, creating it if it doesn't exist yet.
  * Returns null only when the filesystem refuses — callers fall back to a
- * tokenless URL, which still works (read-only) rather than failing the install.
+ * tokenless URL rather than failing the install. Since #67 Tier C a tokenless
+ * app gets no data, only a message to re-run the installer.
  */
 export function readOrCreateToken() {
   const existing = readToken();

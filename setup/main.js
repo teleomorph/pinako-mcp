@@ -138,8 +138,9 @@ async function main() {
 
   // ── Step 1b: Create the local access token (ai-todo #67) ──────────────────
   // Must run BEFORE configureClients, which bakes the token into every URL
-  // it writes. A failure here is non-fatal: clients get a tokenless URL and
-  // keep read-only access rather than the install failing outright.
+  // it writes. A failure here is non-fatal: clients get a tokenless URL (which
+  // the Bridge answers with "re-run the installer", #67 Tier C) rather than
+  // the install failing outright.
   //
   // SKIPPED when the binary write failed. Writing tokened URLs against a
   // surviving OLD binary is worse than doing nothing: that binary has no
@@ -157,7 +158,7 @@ async function main() {
     } else {
       console.log(err);
       console.log(yellow(`  ⚠  Could not write ${TOKEN_PATH}`));
-      console.log(dim('     Apps will be configured with read-only access.'));
+      console.log(dim('     Apps will not reach your Pinako data until you run the installer again.'));
     }
   }
 
@@ -301,7 +302,7 @@ function installClaudePlugin() {
 async function showFinalInstructions() {
   // #67: the manual-configuration URL carries the access token, same as the
   // one written into detected clients. Without it a hand-configured app gets
-  // read-only access and its write tools return an upgrade message.
+  // no data, and every tool returns an upgrade message.
   const MCP_URL = buildMcpUrl();
   const copied = copyToClipboard(MCP_URL);
 
@@ -339,9 +340,9 @@ async function finish() {
 // ─── rotate-token (ai-todo #67) ───────────────────────────────────────────────
 // Regenerates the access token and rewrites it into every detected client's
 // config. Use after the URL has been shared, pasted into a bug report, or
-// otherwise exposed. Any client NOT detected here keeps the old URL and drops
-// to read-only until it is reconfigured — which is the intended behavior for
-// a revocation.
+// otherwise exposed. Any client NOT detected here keeps the old URL and is
+// refused until it is reconfigured — which is the intended behavior for a
+// revocation.
 async function rotateTokenCommand() {
   console.log('');
   console.log(bold('  Rotating the Pinako AI Bridge access token'));

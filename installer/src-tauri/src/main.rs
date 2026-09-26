@@ -10,14 +10,15 @@ const HOST_NAME: &str = "com.pinako.mcp";
 
 // ── Local access token (ai-todo #67) ─────────────────────────────────────────
 // The URL written into every client config carries a machine-local token; the
-// bridge treats a tokenless connection as read-only. Rather than reimplement
+// bridge shares no data with a tokenless connection (#67 Tier C; read-only
+// before it). Rather than reimplement
 // token generation here (a third implementation after host.js and
 // setup/token.js — three chances to drift on path or format), ask the service
 // binary we just installed to create-or-read it and print it.
 //
 // Resolved once per run so every client in one install gets the same value.
-// On failure we fall back to the bare URL: those clients still work read-only,
-// which beats failing the whole install.
+// On failure we fall back to the bare URL: those clients connect but are told
+// to re-run the installer, which beats failing the whole install.
 // Only a VALIDATED tokened URL is cached. Caching the fallback was a silent
 // read-only trap: if the very first call happened while the service binary was
 // missing or AV-locked (it is written milliseconds earlier and is ~90 MB), the

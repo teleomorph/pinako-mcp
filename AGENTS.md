@@ -11,7 +11,7 @@ You probably don't need this codebase at all:
 
 - **Local bridge already installed?** Connect your MCP client to
   `http://127.0.0.1:37421/mcp` (the installer appends a machine-local access
-  token to the configured URL; without it the surface is read-only).
+  token to the configured URL; without it every tool refuses, with a message).
 - **No install:** use the hosted Remote MCP Connector at
   `https://connect.pinako.pro/mcp` (OAuth sign-in; name it "Pinako (cloud)").
 - Tool list with descriptions: https://pinako.pro/.well-known/mcp/server-card.json

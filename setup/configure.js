@@ -25,7 +25,7 @@ import { buildMcpUrl } from './token.js';
 // Still resolved ONCE PER RUN rather than per writer, so a rotation racing a
 // configure pass cannot split the client table across two different tokens.
 // Falls back to the bare URL if the token file can't be created — that client
-// still works, read-only, instead of failing the install outright.
+// connects and is told to re-run the installer, instead of the install failing.
 let MCP_URL = buildMcpUrl();
 
 // ─── Server key ──────────────────────────────────────────────────────────────
