@@ -5680,7 +5680,7 @@ const activeSessionProfiles = new Map(); // sessionId → MCP profile ('default'
 // ─── Idle MCP sessions are closed ─────────────────────────────────────────────
 // A session used to end only when its client sent DELETE, and most clients
 // never do: an AI app that quits, crashes or restarts just stops talking. Each
-// session holds a whole McpServer (every tool and its schemas, about 2.7 MB),
+// session holds a whole McpServer (every tool and its schemas, about 2.5 MB),
 // so the leader kept every session it had ever served. Measured 2026-10-03: a
 // leader 32 hours old held 1,162 of them in a 3.2 GB heap whose limit is 4.3 GB.
 //
