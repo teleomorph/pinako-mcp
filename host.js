@@ -5677,6 +5677,66 @@ const activeSessions = new Map(); // sessionId → StreamableHTTPServerTransport
 const activeServers = new Map();  // sessionId → McpServer
 const activeSessionProfiles = new Map(); // sessionId → MCP profile ('default' or a defined name)
 
+// ─── Idle MCP sessions are closed ─────────────────────────────────────────────
+// A session used to end only when its client sent DELETE, and most clients
+// never do: an AI app that quits, crashes or restarts just stops talking. Each
+// session holds a whole McpServer (every tool and its schemas, about 2.7 MB),
+// so the leader kept every session it had ever served. Measured 2026-10-03: a
+// leader 32 hours old held 1,162 of them in a 3.2 GB heap whose limit is 4.3 GB.
+//
+// The rule: a session with NO request open for MCP_SESSION_IDLE_MS is closed,
+// and at most MCP_SESSION_IDLE_MAX idle sessions are kept (the oldest go first).
+// A client's GET push stream is an open request for as long as it lasts, so a
+// live client holding one (Claude Code does, and so does the --stdio-mcp shim)
+// is never closed however long its user pauses. A closed session answers 404,
+// which the MCP spec tells the client to treat as "initialize again"; the shim
+// does (STALE_SESSION_RE), and so does Claude Code from 2.1.233
+// (anthropics/claude-code#83404).
+//
+// The sweep runs when a session is created, the only moment the count grows,
+// so an idle bridge runs no timer for it. The PINAKO_MCP_SESSION_IDLE_* env
+// overrides exist for tests (same idiom as PINAKO_MCP_PORT).
+const MCP_SESSION_IDLE_MS = Number(process.env.PINAKO_MCP_SESSION_IDLE_MS) > 0
+  ? Number(process.env.PINAKO_MCP_SESSION_IDLE_MS)
+  : 60 * 60_000;
+const _idleMaxEnv = process.env.PINAKO_MCP_SESSION_IDLE_MAX;
+const MCP_SESSION_IDLE_MAX = (_idleMaxEnv && Number.isInteger(Number(_idleMaxEnv)) && Number(_idleMaxEnv) >= 0)
+  ? Number(_idleMaxEnv)
+  : 32;
+const sessionActivity = new Map(); // sessionId → { open: requests in flight, lastSeen: ms }
+
+// Count one request against a session until its response closes.
+function _trackSessionRequest(sessionId, res) {
+  let a = sessionActivity.get(sessionId);
+  if (!a) { a = { open: 0, lastSeen: Date.now() }; sessionActivity.set(sessionId, a); }
+  a.open++;
+  a.lastSeen = Date.now();
+  res.once('close', () => {
+    a.open = Math.max(0, a.open - 1);
+    a.lastSeen = Date.now();
+  });
+}
+
+function _closeIdleSessions(now = Date.now()) {
+  const idle = [];
+  for (const [id, a] of sessionActivity) if (a.open === 0) idle.push([id, a.lastSeen]);
+  if (idle.length === 0) return;
+  idle.sort((x, y) => x[1] - y[1]); // oldest first
+  let overCap = idle.length - MCP_SESSION_IDLE_MAX;
+  let closed = 0;
+  for (const [id, lastSeen] of idle) {
+    if (overCap <= 0 && now - lastSeen < MCP_SESSION_IDLE_MS) break; // the rest are younger still
+    overCap--;
+    const t = activeSessions.get(id);
+    if (!t) { sessionActivity.delete(id); continue; }
+    closed++;
+    // close() runs the transport's onclose synchronously, which drops the
+    // session from every map here and logs "MCP session closed".
+    t.close().catch(() => {});
+  }
+  if (closed) log(`Closed ${closed} idle MCP session(s); ${activeSessions.size} remain.`);
+}
+
 // Resource URI scheme. Five fixed URIs mirror the five cache slices the
 // bridge tracks. Clients can subscribe to any subset; notifications fire
 // only for the resources whose data actually changed (based on which
@@ -6402,6 +6462,7 @@ const httpServer = http.createServer(async (req, res) => {
         if (sessionId && activeSessions.has(sessionId) && activeSessionProfiles.get(sessionId) === mcpProfile) {
           // Existing session — reuse its transport
           transport = activeSessions.get(sessionId);
+          _trackSessionRequest(sessionId, res);
         } else if (parsed?.method === 'initialize') {
           // New session — create a fresh transport + McpServer pair
           const srv = createMcpServer(mcpProfile);
@@ -6415,6 +6476,10 @@ const httpServer = http.createServer(async (req, res) => {
               activeServers.set(id, srv);
               activeSessionProfiles.set(id, mcpProfile);
               log(`MCP session created: ${id}`);
+              // This initialize is the new session's first open request, so
+              // the sweep below can never close the session it just made.
+              _trackSessionRequest(id, res);
+              _closeIdleSessions();
             },
             enableJsonResponse: true,
           });
@@ -6425,6 +6490,7 @@ const httpServer = http.createServer(async (req, res) => {
               activeServers.delete(id);
               activeSessionProfiles.delete(id);
               authedSessions.delete(id);
+              sessionActivity.delete(id);
               log(`MCP session closed: ${id}`);
             }
           };
@@ -6480,6 +6546,7 @@ const httpServer = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found — reinitialize.' }, id: null }));
         return;
       }
+      _trackSessionRequest(sessionId, res); // a GET push stream keeps its session open for as long as it lasts
       await transport.handleRequest(req, res);
       log(`${req.method} /mcp done`);
     } catch (e) {
