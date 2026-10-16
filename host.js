@@ -2366,13 +2366,19 @@ function _countNodesDeep(treeOrNode) {
 // (chrome.bookmarks' outer root, unnamed Pinako windows) are skipped so
 // "Bookmarks bar" prefixes don't pollute the path; "Other Bookmarks" and
 // "Mobile Bookmarks" (which DO carry signal vs Bookmarks bar) are preserved.
+//
+// Incognito nodes are skipped with their whole subtree. The extension sends
+// incognito rows to the Bridge on purpose and relies on the Bridge to hide
+// them (getTree does it for the other readers), so this scan, which reads the
+// raw cached tree, must do the same or a duplicate set would name an incognito
+// tab's URL, title, id and parent path to the agent.
 function _findDuplicateUrls(tree) {
   // url → array of { id, title, parentPath }
   const urlMap = new Map();
   let scanned = 0;
   const pathStack = [];
   function walk(node) {
-    if (!node) return;
+    if (!node || node.incognito) return;
     const url = node && typeof node.url === 'string' ? node.url : '';
     if (url.length > 0) {
       scanned++;
@@ -2446,7 +2452,7 @@ function _findDuplicateUrlsCrossScope(scopedTrees) {
   for (const { tree, sourceScope, sourceLibraryId } of scopedTrees) {
     const pathStack = [];
     function walk(node) {
-      if (!node) return;
+      if (!node || node.incognito) return; // incognito never reaches an agent, subtree included
       const url = node && typeof node.url === 'string' ? node.url : '';
       if (url.length > 0) {
         scanned++;
