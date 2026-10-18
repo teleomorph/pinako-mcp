@@ -3372,6 +3372,27 @@ function getTree(data, includeGhost = true) {
   return filterNodes(tree);
 }
 
+// The extension pushes its whole in-memory tree and libraries to the Bridge,
+// incognito rows included, and relies on the Bridge to keep them from agents.
+// getTree, containerOutline, the search walks and the summary each skip them on
+// their own; a reader that hands out RAW cached nodes goes through this first.
+// Drops an incognito node with its whole subtree, at any depth, and leaves
+// every other node exactly as cached. Returns new arrays; the cache is never
+// mutated. Libraries only hold flagged rows as legacy clones (copying an
+// incognito tab into a library is blocked), but those must not leak either.
+function _withoutIncognito(nodes) {
+  if (!Array.isArray(nodes)) return nodes;
+  const out = [];
+  for (const n of nodes) {
+    if (n && typeof n === 'object' && n.incognito) continue;
+    out.push(n && Array.isArray(n.children) ? { ...n, children: _withoutIncognito(n.children) } : n);
+  }
+  return out;
+}
+function _libraryWithoutIncognito(lib) {
+  return lib && Array.isArray(lib.children) ? { ...lib, children: _withoutIncognito(lib.children) } : lib;
+}
+
 // Container outline for get_tree / get_library `containers_only:true`: every
 // non-tab node (window, group, tabgroup, folder, library-folder), nested as in
 // the tree, each with the count of tabs anywhere beneath it (tabs nested under
@@ -4349,7 +4370,7 @@ function createMcpServer(profile) {
       const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
-      const libs = (r.data.libraries || []).map(lib => {
+      const libs = (r.data.libraries || []).map(_libraryWithoutIncognito).map(lib => {
         const entry = {
           id:          lib.id,
           title:       lib.title,
@@ -4438,7 +4459,7 @@ function createMcpServer(profile) {
       const shapeOpts = _extractShapeOpts(args);
       const r = resolveBrowserData(browser);
       if (r.error) return r.error;
-      const lib = (r.data.libraries || []).find(l => l.id === library_id);
+      const lib = _libraryWithoutIncognito((r.data.libraries || []).find(l => l.id === library_id));
       if (!lib) return { content: [{ type: 'text', text: `Library not found: ${library_id} (in ${r.data.browserBrand})` }], isError: true };
 
       if (args.containers_only === true) {
@@ -5072,7 +5093,7 @@ function createMcpServer(profile) {
       return _resourceJsonContents(uri, {
         browser:   r.data.browserBrand,
         browserId: r.data.browserId,
-        tree:      r.data.tree || [],
+        tree:      _withoutIncognito(r.data.tree || []),
         updatedAt: r.data.updatedAt,
       });
     }
@@ -5102,7 +5123,7 @@ function createMcpServer(profile) {
       }));
       return _resourceJsonContents(uri, {
         browser:     r.data.browserBrand,
-        libraries:   r.data.libraries || [],
+        libraries:   (r.data.libraries || []).map(_libraryWithoutIncognito),
         groups,
         panel_order: r.data.libraryPanelOrder || [],
         updatedAt:   r.data.updatedAt,
