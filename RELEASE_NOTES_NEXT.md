@@ -1,3 +1,3 @@
 ## What's new
 
-- **The Bridge no longer grows in memory the longer it runs.** Each time an AI app connected, the Bridge kept that connection's state, even after the app quit or restarted without saying goodbye (most do). Over a day or two this could add up to several gigabytes. Connections left idle for an hour are now closed, and only a small number of idle ones are kept. An AI app that comes back after a long pause simply reconnects on its own, so nothing changes for you.
+- **Incognito tabs stay out of what AI apps see, everywhere.** Pinako already left incognito windows and tabs out of the tree an AI app reads, but four other places could still show them: the duplicate finder, the tree and libraries resources, and the library tools (get_library and list_libraries). They now leave incognito windows and tabs out too, so an AI app never sees their titles or addresses.
