@@ -70,7 +70,7 @@ const bridges = [];
 // stayed invisible after a handover.
 function spawnBridge(label, browserId, brand) {
   const child = spawn(process.execPath, [HOST_JS], { env: ENV, stdio: ['pipe', 'pipe', 'pipe'] });
-  const b = { label, browserId, brand, child, getTrees: 0, exited: false };
+  const b = { label, browserId, brand, child, getTrees: 0, versions: [], exited: false };
   child.on('exit', () => { b.exited = true; });
   child.stderr.on('data', () => {});
   const send = (obj) => {
@@ -90,6 +90,9 @@ function spawnBridge(label, browserId, brand) {
       if (!msg) continue;
       if (msg.type === 'getTree') {
         b.getTrees++;
+        // Every getTree says which Bridge this is (askForTree in host.js),
+        // whatever the process's role, and that it runs from source here.
+        b.versions.push(`${msg.bridgeVersion} packaged=${msg.bridgePackaged}`);
         send({
           type: 'treeResponse', browserId, browserBrand: brand, userTier: 4, userId: '',
           data: {
@@ -192,6 +195,16 @@ async function main() {
   const counts = bridges.map(x => `${x.label}:${x.getTrees}`).join(' ');
   check(`no Bridge asked its browser for more than 3 snapshots (${counts})`,
     bridges.every(x => x.getTrees <= 3), true);
+
+  // ── Every Bridge says its version, every time it asks ──
+  // Pinako's "the AI Bridge needs an update" notice reads it. A leader, a
+  // forwarder, one promoted and one registering again all ask here.
+  console.log('\n  The Bridge says its version');
+  const version = JSON.parse(fs.readFileSync(path.join(path.dirname(HOST_JS), 'package.json'), 'utf8')).version;
+  check('every getTree carried the version, and that it runs from source',
+    bridges.every(x => x.versions.length > 0 && x.versions.every(v => v === `${version} packaged=false`)), true);
+  check('a Bridge that only forwarded and one that asked again are both covered',
+    bridges.length >= 3 && bridges.some(x => x.getTrees > 1), true);
 }
 
 main()

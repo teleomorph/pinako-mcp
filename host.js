@@ -865,6 +865,14 @@ if (!HOOK_NAME) {
   });
 }
 
+// Every getTree says which Bridge this is, so Pinako can say when it is too old
+// (Pinako/bridge-update.js). Extensions before that field ignore it. A Bridge
+// run from source says so: there is no download to send it to. Leader and
+// forwarder alike: each browser hears from the process it started.
+function askForTree() {
+  nmWrite({ type: 'getTree', bridgeVersion: pkg.version, bridgePackaged: !!process.pkg });
+}
+
 function nmWrite(obj) {
   // In --stdio-mcp mode stdout IS the MCP stdio channel to the AI client —
   // no extension is attached, and a length-prefixed NM frame written here
@@ -1795,7 +1803,7 @@ function _reRegisterWithLeader() {
   _reRegisterAt = now;
   _reRegisterBackoffMs = Math.min(_reRegisterBackoffMs ? _reRegisterBackoffMs * 2 : 30_000, 10 * 60_000);
   log('The leader has no registration for this browser (it changed hands). Asking the browser for a fresh snapshot to register again.');
-  nmWrite({ type: 'getTree' });
+  askForTree();
 }
 
 function _ensureSseConnection() {
@@ -6703,7 +6711,7 @@ async function tryBindOrForward(initialAttempt) {
     if (sseClientReq) { try { sseClientReq.destroy(); } catch (_) {} sseClientReq = null; }
     extensionConnected = true;
     process.stderr.write(`[pinako-mcp] Listening on http://127.0.0.1:${MCP_PORT}/mcp\n`);
-    nmWrite({ type: 'getTree' });
+    askForTree();
     return;
   }
   if (r.error && r.error.code === 'EADDRINUSE') {
@@ -6748,7 +6756,7 @@ async function tryBindOrForward(initialAttempt) {
           req.write(body); req.end();
         }).catch(() => {});
       };
-      nmWrite({ type: 'getTree' });
+      askForTree();
       // Start promotion polling so we can take over when the leader dies.
       if (!promoteTimer) {
         promoteTimer = setInterval(() => { tryBindOrForward(false).catch(() => {}); }, PROMOTE_RETRY_MS);
