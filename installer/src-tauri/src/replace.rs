@@ -42,8 +42,10 @@ fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Files an earlier run renamed out of the way: `<name>.old-<digits>`, nothing else.
-fn old_copies(path: &Path) -> Vec<PathBuf> {
-    let prefix = sibling(path, ".old-").file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+fn old_copies(path: &Path) -> Vec<PathBuf> { numbered(path, ".old-") }
+
+fn numbered(path: &Path, suffix: &str) -> Vec<PathBuf> {
+    let prefix = sibling(path, suffix).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let Some(Ok(dir)) = path.parent().map(std::fs::read_dir) else { return Vec::new() };
     dir.flatten()
         .map(|e| e.path())
@@ -64,11 +66,36 @@ pub fn delete_old_copies(path: &Path) {
     }
 }
 
+/// An installer closed between the two renames leaves no file at `path` and
+/// the working one under its old name: put the newest of those back.
+fn recover(path: &Path) {
+    if path.exists() { return; }
+    let stamp = |p: &PathBuf| -> u128 {
+        p.to_string_lossy().rsplit('-').next().and_then(|d| d.parse().ok()).unwrap_or(0)
+    };
+    if let Some(old) = old_copies(path).into_iter().max_by_key(stamp) { let _ = rename_retry(&old, path); }
+}
+
+/// New files an interrupted run never moved in. Only stale ones: a second
+/// installer open right now may still be writing its own.
+fn delete_stale_new(path: &Path) {
+    for p in numbered(path, ".new-") {
+        let stale = std::fs::metadata(&p).and_then(|m| m.modified()).ok()
+            .and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(3600));
+        if stale { let _ = std::fs::remove_file(&p); }
+    }
+}
+
 /// Write `bytes` at `path`. On any error the file that was there is still there.
 pub fn replace_binary(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let fresh = sibling(path, ".new");
+    recover(path);
+    delete_stale_new(path);
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    // Its own name each time, and never one that exists: two installers open at
+    // once must not write into the same file.
+    let fresh = sibling(path, &format!(".new-{}{stamp}", std::process::id()));
     let written = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&fresh)?;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&fresh)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         #[cfg(unix)]
@@ -83,7 +110,6 @@ pub fn replace_binary(path: &Path, bytes: &[u8]) -> Result<(), String> {
         return Err(format!("could not write the new file: {e}"));
     }
 
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let aside = sibling(path, &format!(".old-{stamp}"));
     let had_old = path.exists();
     if had_old {
@@ -112,9 +138,15 @@ fn is_ours(candidate: &str, path: &Path) -> bool {
         let s = s.strip_suffix(" (deleted)").unwrap_or(s);
         if cfg!(windows) { s.replace('/', "\\").to_lowercase() } else { s.to_string() }
     };
-    let ours = norm(&path.to_string_lossy());
+    // The system reports the real path; ours may go through a link (a moved
+    // profile, a linked home folder).
+    let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let c = norm(candidate);
-    match c.strip_prefix(&ours) {
+    [path, real.as_path()].iter().any(|p| same_file_name(&c, &norm(&p.to_string_lossy())))
+}
+
+fn same_file_name(candidate: &str, ours: &str) -> bool {
+    match candidate.strip_prefix(ours) {
         Some("") => true,
         Some(rest) => rest
             .strip_prefix(".old-")
@@ -170,13 +202,13 @@ mod imp {
         (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
     }
 
-    fn pids() -> Vec<u32> {
+    fn pids() -> Option<Vec<u32>> {
         let mut out = Vec::new();
         // SAFETY: the entry's size field is set before the first call, and the
         // snapshot handle is closed on the way out.
         unsafe {
             let snap = CreateToolhelp32Snapshot(SNAPPROCESS, 0);
-            if snap.is_null() || snap as isize == -1 { return out; }
+            if snap.is_null() || snap as isize == -1 { return None; }
             let mut e: ProcessEntry32W = std::mem::zeroed();
             e.size = std::mem::size_of::<ProcessEntry32W>() as u32;
             let mut more = Process32FirstW(snap, &mut e);
@@ -186,25 +218,31 @@ mod imp {
             }
             CloseHandle(snap);
         }
-        out
+        Some(out)
     }
 
     pub fn stop(path: &Path) -> bool {
         let mut all_gone = true;
         let mut stopping = Vec::new();
-        for pid in pids() {
-            // SAFETY: the handle is checked, and closed on every path. The path
-            // is read from the same handle that is terminated, so a reused pid
-            // can never be the one stopped.
+        let Some(pids) = pids() else { return false };
+        for pid in pids {
+            // SAFETY: handles are checked, and closed on every path. The query
+            // handle stays open past the second OpenProcess, which keeps the
+            // pid from being reused in between.
             unsafe {
-                let h = OpenProcess(QUERY_LIMITED | SYNCHRONIZE | TERMINATE, 0, pid);
-                if h.is_null() { continue; }
-                if image_path(h).is_some_and(|p| is_ours(&p, path)) {
-                    TerminateProcess(h, 1);
-                    stopping.push(h);
-                } else {
-                    CloseHandle(h);
+                let q = OpenProcess(QUERY_LIMITED, 0, pid);
+                if q.is_null() { continue; }
+                if image_path(q).is_some_and(|p| is_ours(&p, path)) {
+                    // Refused when it runs with more rights (an elevated browser).
+                    let h = OpenProcess(SYNCHRONIZE | TERMINATE, 0, pid);
+                    if h.is_null() {
+                        all_gone = false;
+                    } else {
+                        TerminateProcess(h, 1);
+                        stopping.push(h);
+                    }
                 }
+                CloseHandle(q);
             }
         }
         for h in stopping {
@@ -225,37 +263,38 @@ mod imp {
     use std::process::Command;
     use std::time::Duration;
 
-    fn ours(path: &Path) -> Vec<String> {
+    fn ours(path: &Path) -> Option<Vec<String>> {
         #[cfg(target_os = "linux")]
         {
-            let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
-            dir.flatten()
+            let dir = std::fs::read_dir("/proc").ok()?;
+            Some(dir.flatten()
                 .filter(|e| e.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit()))
                 .filter(|e| std::fs::read_link(e.path().join("exe")).is_ok_and(|p| is_ours(&p.to_string_lossy(), path)))
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
+                .collect())
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let Ok(o) = Command::new("ps").args(["-axo", "pid=,comm="]).output() else { return Vec::new() };
-            String::from_utf8_lossy(&o.stdout)
+            let o = Command::new("ps").args(["-axo", "pid=,comm="]).output().ok()?;
+            Some(String::from_utf8_lossy(&o.stdout)
                 .lines()
                 .filter_map(|l| l.trim().split_once(' ').map(|(p, c)| (p.to_string(), c.trim().to_string())))
                 .filter(|(_, c)| is_ours(c, path))
                 .map(|(p, _)| p)
-                .collect()
+                .collect())
         }
     }
 
     pub fn stop(path: &Path) -> bool {
         for signal in ["-TERM", "-KILL"] {
-            for pid in ours(path) { let _ = Command::new("kill").args([signal, &pid]).output(); }
+            let Some(pids) = ours(path) else { return false };
+            for pid in pids { let _ = Command::new("kill").args([signal, &pid]).output(); }
             for _ in 0..25 {
-                if ours(path).is_empty() { return true; }
+                if ours(path).is_some_and(|p| p.is_empty()) { return true; }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-        ours(path).is_empty()
+        ours(path).is_some_and(|p| p.is_empty())
     }
 }
 
@@ -296,7 +335,20 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"two");
         delete_old_copies(&p);
         assert!(old_copies(&p).is_empty());
-        assert!(!sibling(&p, ".new").exists());
+        assert!(numbered(&p, ".new-").is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_swap_is_put_right() {
+        let p = folder("interrupted").join("svc.exe");
+        std::fs::write(sibling(&p, ".old-5"), b"older").unwrap();
+        std::fs::write(sibling(&p, ".old-40"), b"newest").unwrap();
+        recover(&p);
+        assert_eq!(std::fs::read(&p).unwrap(), b"newest");
+        std::fs::write(sibling(&p, ".new-7"), b"another installer, still writing").unwrap();
+        replace_binary(&p, b"new").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new");
+        assert!(sibling(&p, ".new-7").exists());
     }
 
     #[test]
@@ -322,14 +374,11 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_swap_leaves_the_old_file() {
-        // The target is a folder that cannot be renamed over by a file and the
-        // new file cannot be written because its name is taken by a folder.
-        let p = folder("fails").join("svc.exe");
-        std::fs::write(&p, b"old").unwrap();
-        std::fs::create_dir(sibling(&p, ".new")).unwrap();
+    fn a_failed_write_is_reported() {
+        // No folder to write into.
+        let p = folder("fails").join("gone").join("svc.exe");
         assert!(replace_binary(&p, b"new").is_err());
-        assert_eq!(std::fs::read(&p).unwrap(), b"old");
+        assert!(!p.exists());
     }
 
     #[cfg(windows)]
@@ -342,7 +391,7 @@ mod tests {
         assert!(replace_binary(&p, b"new").is_err());
         drop(lock);
         assert_eq!(std::fs::read(&p).unwrap(), b"old");
-        assert!(!sibling(&p, ".new").exists());
+        assert!(numbered(&p, ".new-").is_empty());
         replace_binary(&p, b"new").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"new");
     }

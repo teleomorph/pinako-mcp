@@ -24,20 +24,25 @@ assert.equal(fs.readFileSync(plain, 'utf8'), 'two');
 deleteOldCopies(plain);
 assert.deepEqual(listing(a), [`svc${exe}`]);
 
-// A failure before the swap keeps the old file.
-fs.mkdirSync(`${plain}.new`);
-assert.throws(() => replaceBinary(plain, Buffer.from('three')));
-assert.equal(fs.readFileSync(plain, 'utf8'), 'two');
-fs.rmdirSync(`${plain}.new`);
+// A failure before the swap moves nothing.
+assert.throws(() => replaceBinary(path.join(a, 'gone', 'svc'), Buffer.from('three')));
 
-// A failure of the second rename puts the old file back.
+// A failure of the second rename puts the old file back. Started from an
+// interrupted swap (the file only under its old names), with another installer
+// still writing a file of its own.
+fs.renameSync(plain, `${plain}.old-40`);
+fs.writeFileSync(`${plain}.old-5`, 'older');
+fs.writeFileSync(`${plain}.new-7`, 'someone else');
 const realRename = fs.renameSync;
 fs.renameSync = (from, to) => {
-  if (String(from).endsWith('.new')) { const e = new Error('pretend'); e.code = 'ENOENT'; throw e; }
+  if (/\.new-\d+$/.test(String(from))) { const e = new Error('pretend'); e.code = 'ENOENT'; throw e; }
   return realRename(from, to);
 };
 try { assert.throws(() => replaceBinary(plain, Buffer.from('four')), /pretend/); } finally { fs.renameSync = realRename; }
 assert.equal(fs.readFileSync(plain, 'utf8'), 'two');
+assert.equal(fs.readFileSync(`${plain}.new-7`, 'utf8'), 'someone else');
+fs.unlinkSync(`${plain}.new-7`);
+deleteOldCopies(plain);
 assert.deepEqual(listing(a), [`svc${exe}`]);
 
 // Only our own leftovers are swept.

@@ -29,9 +29,11 @@ function renameRetry(from, to) {
 }
 
 // Files an earlier run renamed out of the way: <name>.old-<digits>, nothing else.
-function oldCopies(file) {
+const oldCopies = (file) => numbered(file, '.old-');
+
+function numbered(file, suffix) {
   const dir = path.dirname(file);
-  const prefix = `${path.basename(file)}.old-`;
+  const prefix = path.basename(file) + suffix;
   let names = [];
   try { names = fs.readdirSync(dir); } catch (_) {}
   return names.filter((n) => n.startsWith(prefix) && /^\d+$/.test(n.slice(prefix.length))).map((n) => path.join(dir, n));
@@ -46,12 +48,33 @@ export function deleteOldCopies(file) {
   }
 }
 
+// An installer closed between the two renames leaves no file at `file` and the
+// working one under its old name: put the newest of those back.
+function recover(file) {
+  if (fs.existsSync(file)) return;
+  const stamp = (p) => Number(p.slice(p.lastIndexOf('-') + 1));
+  const newest = oldCopies(file).sort((a, b) => stamp(b) - stamp(a))[0];
+  if (newest) { try { renameRetry(newest, file); } catch (_) {} }
+}
+
+// New files an interrupted run never moved in. Only stale ones: a second
+// installer open right now may still be writing its own.
+function deleteStaleNew(file) {
+  for (const p of numbered(file, '.new-')) {
+    try { if (Date.now() - fs.statSync(p).mtimeMs > 3600_000) fs.unlinkSync(p); } catch (_) {}
+  }
+}
+
 /** Write `bytes` at `file`. When this throws, the file that was there is still there. */
 export function replaceBinary(file, bytes) {
-  const fresh = `${file}.new`;
+  recover(file);
+  deleteStaleNew(file);
+  // Its own name each time, and never one that exists: two installers open at
+  // once must not write into the same file.
+  const fresh = `${file}.new-${process.pid}${Date.now()}`;
   const dropFresh = () => { try { fs.unlinkSync(fresh); } catch (_) {} };
   try {
-    const fd = fs.openSync(fresh, 'w', 0o755);
+    const fd = fs.openSync(fresh, 'wx', 0o755);
     try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     if (process.platform !== 'win32') fs.chmodSync(fresh, 0o755);
   } catch (e) { dropFresh(); throw e; }
@@ -76,17 +99,23 @@ export function isOurs(candidate, file, platform = process.platform) {
     const t = s.replace(/^\\\\\?\\/, '').replace(/ \(deleted\)$/, '');
     return platform === 'win32' ? t.replace(/\//g, '\\').toLowerCase() : t;
   };
-  const ours = norm(file), c = norm(candidate);
-  if (!c.startsWith(ours)) return false;
-  const rest = c.slice(ours.length);
-  return rest === '' || /^\.old-\d+$/.test(rest);
+  // The system reports the real path; ours may go through a link (a moved
+  // profile, a linked home folder).
+  let real = file;
+  try { real = fs.realpathSync(file); } catch (_) {}
+  const c = norm(candidate);
+  return [file, real].some((f) => {
+    const ours = norm(f);
+    return c.startsWith(ours) && /^(\.old-\d+)?$/.test(c.slice(ours.length));
+  });
 }
 
+// null = the list could not be read, so nobody can say what is running.
 function ourPids(file) {
   const out = [];
   if (process.platform === 'linux') {
     let names = [];
-    try { names = fs.readdirSync('/proc').filter((n) => /^\d+$/.test(n)); } catch (_) {}
+    try { names = fs.readdirSync('/proc').filter((n) => /^\d+$/.test(n)); } catch (_) { return null; }
     for (const n of names) {
       try { if (isOurs(fs.readlinkSync(`/proc/${n}/exe`), file)) out.push(Number(n)); } catch (_) {}
     }
@@ -99,7 +128,8 @@ function ourPids(file) {
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path } | ForEach-Object { \"$($_.Id) $($_.Path)\" }"],
       { encoding: 'utf8', timeout: 30_000, windowsHide: true })
     : spawnSync('ps', ['-axo', 'pid=,comm='], { encoding: 'utf8', timeout: 30_000 });
-  for (const line of String((r && r.stdout) || '').split(/\r?\n/)) {
+  if (!r || r.error || !String(r.stdout || '').trim()) return null;
+  for (const line of String(r.stdout).split(/\r?\n/)) {
     const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
     if (m && isOurs(m[2], file)) out.push(Number(m[1]));
   }
@@ -121,7 +151,9 @@ const running = (pid) => {
  * is not ours to stop. Returns false when one of them is still running.
  */
 export function stopProcesses(file) {
-  let pids = ourPids(file).filter((p) => p !== process.pid);
+  let pids = ourPids(file);
+  if (!pids) return false;
+  pids = pids.filter((p) => p !== process.pid);
   for (const signal of ['SIGTERM', 'SIGKILL']) {
     for (const p of pids) { try { process.kill(p, signal); } catch (_) {} }
     for (let i = 0; i < 25 && pids.length; i++) {

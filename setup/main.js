@@ -119,6 +119,7 @@ async function main() {
       fs.mkdirSync(PINAKO_DIR, { recursive: true });
       replaceBinary(SERVICE_PATH, Buffer.from(serviceExeBase64, 'base64'));
       serviceError = null;
+      process.exitCode = 0;
       console.log(ok);
     } catch (e) {
       serviceError = e;
@@ -133,6 +134,7 @@ async function main() {
       console.log('');
     }
     if (!serviceError) break;
+    process.exitCode = 1; // Ctrl+D at the question ends the program here
     if (!process.stdin.isTTY) process.exit(1);
     const again = await ask('  Try again? [Y/n]  ');
     if (again.trim().toLowerCase() === 'n') process.exit(1);
