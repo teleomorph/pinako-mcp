@@ -381,8 +381,15 @@
 
     <!-- Screen 2: Installing -->
     <div class="screen" id="s-installing">
-      <h2>Installing…</h2>
+      <h2 id="installing-title">Installing…</h2>
       <div class="log-box" id="install-log"></div>
+      <div id="install-failed" role="alert" hidden>
+        <p class="lead" id="install-failed-text"></p>
+        <details>
+          <summary>Details</summary>
+          <p id="install-failed-details"></p>
+        </details>
+      </div>
     </div>
 
     <!-- Screen 3: Done -->

@@ -1,6 +1,8 @@
 // Prevents a second console window from appearing on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod replace;
+
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -346,27 +348,18 @@ fn detect_clients() -> Vec<ClientInfo> {
     ]
 }
 
-// ── Process management ───────────────────────────────────────────────────────
-
-fn kill_service(name: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", name, "/F"])
-            .output();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("pkill")
-            .args(["-f", name])
-            .output();
-    }
+/// Why an install stopped. `had_previous` says whether a Bridge is still there
+/// to fall back on, so the wizard never claims one that does not exist.
+#[derive(Serialize)]
+struct InstallError {
+    message: String,
+    had_previous: bool,
 }
 
 /// Run the full installation with the user-selected client IDs.
 /// Returns a log of result lines for display in the wizard.
 #[tauri::command]
-fn install(selected_ids: Vec<String>) -> Result<Vec<String>, String> {
+fn install(selected_ids: Vec<String>) -> Result<Vec<String>, InstallError> {
     let mut log = Vec::<String>::new();
     let h = home();
     let a = appdata();
@@ -374,37 +367,32 @@ fn install(selected_ids: Vec<String>) -> Result<Vec<String>, String> {
 
     // 1. Create Pinako data directory
     std::fs::create_dir_all(&pd)
-        .map_err(|e| format!("Failed to create Pinako directory: {e}"))?;
+        .map_err(|e| InstallError {
+            message: format!("Failed to create Pinako directory: {e}"),
+            had_previous: false,
+        })?;
 
-    // 2. Kill any running service before overwriting the binary
+    // 2. Put the new service in place, THEN stop the old one (replace.rs).
     let svc_name = service_binary_name();
     let service_path = pd.join(svc_name);
-    if service_path.exists() {
-        kill_service(svc_name);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-
-    // 3. Write the embedded service binary
-    std::fs::write(&service_path, SERVICE_BINARY)
-        .map_err(|e| format!("Failed to install {svc_name}: {e}"))?;
-
-    // On Linux/macOS, set executable permission
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&service_path, perms)
-            .map_err(|e| format!("Failed to set executable permission: {e}"))?;
-    }
+    replace::replace_binary(&service_path, SERVICE_BINARY).map_err(|e| InstallError {
+        message: format!("Failed to install {svc_name}: {e}"),
+        had_previous: service_path.exists(),
+    })?;
+    let stopped = replace::stop_processes(&service_path);
+    replace::delete_old_copies(&service_path);
     log.push("✓  Installed Pinako MCP service".into());
+    if !stopped {
+        log.push("⚠  The old AI Bridge is still running. Restart your browser and AI apps to switch to the new one.".into());
+    }
 
-    // 4. Register Chrome native messaging host
+    // 3. Register Chrome native messaging host
     match install_native_host(&pd, &service_path) {
         Ok(())  => log.push("✓  Registered Chrome native messaging host".into()),
         Err(e)  => log.push(format!("⚠  Native host skipped: {e}")),
     }
 
-    // 5. Configure each selected AI client
+    // 4. Configure each selected AI client
     for id in &selected_ids {
         match configure_client(id, &h, &a) {
             Ok(()) => {

@@ -5,6 +5,7 @@ const invoke = window.__TAURI__.core.invoke;
 
 let step = 0;           // 0=welcome 1=apps 2=installing 3=done
 let clients = [];       // ClientInfo[] from detect_clients command
+let failed = false;     // the last install attempt failed (screen 2 offers Try again)
 
 const SCREENS = ['s-welcome', 's-apps', 's-installing', 's-done'];
 
@@ -89,14 +90,15 @@ function showStep(s) {
   }
 }
 
-function back() {
+async function back() {
   if (step === 1) showStep(0);
+  else if (step === 2 && failed) await invoke('quit');
 }
 
 async function next() {
   if (step === 0) {
     showStep(1);
-  } else if (step === 1) {
+  } else if (step === 1 || (step === 2 && failed)) {
     await runInstall();
   } else if (step === 3) {
     await invoke('quit');
@@ -105,7 +107,33 @@ async function next() {
 
 // ── Installation ──────────────────────────────────────────────────────────────
 
+// A failed install stays on its own screen: moving on to "Installation
+// Complete" told people the update had worked when nothing had changed.
+function showFailure(err) {
+  failed = true;
+  const message = err && err.message ? err.message : String(err);
+  const hadPrevious = !!(err && err.had_previous);
+  document.getElementById('installing-title').textContent = hadPrevious ? 'Not updated' : 'Not installed';
+  document.getElementById('install-log').classList.add('hidden');
+  document.getElementById('install-failed-text').textContent = hadPrevious
+    ? 'The AI Bridge was not updated. Your current version is still in place. Try again after your next system reboot, or close your browsers and AI apps, then press Try again.'
+    : 'The AI Bridge was not installed. Try again after your next system reboot, or close your browsers and AI apps, then press Try again.';
+  document.getElementById('install-failed-details').textContent = message;
+  document.getElementById('install-failed').hidden = false;
+  const btnBack = document.getElementById('btn-back');
+  const btnNext = document.getElementById('btn-next');
+  btnBack.textContent = 'Close';
+  btnBack.classList.remove('hidden');
+  btnNext.textContent = 'Try again';
+  btnNext.classList.remove('hidden');
+}
+
 async function runInstall() {
+  failed = false;
+  document.getElementById('installing-title').textContent = 'Installing…';
+  document.getElementById('install-failed').hidden = true;
+  document.getElementById('install-log').classList.remove('hidden');
+  document.getElementById('btn-back').textContent = 'Back';
   showStep(2);
 
   const selectedIds = clients
@@ -125,7 +153,8 @@ async function runInstall() {
       appendLog(logBox, line);
     }
   } catch (err) {
-    appendLog(logBox, `Error: ${err}`);
+    showFailure(err);
+    return;
   }
 
   // #67: fill in the REAL server URL before showing the done screen. It used
