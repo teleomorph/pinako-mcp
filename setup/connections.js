@@ -116,7 +116,9 @@ function refreshEntry(kind, e, target) {
     if (Array.isArray(e.args)) out.args = e.args.map(a => (hasUrl(a) ? swapUrls(a, target) : a));
     return out;
   }
-  const want = shape(kind, { ...target, url: swapUrls(e[key], target) });
+  const url = swapUrls(e[key], target);
+  // Windsurf reads either spelling: keep the person's.
+  const want = kind === 'windsurf' ? { [key]: url } : shape(kind, { ...target, url });
   const out = {};
   for (const [k, v] of Object.entries(e)) {
     if (k in want) out[k] = want[k];

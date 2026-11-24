@@ -199,7 +199,13 @@ fn refresh_entry(kind: &str, e: &Map<String, Value>, t: &Target) -> Map<String, 
         }
         return out;
     };
-    let want = shape(kind, &swap_urls(str_of(e, key), t), t);
+    let now = swap_urls(str_of(e, key), t);
+    // Windsurf reads either spelling: keep the person's.
+    let want = if kind == "windsurf" {
+        Map::from_iter([(key.to_string(), json!(now))])
+    } else {
+        shape(kind, &now, t)
+    };
     let mut out = Map::new();
     for (k, v) in e {
         if let Some(w) = want.get(k) {
@@ -262,7 +268,7 @@ fn inspect_json(kind: &str, text: &str, target: Option<&Target>) -> Inspected {
 pub fn toml_header(line: &str) -> Option<Vec<String>> {
     let whole = re!(r#"^\s*\[\[?\s*((?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'.,=#\[\]]+)(?:\s*\.\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'.,=#\[\]]+))*)\s*\]\]?\s*(?:#.*)?$"#);
     let part = re!(r#""(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'.,=#\[\]]+"#);
-    let name = whole.captures(line)?.get(1)?.as_str().to_string();
+    let name = whole.captures(line.trim_start_matches('\u{feff}'))?.get(1)?.as_str().to_string();
     Some(part.find_iter(&name)
         .map(|p| p.as_str().trim_matches(|c| c == '"' || c == '\'').to_string())
         .collect())
