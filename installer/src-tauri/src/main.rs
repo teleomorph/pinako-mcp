@@ -405,6 +405,10 @@ fn refresh_via_claude_cli(path: &Path, target: &Target) -> Result<(), String> {
         if e.keys().any(|k| k != "type" && k != "url") || (now_url == url && entry["type"] == "http") {
             continue;
         }
+        // The command line is a shell's on Windows: only our own address goes there.
+        if now_url != format!("{MCP_BASE_URL}?token={}", target.token) {
+            continue;
+        }
         run_claude_cli(&["mcp", "remove", key, "--scope", "user"]);
         if run_claude_cli(&["mcp", "add", "--scope", "user", "--transport", "http", key, &now_url]) {
             continue;
@@ -1006,10 +1010,10 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
     match id {
         "claude-code" => configure_claude_code(home),
         "claude-desktop" => {
-            for path in claude_desktop_files(appdata) {
-                write_claude_desktop_config(&path)?;
-            }
-            Ok(())
+            // Only the file it reads: a new one in a home read earlier would
+            // hide the settings that are there.
+            let files = claude_desktop_files(appdata);
+            write_claude_desktop_config(files.iter().find(|f| f.exists()).unwrap_or(&files[0]))
         }
         "cursor" => {
             let path = home.join(".cursor").join("mcp.json");

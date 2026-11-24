@@ -297,7 +297,7 @@ fn inspect_toml(text: &str, target: Option<&Target>) -> Inspected {
     let lines: Vec<String> = text.split('\n').map(|line| {
         // Inside a multi-line string nothing is a table or an address of ours.
         for q in ["\"\"\"", "'''"] {
-            if quoted.is_some_and(|open| open != q) {
+            if quoted.is_some_and(|open| open != q) || (quoted.is_none() && line.trim().starts_with('#')) {
                 continue;
             }
             let odd = line.matches(q).count() % 2 == 1;

@@ -192,7 +192,7 @@ function inspectToml(text, target) {
   let inside = false, found = false, quoted = null;
   const lines = text.split('\n').map(line => {
     // Inside a multi-line string nothing is a table or an address of ours.
-    for (const q of ['"""', "'''"]) {
+    for (const q of !quoted && line.trim().startsWith('#') ? [] : ['"""', "'''"]) {
       if (quoted && quoted !== q) continue;
       const ends = line.split(q).length - 1;
       if (quoted === q) {

@@ -48,6 +48,8 @@ const codex = put(of('codex').configPath, `[mcp_servers.Pinako]\nurl = "${old}"\
 fs.mkdirSync(path.join(dir, '.grok'));
 const claude = put(of('claude-code').configPath, { big: 'BIG', mcpServers: { Pinako: { type: 'http', url: old } } });
 fs.writeFileSync(claude, fs.readFileSync(claude, 'utf8').replace('"BIG"', '9007199254740993'));
+// An address with shell characters never reaches a command line; its file is edited.
+const oddUrl = `${old}?token=OLD&x=1`;
 const oldClaude = put(path.join(dir, '.claude', 'settings.json'), { keep: 1, mcpServers: { pinako: { type: 'http', url: old } } });
 const profile = put(path.join(APPDATA, 'Code', 'User', 'profiles', 'abc', 'mcp.json'), { servers: { Pinako: { type: 'http', url: old } } });
 // The store app's own file is the one it reads; the older home holds a leftover.
@@ -92,6 +94,13 @@ assert.deepEqual([cursor, codex, claude, profile].map(p => fs.statSync(p).mtimeM
 
 // Claude Desktop moved out of both old homes: only its new one counts.
 if (process.platform === 'win32') {
+  // A store app with no settings of its own reads the classic file: no new one
+  // may appear in front of it.
+  fs.rmSync(path.join(storeDir, 'claude_desktop_config.json'));
+  const classicBefore = fs.readFileSync(deskOld, 'utf8');
+  assert.equal(configureClient(desk).ok, true);
+  assert.ok(!fs.existsSync(path.join(storeDir, 'claude_desktop_config.json')));
+  fs.writeFileSync(deskOld, classicBefore);
   put(path.join(storeDir, '.user-data-left.claude_x'), '');
   put(path.join(path.dirname(deskOld), '.user-data-left.claude_x'), '');
   const moved = put(path.join(dir, 'local', 'Claude-Data', 'claude_x', 'claude_desktop_config.json'), { keep: 1 });
@@ -105,6 +114,10 @@ if (process.platform === 'win32') {
   assert.ok(fs.readFileSync(moved, 'utf8').includes(token));
   assert.ok(!fs.readFileSync(deskOld, 'utf8').includes(token), 'wrote to a home the app left');
 }
+
+put(claude, { mcpServers: { Pinako: { type: 'http', url: oddUrl } } });
+refreshClients();
+assert.equal(JSON.parse(fs.readFileSync(claude, 'utf8')).mcpServers.Pinako.url, `${old}?token=${token}&x=1`);
 
 // No access key: a working entry is not traded for one without it.
 fs.rmSync(TOKEN_PATH);

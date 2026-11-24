@@ -7,7 +7,7 @@ let step = 0;           // 0=welcome 1=apps 2=installing 3=done
 let clients = [];       // ClientInfo[] from detect_clients command
 let update = false;     // the Bridge is already here: refresh what is connected, tick nothing
 let adding = false;     // "Connect more apps", after an update
-const notices = [];     // ⚠ lines of this run, for the done screen
+let notices = [];       // ⚠ lines of the install, for the done screen
 let failed = false;     // the last install attempt failed (screen 2 offers Try again)
 
 const SCREENS = ['s-welcome', 's-apps', 's-installing', 's-done'];
@@ -184,10 +184,10 @@ function startWork(title) {
 // The done screen repeats what did not go well: the log is gone in a moment.
 function showNotices(lines) {
   const box = document.getElementById('done-notices');
-  notices.push(...lines.filter(l => l.startsWith('⚠') && !notices.includes(l)));
+  const shown = lines.filter(l => l.startsWith('⚠'));
   box.innerHTML = '';
-  for (const line of notices) appendLog(box, line);
-  box.hidden = notices.length === 0;
+  for (const line of shown) appendLog(box, line);
+  box.hidden = shown.length === 0;
 }
 
 function notConnected() {
@@ -213,7 +213,8 @@ async function runInstall() {
     document.getElementById('done-lead').textContent = 'Pinako AI Bridge has been updated.';
     await detect();
   }
-  showNotices(lines);
+  notices = lines;
+  showNotices(notices);
 
   // #67: fill in the REAL server URL before showing the done screen. It used
   // to be hardcoded as the bare URL in index.html, which is the read-only
@@ -264,7 +265,8 @@ async function runConnect() {
   }
   for (const line of lines) appendLog(logBox, line);
   await detect();
-  showNotices(lines);
+  // Those of the install still stand; those of an earlier try here do not.
+  showNotices([...notices, ...lines]);
   setTimeout(() => showStep(3), 900);
 }
 

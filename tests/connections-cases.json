@@ -52,6 +52,7 @@
       "next": "[mcp_servers.Pinako]\nurl = \"http://127.0.0.1:37421/mcp?token=NEW\"\n[other.\"a\\\"b\"]\nurl = \"http://127.0.0.1:37421/mcp\"\n[été]\nurl = \"http://127.0.0.1:37421/mcp\"\n" },
     { "name": "codex: our table inside a multi-line string is text", "kind": "codex", "text": "[mcp_servers.x]\nargs = [\"\"\"\n[mcp_servers.Pinako]\nurl = \"http://127.0.0.1:37421/mcp\"\n\"\"\"]\n", "status": "no", "next": null },
     { "name": "codex: byte order mark", "kind": "codex", "text": "\ufeff[mcp_servers.Pinako]\nurl = \"http://127.0.0.1:37421/mcp\"\n", "status": "yes", "next": "\ufeff[mcp_servers.Pinako]\nurl = \"http://127.0.0.1:37421/mcp?token=NEW\"\n" },
+    { "name": "codex: quotes in a comment hide nothing", "kind": "codex", "text": "# a \"\"\" note\n[mcp_servers.Pinako]\nurl = \"http://127.0.0.1:37421/mcp?token=NEW\"\n", "status": "yes", "next": null },
     { "name": "codex: inline form", "kind": "codex", "text": "[mcp_servers]\npinako = { url = \"http://127.0.0.1:37421/mcp\" }\n", "status": "unreadable", "next": null },
     { "name": "codex: dotted form", "kind": "grok", "text": "mcp_servers.Pinako.url = \"http://127.0.0.1:37421/mcp\"\n", "status": "unreadable", "next": null },
     { "name": "codex: not connected", "kind": "codex", "text": "[mcp_servers.other]\nurl = \"http://x\"\n", "status": "no", "next": null },

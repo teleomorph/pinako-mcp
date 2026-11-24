@@ -382,19 +382,21 @@ const writers = {
   },
 
   'claude-desktop'(configPath) {
-    for (const p of claudeDesktopFiles({ configPath })) {
-      const config = readJson(p);
-      config.mcpServers = config.mcpServers || {};
-      // Claude Desktop only supports stdio MCP servers (command + args).
-      // Use the bundled pinako-mcp-service binary in --stdio-mcp mode as a
-      // self-contained stdio↔HTTP bridge — no Node.js dependency on the
-      // end user's machine.
-      putServerEntry(config.mcpServers, {
-        command: SERVICE_PATH,
-        args: ['--stdio-mcp', MCP_URL],
-      });
-      writeJson(p, config);
-    }
+    // Only the file it reads: a new one in a home read earlier would hide the
+    // settings that are there.
+    const files = claudeDesktopFiles({ configPath });
+    const p = files.find(f => fs.existsSync(f)) || files[0];
+    const config = readJson(p);
+    config.mcpServers = config.mcpServers || {};
+    // Claude Desktop only supports stdio MCP servers (command + args).
+    // Use the bundled pinako-mcp-service binary in --stdio-mcp mode as a
+    // self-contained stdio↔HTTP bridge — no Node.js dependency on the
+    // end user's machine.
+    putServerEntry(config.mcpServers, {
+      command: SERVICE_PATH,
+      args: ['--stdio-mcp', MCP_URL],
+    });
+    writeJson(p, config);
   },
 
   'cursor'(configPath) {
@@ -649,6 +651,8 @@ function refreshViaClaudeCli(target) {
     if (!isOurEntry(e) || Object.keys(e).some(k => k !== 'type' && k !== 'url')) continue;
     const url = swapUrls(String(e.url), target);
     if (url === e.url && e.type === 'http') continue;
+    // The command line is a shell's on Windows: only our own address goes there.
+    if (url !== target.url) continue;
     runClaudeCli(['mcp', 'remove', key, '--scope', 'user']);
     if (runClaudeCli(['mcp', 'add', '--scope', 'user', '--transport', 'http', key, url])) continue;
     const config = readJson(CLAUDE_JSON_PATH);
