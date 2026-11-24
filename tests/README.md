@@ -54,6 +54,7 @@ node tests/auth-67.smoke.js          # Host/Origin refusal, tokenless-read-only,
 node tests/auth-67-writers.smoke.js  # every client writer bakes the token into its own config shape
 node tests/auth-67-shim.smoke.js     # --stdio-mcp token self-heal + refusal to trust a port squatter
 node tests/forwarder-reregister.smoke.js  # a follower Bridge re-registers after the leader changes hands
+node tests/connections.smoke.js       # an update keeps the connected apps and connects no others (temp folders only)
 ```
 
 They exit non-zero on failure and are safe to run any time.

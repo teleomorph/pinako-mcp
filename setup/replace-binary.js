@@ -39,6 +39,11 @@ function numbered(file, suffix) {
   return names.filter((n) => n.startsWith(prefix) && /^\d+$/.test(n.slice(prefix.length))).map((n) => path.join(dir, n));
 }
 
+/** Is the program here, even if only under the name an interrupted swap left it? */
+export function hasProgram(file) {
+  return fs.existsSync(file) || oldCopies(file).length > 0;
+}
+
 /** Best effort: one still running stays, and the next install takes it. */
 export function deleteOldCopies(file) {
   for (const old of oldCopies(file)) {

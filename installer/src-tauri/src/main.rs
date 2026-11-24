@@ -1,8 +1,10 @@
 // Prevents a second console window from appearing on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod connections;
 mod replace;
 
+use connections::{inspect, is_our_entry, toml_header, toml_inline_entry, Inspected, Status, Target, LEGACY_SERVER_KEYS, SERVER_KEY};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -156,6 +158,8 @@ struct ClientInfo {
     id:       String,
     label:    String,
     detected: bool,
+    /// "yes", "no", or "unreadable" (cannot tell).
+    connected: &'static str,
     note:     Option<String>,
 }
 
@@ -164,6 +168,11 @@ fn client(id: &str, label: &str, detect: PathBuf, note: Option<&str>) -> ClientI
         id:       id.into(),
         label:    label.into(),
         detected: detect.exists(),
+        connected: match inspect_client(id, None).connected {
+            Status::Yes => "yes",
+            Status::No => "no",
+            Status::Unreadable => "unreadable",
+        },
         note:     note.map(Into::into),
     }
 }
@@ -204,14 +213,199 @@ fn find_msix_claude_dir() -> Option<PathBuf> {
 }
 
 fn detect_claude_desktop(appdata: &Path) -> ClientInfo {
-    let traditional = appdata.join("Claude");
-    let msix = find_msix_claude_dir();
-    ClientInfo {
-        id:       "claude-desktop".into(),
-        label:    "Claude Desktop".into(),
-        detected: traditional.exists() || msix.is_some(),
-        note:     None,
+    let mut info = client("claude-desktop", "Claude Desktop", appdata.join("Claude"), None);
+    info.detected |= find_msix_claude_dir().is_some();
+    info
+}
+
+// ── Connections ──────────────────────────────────────────────────────────────
+
+/// Every settings file that may hold our entry for this client, in the order the
+/// app prefers them, and whether only the first one that exists is what the app
+/// reads (the others are older homes of the same settings).
+/// Mirrors clientFiles() in setup/detect.js.
+fn client_files(id: &str) -> (Vec<(PathBuf, String)>, bool) {
+    let h = home();
+    let a = appdata();
+    let storage = |ext: &str, file: &str| {
+        a.join("Code").join("User").join("globalStorage").join(ext).join("settings").join(file)
+    };
+    let mut first = false;
+    let paths: Vec<PathBuf> = match id {
+        // settings.json: where installers before 2026-07-23 wrote, and Claude
+        // Code never looked. A later install clears it, so an entry there is a
+        // connection the person asked for and never got.
+        "claude-code" => vec![h.join(".claude.json"), h.join(".claude").join("settings.json")],
+        "claude-desktop" => {
+            first = true;
+            find_msix_claude_dir().into_iter().chain([a.join("Claude")])
+                .map(|d| d.join("claude_desktop_config.json")).collect()
+        }
+        "cursor" => vec![h.join(".cursor").join("mcp.json")],
+        "windsurf" => vec![h.join(".codeium").join("windsurf").join("mcp_config.json")],
+        "antigravity" => {
+            first = true;
+            vec![h.join(".gemini").join("config").join("mcp_config.json"),
+                 h.join(".gemini").join("antigravity").join("mcp_config.json")]
+        }
+        "gemini-cli" => vec![h.join(".gemini").join("settings.json")],
+        "cline" => vec![storage("saoudrizwan.claude-dev", "cline_mcp_settings.json"),
+                        h.join(".cline").join("data").join("settings").join("cline_mcp_settings.json")],
+        "roo-code" => vec![storage("rooveterinaryinc.roo-cline", "mcp_settings.json")],
+        "zoo-code" => vec![storage("zoocodeorganization.zoo-code", "mcp_settings.json")],
+        "vscode" => {
+            // `code --add-mcp` writes the ACTIVE profile, which may be a named one.
+            let user = a.join("Code").join("User");
+            let profiles = std::fs::read_dir(user.join("profiles")).into_iter().flatten().flatten()
+                .map(|e| e.path().join("mcp.json"));
+            [user.join("mcp.json")].into_iter().chain(profiles).collect()
+        }
+        "continue" => {
+            first = true;
+            let dir = h.join(".continue");
+            return (vec![(dir.join("mcpServers").join("pinako.yaml"), "continue".into()),
+                         (dir.join("config.json"), "continue-json".into())], first);
+        }
+        "codex" => vec![h.join(".codex").join("config.toml")],
+        "grok" => vec![grok_home().join("config.toml")],
+        "kimi-code" => vec![kimi_code_home().join("mcp.json")],
+        "openclaw" => vec![openclaw_home().join("openclaw.json")],
+        "hermes" => vec![hermes_home().join("config.yaml")],
+        _ => vec![],
+    };
+    (paths.into_iter().map(|p| (p, id.to_string())).collect(), first)
+}
+
+/// The text of a settings file: None when there is none, an error when it cannot be read.
+fn read_settings(path: &Path) -> Result<Option<String>, String> {
+    use std::io::ErrorKind;
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(None),
+        Err(e) => Err(format!("{} could not be read ({e})", path.display())),
     }
+}
+
+/// None when the file does not exist.
+fn inspect_file(path: &Path, kind: &str, target: Option<&Target>) -> Option<Inspected> {
+    match read_settings(path) {
+        Ok(None) => None,
+        Ok(Some(text)) => Some(inspect(kind, &text, target)),
+        Err(_) => Some(Inspected { status: Status::Unreadable, next: None }),
+    }
+}
+
+struct ClientState {
+    /// The files that hold our entry.
+    ours: Vec<(PathBuf, String)>,
+    connected: Status,
+    unreadable: bool,
+}
+
+fn inspect_client(id: &str, target: Option<&Target>) -> ClientState {
+    let (files, first) = client_files(id);
+    let seen: Vec<_> = files.into_iter()
+        .filter_map(|(p, k)| inspect_file(&p, &k, target).map(|r| (p, k, r.status)))
+        .collect();
+    let live = if first { &seen[..seen.len().min(1)] } else { &seen[..] };
+    let unreadable = live.iter().any(|f| f.2 == Status::Unreadable);
+    let connected = if live.iter().any(|f| f.2 == Status::Yes) { Status::Yes }
+        else if unreadable { Status::Unreadable }
+        else { Status::No };
+    ClientState {
+        ours: seen.into_iter().filter(|f| f.2 == Status::Yes).map(|f| (f.0, f.1)).collect(),
+        connected,
+        unreadable,
+    }
+}
+
+/// An update: bring the connections that already exist up to date, and make no
+/// new ones. Only files that hold our entry are touched, and only the parts of
+/// it that make it connect (connections.rs). Mirrors refreshClients() in
+/// setup/configure.js.
+fn refresh_clients(log: &mut Vec<String>, service_path: &Path) {
+    let url = mcp_url_get();
+    // Without the access key a working entry is left as it was.
+    let target = url.split_once("?token=").map(|(_, token)| Target {
+        url: url.clone(),
+        token: token.to_string(),
+        service: service_path.to_string_lossy().into_owned(),
+    });
+    for c in clients() {
+        let state = inspect_client(&c.id, target.as_ref());
+        let label = client_label(&c.id);
+        let mut error = None;
+        if let Some(t) = &target {
+            for (path, kind) in &state.ours {
+                if let Err(e) = refresh_file(&c.id, path, kind, t) {
+                    error = Some(e);
+                }
+            }
+        }
+        if let Some(e) = error {
+            log.push(format!("⚠  {label}: {e}"));
+        } else if state.unreadable {
+            log.push(format!("⚠  {label} was left as it was: its settings could not be read."));
+        } else if state.connected == Status::Yes {
+            if target.is_none() {
+                log.push(format!("⚠  {label} was left as it was: the access key could not be read."));
+                continue;
+            }
+            log.push(format!("✓  {label} stays connected"));
+            if c.id == "claude-code" {
+                log.extend(install_claude_plugin(service_path));
+            }
+        }
+    }
+}
+
+fn refresh_file(id: &str, path: &Path, kind: &str, target: &Target) -> Result<(), String> {
+    if id == "claude-code" {
+        let h = home();
+        let real = h.join(".claude.json");
+        if path != real {
+            // The file Claude Code ignores: put the entry where it looks, once.
+            return match inspect_file(&real, id, None).map(|r| r.status) {
+                Some(Status::Unreadable) => Err(format!("{} could not be read", real.display())),
+                Some(Status::Yes) => { prune_stale_claude_settings_entry(&h); Ok(()) }
+                _ => configure_claude_code(&h),
+            };
+        }
+        refresh_via_claude_cli(&real, target)?;
+    }
+    // Read again: the app may have saved since the first look.
+    match inspect_file(path, kind, Some(target)) {
+        Some(Inspected { status: Status::Unreadable, .. }) => Err(format!("{} could not be read", path.display())),
+        Some(Inspected { next: Some(next), .. }) => write_text(path, &next),
+        _ => Ok(()),
+    }
+}
+
+/// Claude Code's own command owns the locking of its live file, so a plain entry
+/// goes through it. Whatever it leaves undone is caught by the read that follows;
+/// an entry it removed and could not add back is put back here.
+fn refresh_via_claude_cli(path: &Path, target: &Target) -> Result<(), String> {
+    let cfg = read_json(path)?;
+    for key in [SERVER_KEY].iter().chain(LEGACY_SERVER_KEYS) {
+        let entry = &cfg["mcpServers"][*key];
+        let Some(e) = entry.as_object().filter(|_| is_our_entry(entry)) else { continue };
+        let url = e.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        if e.keys().any(|k| k != "type" && k != "url") || url.contains(&format!("token={}", target.token)) {
+            continue;
+        }
+        run_claude_cli(&["mcp", "remove", key, "--scope", "user"]);
+        if run_claude_cli(&["mcp", "add", "--scope", "user", "--transport", "http", key, &target.url]) {
+            continue;
+        }
+        let mut now = read_json(path)?;
+        if now["mcpServers"][*key].is_object() {
+            continue;
+        }
+        ensure_obj(&mut now, "mcpServers");
+        now["mcpServers"][*key] = serde_json::json!({ "type": "http", "url": target.url });
+        write_json(path, &now)?;
+    }
+    Ok(())
 }
 
 // ── Server key ───────────────────────────────────────────────────────────────
@@ -220,9 +414,7 @@ fn detect_claude_desktop(appdata: &Path) -> ClientInfo {
 // a local server. Capitalised 2026-09-17 (owner request: every client listed
 // the bridge as "pinako"). Every writer drops the pre-rename key on the way,
 // so a re-install over an older bridge never leaves two local entries.
-// Mirrors SERVER_KEY / LEGACY_SERVER_KEYS in pinako-mcp/setup/configure.js.
-const SERVER_KEY: &str = "Pinako";
-const LEGACY_SERVER_KEYS: &[&str] = &["pinako"];
+// SERVER_KEY and LEGACY_SERVER_KEYS live in connections.rs.
 
 /// Set our entry on a servers map, removing any pre-rename key first.
 fn put_server_entry(map: &mut serde_json::Value, entry: serde_json::Value) {
@@ -237,7 +429,7 @@ fn put_server_entry(map: &mut serde_json::Value, entry: serde_json::Value) {
 /// Drop only the pre-rename keys from `<file>[map_key]` (best effort; an
 /// unparseable file is the user's business, not ours).
 fn prune_legacy_keys(path: &Path, map_key: &str) {
-    let Ok(Some(mut cfg)) = read_json_strict(path) else { return };
+    let Ok(mut cfg) = read_json(path) else { return };
     let Some(map) = cfg[map_key].as_object_mut() else { return };
     let mut changed = false;
     for k in LEGACY_SERVER_KEYS {
@@ -256,7 +448,7 @@ fn prune_legacy_keys(path: &Path, map_key: &str) {
 
 fn write_claude_desktop_config(path: &Path) -> Result<(), String> {
     let mcp_url = mcp_url_get();
-    let mut cfg = read_json(path);
+    let mut cfg = read_json(path)?;
     ensure_obj(&mut cfg, "mcpServers");
     // Claude Desktop only supports stdio MCP servers (command + args).
     // Use the bundled pinako-mcp-service binary in --stdio-mcp mode as a
@@ -297,9 +489,26 @@ fn hermes_home() -> PathBuf {
         .unwrap_or_else(|| candidates[0].clone())
 }
 
-/// Detect which AI clients are installed on this machine.
+#[derive(Serialize)]
+struct Detection {
+    /// The Bridge is already on this computer, or an app is already connected to
+    /// it. Either way the person's own choices stand: nothing is ticked for them.
+    update:  bool,
+    clients: Vec<ClientInfo>,
+}
+
+/// What is on this machine: is this an update, and which AI apps are here?
 #[tauri::command]
-fn detect_clients() -> Vec<ClientInfo> {
+fn detect_clients() -> Detection {
+    let clients = clients();
+    Detection {
+        update: replace::has_program(&pinako_dir().join(service_binary_name()))
+            || clients.iter().any(|c| c.connected == "yes"),
+        clients,
+    }
+}
+
+fn clients() -> Vec<ClientInfo> {
     let h = home();
     let a = appdata();
     vec![
@@ -356,13 +565,12 @@ struct InstallError {
     had_previous: bool,
 }
 
-/// Run the full installation with the user-selected client IDs.
+/// Run the full installation: an update refreshes the apps already connected,
+/// a first install connects the ones the user selected.
 /// Returns a log of result lines for display in the wizard.
 #[tauri::command]
-fn install(selected_ids: Vec<String>) -> Result<Vec<String>, InstallError> {
+fn install(update: bool, selected_ids: Vec<String>) -> Result<Vec<String>, InstallError> {
     let mut log = Vec::<String>::new();
-    let h = home();
-    let a = appdata();
     let pd = pinako_dir();
 
     // 1. Create Pinako data directory
@@ -392,8 +600,28 @@ fn install(selected_ids: Vec<String>) -> Result<Vec<String>, InstallError> {
         Err(e)  => log.push(format!("⚠  Native host skipped: {e}")),
     }
 
-    // 4. Configure each selected AI client
-    for id in &selected_ids {
+    // 4. The AI apps
+    if update {
+        refresh_clients(&mut log, &service_path);
+    } else {
+        connect_clients(&selected_ids, &mut log, &service_path);
+    }
+
+    Ok(log)
+}
+
+/// "Connect more apps", after an update: only what the user picked.
+#[tauri::command]
+fn connect(selected_ids: Vec<String>) -> Vec<String> {
+    let mut log = Vec::new();
+    connect_clients(&selected_ids, &mut log, &pinako_dir().join(service_binary_name()));
+    log
+}
+
+fn connect_clients(ids: &[String], log: &mut Vec<String>, service_path: &Path) {
+    let h = home();
+    let a = appdata();
+    for id in ids {
         match configure_client(id, &h, &a) {
             Ok(()) => {
                 log.push(format!("✓  Configured {}", client_label(id)));
@@ -403,16 +631,12 @@ fn install(selected_ids: Vec<String>) -> Result<Vec<String>, InstallError> {
                 // configured: a plugin without a server to talk to is a hook
                 // that can never do anything.
                 if id == "claude-code" {
-                    if let Some(line) = install_claude_plugin(&service_path) {
-                        log.push(line);
-                    }
+                    log.extend(install_claude_plugin(service_path));
                 }
             }
             Err(e) => log.push(format!("⚠  {}: {e}", client_label(id))),
         }
     }
-
-    Ok(log)
 }
 
 /// Ask the service binary we just wrote to install the Claude Code
@@ -625,24 +849,37 @@ fn client_label(id: &str) -> &str {
     }
 }
 
-fn read_json(path: &Path) -> serde_json::Value {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}))
-}
-
 // Atomic write: several clients (Cline notably) watch their config file and
 // can observe — and act on — a half-written file. Temp file in the same
-// directory + rename is atomic on every platform we ship.
-fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+// directory + rename is atomic on every platform we ship. A linked settings
+// file stays a link, and a private one stays private.
+fn write_text(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    let real = if is_link { path.canonicalize().unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() };
+    let tmp = real.with_extension("pinako-tmp");
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(&real) {
+            f.set_permissions(meta.permissions())?;
+        }
+        f.write_all(text.as_bytes())?;
+        drop(f);
+        std::fs::rename(&tmp, &real)
+    })();
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
     let content = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("pinako-tmp");
-    std::fs::write(&tmp, content + "\n").map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    write_text(path, &(content + "\n"))
 }
 
 fn ensure_obj(v: &mut serde_json::Value, key: &str) {
@@ -651,22 +888,21 @@ fn ensure_obj(v: &mut serde_json::Value, key: &str) {
     }
 }
 
-/// read_json() above falls back to `{}` on a parse error — fine for the small
-/// per-client MCP config files we own outright, fatal for a large stateful file
-/// the client owns. Missing/empty → Ok(None) (create it); unparseable → Err
-/// (leave it alone). Mirrors readJsonStrict() in setup/configure.js.
-fn read_json_strict(path: &Path) -> Result<Option<serde_json::Value>, String> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return Ok(None),
-    };
+/// Missing or empty → {} (create it). Anything we cannot read or parse → Err, and
+/// leave it be: it holds the user's other servers and settings, and {} in its
+/// place would silently destroy them. Mirrors readJson() in setup/configure.js.
+fn read_json(path: &Path) -> Result<serde_json::Value, String> {
+    let raw = read_settings(path)?.unwrap_or_default();
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
     if raw.trim().is_empty() {
-        return Ok(None);
+        return Ok(serde_json::json!({}));
     }
-    serde_json::from_str(&raw)
-        .map(Some)
-        .map_err(|e| format!("{} exists but is not valid JSON ({e}) — refusing to overwrite it",
-                             path.display()))
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| format!("{} exists but is not valid JSON ({e}) — refusing to overwrite it", path.display()))?;
+    if !value.is_object() {
+        return Err(format!("{} is not a settings file this installer knows — refusing to overwrite it", path.display()));
+    }
+    Ok(value)
 }
 
 // ── Claude Code ──────────────────────────────────────────────────────────────
@@ -704,7 +940,7 @@ fn configure_claude_code(home: &Path) -> Result<(), String> {
 
     if !added {
         let path = home.join(".claude.json");
-        let mut cfg = read_json_strict(&path)?.unwrap_or_else(|| serde_json::json!({}));
+        let mut cfg = read_json(&path)?;
         ensure_obj(&mut cfg, "mcpServers");
         put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "type": "http", "url": mcp_url }));
         write_json(&path, &cfg)?;
@@ -718,7 +954,7 @@ fn configure_claude_code(home: &Path) -> Result<(), String> {
 fn prune_stale_claude_settings_entry(home: &Path) {
     let path = home.join(".claude").join("settings.json");
     // An unparseable settings.json is the user's business, not ours.
-    let Ok(Some(mut cfg)) = read_json_strict(&path) else { return };
+    let Ok(mut cfg) = read_json(&path) else { return };
     let ours: Vec<&str> = LEGACY_SERVER_KEYS.iter().copied().chain([SERVER_KEY]).collect();
     if !ours.iter().any(|k| cfg["mcpServers"][*k].is_object()) {
         return;
@@ -743,7 +979,7 @@ fn prune_stale_claude_settings_entry(home: &Path) {
 
 fn write_antigravity_config(path: &Path) -> Result<(), String> {
     let mcp_url = mcp_url_get();
-    let mut cfg = read_json(path);
+    let mut cfg = read_json(path)?;
     ensure_obj(&mut cfg, "mcpServers");
     put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "serverUrl": mcp_url }));
     write_json(path, &cfg)
@@ -777,14 +1013,14 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
         }
         "cursor" => {
             let path = home.join(".cursor").join("mcp.json");
-            let mut cfg = read_json(&path);
+            let mut cfg = read_json(&path)?;
             ensure_obj(&mut cfg, "mcpServers");
             put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "url": mcp_url }));
             write_json(&path, &cfg)
         }
         "windsurf" => {
             let path = home.join(".codeium").join("windsurf").join("mcp_config.json");
-            let mut cfg = read_json(&path);
+            let mut cfg = read_json(&path)?;
             ensure_obj(&mut cfg, "mcpServers");
             put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "url": mcp_url }));
             write_json(&path, &cfg)
@@ -821,7 +1057,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                     .join("cline_mcp_settings.json"),
             ];
             for path in &paths {
-                let mut cfg = read_json(path);
+                let mut cfg = read_json(path)?;
                 ensure_obj(&mut cfg, "mcpServers");
                 put_server_entry(&mut cfg["mcpServers"], entry.clone());
                 write_json(path, &cfg)?;
@@ -837,7 +1073,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                 .join("Code").join("User").join("globalStorage")
                 .join("rooveterinaryinc.roo-cline").join("settings")
                 .join("mcp_settings.json");
-            let mut cfg = read_json(&path);
+            let mut cfg = read_json(&path)?;
             ensure_obj(&mut cfg, "mcpServers");
             put_server_entry(&mut cfg["mcpServers"], serde_json::json!({
                 "type": "streamable-http",
@@ -850,7 +1086,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                 .join("Code").join("User").join("globalStorage")
                 .join("zoocodeorganization.zoo-code").join("settings")
                 .join("mcp_settings.json");
-            let mut cfg = read_json(&path);
+            let mut cfg = read_json(&path)?;
             ensure_obj(&mut cfg, "mcpServers");
             put_server_entry(&mut cfg["mcpServers"], serde_json::json!({
                 "type": "streamable-http",
@@ -871,8 +1107,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
                 prune_legacy_keys(&path, "servers");
                 return Ok(());
             }
-            let mut cfg = read_json_strict(&path)?
-                .unwrap_or_else(|| serde_json::json!({}));
+            let mut cfg = read_json(&path)?;
             ensure_obj(&mut cfg, "servers");
             put_server_entry(&mut cfg["servers"], serde_json::json!({ "type": "http", "url": mcp_url }));
             write_json(&path, &cfg)
@@ -883,8 +1118,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             // Streamable HTTP uses `httpUrl` (`url` means SSE here, and
             // Antigravity's `serverUrl` file does not serve this CLI).
             let path = home.join(".gemini").join("settings.json");
-            let mut cfg = read_json_strict(&path)?
-                .unwrap_or_else(|| serde_json::json!({}));
+            let mut cfg = read_json(&path)?;
             ensure_obj(&mut cfg, "mcpServers");
             put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "httpUrl": mcp_url }));
             write_json(&path, &cfg)
@@ -900,7 +1134,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             // Dedicated mcp.json (Claude-Desktop-compatible shape); a bare
             // `url` with no `transport` key is treated as streamable HTTP.
             let path = kimi_code_home().join("mcp.json");
-            let mut cfg = read_json(&path);
+            let mut cfg = read_json(&path)?;
             ensure_obj(&mut cfg, "mcpServers");
             put_server_entry(&mut cfg["mcpServers"], serde_json::json!({ "url": mcp_url }));
             write_json(&path, &cfg)
@@ -911,8 +1145,7 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             // never replaced. Transport is NOT inferred from `url` here;
             // "streamable-http" must be explicit.
             let path = openclaw_home().join("openclaw.json");
-            let mut cfg = read_json_strict(&path)?
-                .unwrap_or_else(|| serde_json::json!({}));
+            let mut cfg = read_json(&path)?;
             ensure_obj(&mut cfg, "mcp");
             if !cfg["mcp"]["servers"].is_object() {
                 cfg["mcp"]["servers"] = serde_json::json!({});
@@ -931,13 +1164,10 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             // once config.yaml exists — a silent no-op in practice. Continue
             // itself is frozen upstream: acquired by Cursor, final 2.0.0.)
             let path = home.join(".continue").join("mcpServers").join("pinako.yaml");
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
             let yaml = format!(
                 "name: Pinako\nversion: 0.0.1\nschema: v1\nmcpServers:\n  - name: Pinako\n    type: streamable-http\n    url: {mcp_url}\n"
             );
-            std::fs::write(&path, yaml).map_err(|e| e.to_string())
+            write_text(&path, &yaml)
         }
         "codex" => {
             upsert_pinako_toml_table(
@@ -961,20 +1191,14 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
 fn pinako_table() -> String {
     format!("mcp_servers.{SERVER_KEY}")
 }
-fn legacy_pinako_tables() -> Vec<String> {
-    LEGACY_SERVER_KEYS.iter().map(|k| format!("mcp_servers.{k}")).collect()
-}
 
-fn strip_toml_table(toml: &str, table: &str) -> String {
+fn strip_toml_table(toml: &str, key: &str) -> String {
     let nl = if toml.contains("\r\n") { "\r\n" } else { "\n" };
-    let sub_prefix = format!("{table}.");
     let mut out: Vec<&str> = Vec::new();
     let mut skipping = false;
     for line in toml.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let name = trimmed.trim_matches(|c| c == '[' || c == ']').trim();
-            skipping = name == table || name.starts_with(&sub_prefix);
+        if let Some(name) = toml_header(line) {
+            skipping = name.len() > 1 && name[0] == "mcp_servers" && name[1] == key;
             if skipping { continue; } // drop the table header itself
         }
         if skipping { continue; }     // drop lines belonging to the skipped table
@@ -986,12 +1210,15 @@ fn strip_toml_table(toml: &str, table: &str) -> String {
 /// Drop any prior pinako table (idempotent re-install), then append a fresh
 /// canonical block with the given body lines. Shared by Codex and Grok Build.
 fn upsert_pinako_toml_table(path: &Path, body_lines: &[&str]) -> Result<(), String> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = read_settings(path)?.unwrap_or_default();
+    if toml_inline_entry(&existing) {
+        return Err(format!("{} already has a Pinako entry in a form this installer does not edit", path.display()));
+    }
     let nl = if existing.contains("\r\n") { "\r\n" } else { "\n" };
     let table = pinako_table();
-    let mut stripped = strip_toml_table(&existing, &table);
-    for legacy in legacy_pinako_tables() {
-        stripped = strip_toml_table(&stripped, &legacy);
+    let mut stripped = existing;
+    for key in [SERVER_KEY].iter().chain(LEGACY_SERVER_KEYS) {
+        stripped = strip_toml_table(&stripped, key);
     }
     let stripped = stripped.trim_end();
     let block = format!("[{table}]{nl}{}", body_lines.join(nl));
@@ -1000,10 +1227,7 @@ fn upsert_pinako_toml_table(path: &Path, body_lines: &[&str]) -> Result<(), Stri
     } else {
         format!("{stripped}{nl}{nl}{block}{nl}")
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, next).map_err(|e| e.to_string())
+    write_text(path, &next)
 }
 
 /// `code --add-mcp '<json>'` upserts into the active VS Code profile's
@@ -1033,7 +1257,7 @@ fn run_code_add_mcp() -> bool {
 
 fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
     let mcp_url = mcp_url_get();
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = read_settings(path)?.unwrap_or_default();
     let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let lines: Vec<String> = if text.is_empty() {
         Vec::new()
@@ -1064,10 +1288,7 @@ fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
         } else {
             format!("{base}{nl}{nl}{block}")
         };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        return std::fs::write(path, next).map_err(|e| e.to_string());
+        return write_text(path, &next);
     };
 
     let mut lines = lines;
@@ -1121,7 +1342,7 @@ fn upsert_hermes_yaml(path: &Path) -> Result<(), String> {
     next_lines.extend_from_slice(&lines[end..]);
 
     let next = format!("{}{nl}", next_lines.join(nl).trim_end());
-    std::fs::write(path, next).map_err(|e| e.to_string())
+    write_text(path, &next)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1131,6 +1352,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             detect_clients,
             install,
+            connect,
             open_url,
             quit,
             mcp_url,

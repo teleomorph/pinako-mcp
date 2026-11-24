@@ -127,7 +127,7 @@ await wizard.next();
 assert.equal(node('install-failed').hidden, true);
 await wait(1200);
 assert.equal(wizard.step, 3);
-assert.equal(node('btn-back').textContent, 'Back');
+assert.ok(node('btn-back').classList.set.has('hidden'));
 
 fs.rmSync(dir, { recursive: true, force: true });
 console.log('replace-binary: all checks passed');

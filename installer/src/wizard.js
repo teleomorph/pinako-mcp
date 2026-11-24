@@ -5,6 +5,8 @@ const invoke = window.__TAURI__.core.invoke;
 
 let step = 0;           // 0=welcome 1=apps 2=installing 3=done
 let clients = [];       // ClientInfo[] from detect_clients command
+let update = false;     // the Bridge is already here: refresh what is connected, tick nothing
+let adding = false;     // "Connect more apps", after an update
 let failed = false;     // the last install attempt failed (screen 2 offers Try again)
 
 const SCREENS = ['s-welcome', 's-apps', 's-installing', 's-done'];
@@ -12,31 +14,50 @@ const SCREENS = ['s-welcome', 's-apps', 's-installing', 's-done'];
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 async function init() {
+  await detect();
+  if (update) showUpdateWelcome();
+  else buildAppList(clients.filter(c => c.detected), true);
+  showStep(0);
+}
+
+async function detect() {
   try {
-    clients = await invoke('detect_clients');
+    const found = await invoke('detect_clients');
+    clients = found.clients;
+    update = update || found.update;
   } catch (e) {
     clients = [];
     console.error('detect_clients failed:', e);
   }
-  buildAppList();
-  showStep(0);
 }
 
-function buildAppList() {
-  const detected = clients.filter(c => c.detected);
+// An update never asks which apps: it names the connected ones and keeps them.
+function showUpdateWelcome() {
+  const connected = clients.filter(c => c.connected === 'yes').map(c => c.label);
+  document.getElementById('welcome-install').classList.add('hidden');
+  document.getElementById('welcome-update').classList.remove('hidden');
+  document.getElementById('welcome-title').textContent = 'Update Pinako AI Bridge';
+  document.getElementById('welcome-connected').textContent = connected.length
+    ? `Connected AI apps: ${connected.join(', ')}.`
+    : 'No AI apps are connected to Pinako.';
+  document.getElementById('terms-button').textContent = 'Update';
+  document.getElementById('dot-1').classList.add('hidden');
+}
 
-  if (detected.length === 0) {
+function buildAppList(shown, ticked) {
+  if (shown.length === 0) {
     document.getElementById('apps-detected').classList.add('hidden');
     document.getElementById('apps-none').classList.remove('hidden');
     return;
   }
 
   const list = document.getElementById('app-list');
-  for (const c of detected) {
+  list.innerHTML = '';
+  for (const c of shown) {
     const item = document.createElement('label');
     item.className = 'app-item';
     item.innerHTML = `
-      <input type="checkbox" id="chk-${c.id}" checked>
+      <input type="checkbox" id="chk-${c.id}"${ticked ? ' checked' : ''}>
       <div class="app-body">
         <div class="app-name">${c.label}</div>
         ${c.note ? `<div class="app-note">${c.note}</div>` : ''}
@@ -55,6 +76,8 @@ function showStep(s) {
     document.getElementById(id).classList.toggle('active', i === s);
   });
 
+  document.querySelector('main').scrollTop = 0;
+
   const btnBack = document.getElementById('btn-back');
   const btnNext = document.getElementById('btn-next');
 
@@ -68,13 +91,14 @@ function showStep(s) {
     case 0:
       btnBack.classList.add('hidden');
       btnNext.classList.remove('hidden');
-      btnNext.textContent = 'Next';
+      btnNext.textContent = update ? 'Update' : 'Next';
       btnNext.disabled = false;
       break;
     case 1:
       btnBack.classList.remove('hidden');
+      btnBack.textContent = 'Back';
       btnNext.classList.remove('hidden');
-      btnNext.textContent = 'Install';
+      btnNext.textContent = adding ? 'Connect' : 'Install';
       btnNext.disabled = false;
       break;
     case 2:
@@ -82,7 +106,9 @@ function showStep(s) {
       btnNext.classList.add('hidden');
       break;
     case 3:
-      btnBack.classList.add('hidden');
+      // Down here it is always in view; the screen above it scrolls.
+      btnBack.classList.toggle('hidden', !update || notConnected().length === 0);
+      btnBack.textContent = 'Connect more apps';
       btnNext.classList.remove('hidden');
       btnNext.textContent = 'Finish';
       btnNext.disabled = false;
@@ -91,14 +117,18 @@ function showStep(s) {
 }
 
 async function back() {
-  if (step === 1) showStep(0);
+  if (step === 1 && adding) showStep(3);
+  else if (step === 1) showStep(0);
+  else if (step === 3) connectMore();
   else if (step === 2 && failed) await invoke('quit');
 }
 
 async function next() {
-  if (step === 0) {
+  if (step === 0 && !update) {
     showStep(1);
-  } else if (step === 1 || (step === 2 && failed)) {
+  } else if (step === 1 && adding) {
+    await runConnect();
+  } else if (step <= 1 || (step === 2 && failed)) {
     await runInstall();
   } else if (step === 3) {
     await invoke('quit');
@@ -128,27 +158,47 @@ function showFailure(err) {
   btnNext.classList.remove('hidden');
 }
 
-async function runInstall() {
-  failed = false;
-  document.getElementById('installing-title').textContent = 'Installing…';
-  document.getElementById('install-failed').hidden = true;
-  document.getElementById('install-log').classList.remove('hidden');
-  document.getElementById('btn-back').textContent = 'Back';
-  showStep(2);
-
-  const selectedIds = clients
+function tickedIds() {
+  return clients
     .filter(c => c.detected)
     .filter(c => {
       const chk = document.getElementById(`chk-${c.id}`);
       return chk ? chk.checked : false;
     })
     .map(c => c.id);
+}
 
+function startWork(title) {
+  failed = false;
+  document.getElementById('installing-title').textContent = title;
+  document.getElementById('install-failed').hidden = true;
+  document.getElementById('install-log').classList.remove('hidden');
+  document.getElementById('btn-back').textContent = 'Back';
+  showStep(2);
   const logBox = document.getElementById('install-log');
   logBox.innerHTML = '';
+  return logBox;
+}
 
+// The done screen repeats what did not go well: the log is gone in a moment.
+function showNotices(lines) {
+  const box = document.getElementById('done-notices');
+  const notices = lines.filter(l => l.startsWith('⚠'));
+  box.innerHTML = '';
+  for (const line of notices) appendLog(box, line);
+  box.hidden = notices.length === 0;
+}
+
+function notConnected() {
+  return clients.filter(c => c.detected && c.connected === 'no');
+}
+
+async function runInstall() {
+  const logBox = startWork(update ? 'Updating…' : 'Installing…');
+
+  let lines;
   try {
-    const lines = await invoke('install', { selectedIds });
+    lines = await invoke('install', { update, selectedIds: update ? [] : tickedIds() });
     for (const line of lines) {
       appendLog(logBox, line);
     }
@@ -156,6 +206,13 @@ async function runInstall() {
     showFailure(err);
     return;
   }
+
+  if (update) {
+    document.getElementById('done-title').textContent = 'Update Complete';
+    document.getElementById('done-lead').textContent = 'Pinako AI Bridge has been updated.';
+    await detect();
+  }
+  showNotices(lines);
 
   // #67: fill in the REAL server URL before showing the done screen. It used
   // to be hardcoded as the bare URL in index.html, which is the read-only
@@ -167,8 +224,9 @@ async function runInstall() {
     if (urlEl) urlEl.textContent = url;
     const warnEl = document.getElementById('mcp-url-warning');
     if (warnEl) {
-      warnEl.hidden = !tokenless;
-      if (tokenless) {
+      // An update without the key changed no app: its own notice says so.
+      warnEl.hidden = !tokenless || update;
+      if (tokenless && !update) {
         appendLog(logBox, '⚠ Could not create the access token — apps were configured with read-only access.');
       }
     }
@@ -177,6 +235,35 @@ async function runInstall() {
   }
 
   // Brief pause so the user can read the log, then advance to done screen.
+  setTimeout(() => showStep(3), 900);
+}
+
+// ── Connect more apps (after an update) ───────────────────────────────────────
+
+function connectMore() {
+  adding = true;
+  buildAppList(notConnected(), false);
+  document.getElementById('apps-title').textContent = 'Connect more apps';
+  document.getElementById('apps-lead').textContent = 'Select the apps to connect to Pinako:';
+  showStep(1);
+}
+
+async function runConnect() {
+  const selectedIds = tickedIds();
+  if (selectedIds.length === 0) {
+    showStep(3);
+    return;
+  }
+  const logBox = startWork('Connecting…');
+  let lines;
+  try {
+    lines = await invoke('connect', { selectedIds });
+  } catch (err) {
+    lines = [`⚠  ${err && err.message ? err.message : String(err)}`];
+  }
+  for (const line of lines) appendLog(logBox, line);
+  await detect();
+  showNotices(lines);
   setTimeout(() => showStep(3), 900);
 }
 

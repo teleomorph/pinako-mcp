@@ -56,6 +56,9 @@ fn numbered(path: &Path, suffix: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Is the program here, even if only under the name an interrupted swap left it?
+pub fn has_program(path: &Path) -> bool { path.exists() || !old_copies(path).is_empty() }
+
 /// Best effort: one still running stays, and the next install takes it.
 pub fn delete_old_copies(path: &Path) {
     for old in old_copies(path) {

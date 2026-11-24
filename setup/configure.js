@@ -10,7 +10,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { HOME, APPDATA, SERVICE_PATH } from './paths.js';
-import { buildMcpUrl } from './token.js';
+import { buildMcpUrl, readToken } from './token.js';
+import { CLIENTS, inspectClient, inspectFile, readSettings } from './detect.js';
+import { SERVER_KEY, LEGACY_SERVER_KEYS, isOurEntry, tomlHeader, tomlInlineEntry } from './connections.js';
 
 // ai-todo #67: the URL carries the machine-local access token.
 //
@@ -34,9 +36,8 @@ let MCP_URL = buildMcpUrl();
 // local server. Capitalised 2026-09-17 (owner request: every client listed the
 // bridge as "pinako"). Every writer drops the pre-rename key on the way, so a
 // re-install over an older bridge never leaves a user with two local entries.
-// Mirrors SERVER_KEY / LEGACY_SERVER_KEYS in installer/src-tauri/src/main.rs.
-export const SERVER_KEY = 'Pinako';
-export const LEGACY_SERVER_KEYS = ['pinako'];
+// Both constants live in connections.js.
+export { SERVER_KEY, LEGACY_SERVER_KEYS };
 
 /** Set our entry on a servers map, removing any pre-rename key first. */
 function putServerEntry(map, entry) {
@@ -89,42 +90,49 @@ const READ_ONLY_TOOLS = [
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function readJson(filePath) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch {
-    return {};
-  }
-}
-
 // Atomic write: several clients (Cline notably) watch their config file with
 // chokidar and can observe — and act on — a half-written file. Temp file in
-// the same directory + rename is atomic on every platform we ship.
-function writeJson(filePath, obj) {
+// the same directory + rename is atomic on every platform we ship. A linked
+// settings file stays a link, and a private one stays private.
+function writeText(filePath, text) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = filePath + '.pinako-tmp';
-  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', 'utf8');
-  fs.renameSync(tmp, filePath);
+  let real = filePath, mode;
+  try {
+    real = fs.realpathSync(filePath);
+    mode = fs.statSync(real).mode & 0o777;
+  } catch { /* a new file */ }
+  const tmp = real + '.pinako-tmp';
+  try {
+    fs.rmSync(tmp, { force: true });
+    fs.writeFileSync(tmp, text, mode === undefined ? 'utf8' : { encoding: 'utf8', mode });
+    if (mode !== undefined && process.platform !== 'win32') fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, real);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    throw e;
+  }
 }
 
-// readJson() above deliberately swallows parse errors and returns {} — safe for
-// the small per-client MCP config files we own outright (a 0-byte or corrupt
-// mcp.json should just be replaced). It is NOT safe for a large stateful file
-// the client owns, where {} would silently destroy the user's data. Use this
-// instead there: missing → null (create it), unparseable → throw (leave it be).
-function readJsonStrict(filePath) {
-  let raw;
+function writeJson(filePath, obj) {
+  writeText(filePath, JSON.stringify(obj, null, 2) + '\n');
+}
+
+// Missing or empty → {} (create it). Anything we cannot read or parse → throw
+// and leave it be: it holds the user's other servers and settings, and {} in
+// its place would silently destroy them.
+function readJson(filePath) {
+  const raw = (readSettings(filePath) ?? '').replace(/^\uFEFF/, '');
+  if (!raw.trim()) return {};
+  let value;
   try {
-    raw = fs.readFileSync(filePath, 'utf8');
-  } catch {
-    return null;
-  }
-  if (!raw.trim()) return null;
-  try {
-    return JSON.parse(raw);
+    value = JSON.parse(raw);
   } catch (e) {
     throw new Error(`${filePath} exists but is not valid JSON (${e.message}) — refusing to overwrite it`);
   }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${filePath} is not a settings file this installer knows — refusing to overwrite it`);
+  }
+  return value;
 }
 
 // ─── TOML helpers (Codex + Grok Build) ──────────────────────────────────────
@@ -141,20 +149,17 @@ function readJsonStrict(filePath) {
 // would break Codex's `--strict-config`), so the blocks stay minimal.
 
 const PINAKO_TABLE = `mcp_servers.${SERVER_KEY}`;
-const LEGACY_PINAKO_TABLES = LEGACY_SERVER_KEYS.map(k => `mcp_servers.${k}`);
-const TOML_HEADER_RE = /^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*$/;
 
 // Remove the [mcp_servers.Pinako] table and any [mcp_servers.Pinako.<sub>]
 // sub-tables from a TOML string, preserving all other content verbatim.
-function stripTomlTable(toml, table) {
+function stripTomlTable(toml, key) {
   const nl = /\r\n/.test(toml) ? '\r\n' : '\n';
   const out = [];
   let skipping = false;
   for (const line of toml.split(/\r?\n/)) {
-    const m = line.match(TOML_HEADER_RE);
-    if (m) {
-      const name = m[1].trim();
-      skipping = name === table || name.startsWith(table + '.');
+    const name = tomlHeader(line);
+    if (name) {
+      skipping = name[0] === 'mcp_servers' && name[1] === key;
       if (skipping) continue; // drop the table header itself
     }
     if (skipping) continue;   // drop lines belonging to the skipped table
@@ -166,18 +171,19 @@ function stripTomlTable(toml, table) {
 // Drop any prior pinako table (idempotent re-install), then append a fresh
 // canonical block with the given body lines at the end of the file.
 function upsertPinakoTomlTable(configPath, bodyLines) {
-  let existing = '';
-  try { existing = fs.readFileSync(configPath, 'utf8'); } catch { existing = ''; }
+  const existing = readSettings(configPath) ?? '';
+  if (tomlInlineEntry(existing)) {
+    throw new Error(`${configPath} already has a Pinako entry in a form this installer does not edit`);
+  }
   const nl = /\r\n/.test(existing) ? '\r\n' : '\n';
   let stripped = existing;
-  for (const t of [PINAKO_TABLE, ...LEGACY_PINAKO_TABLES]) stripped = stripTomlTable(stripped, t);
+  for (const k of [SERVER_KEY, ...LEGACY_SERVER_KEYS]) stripped = stripTomlTable(stripped, k);
   stripped = stripped.replace(/\s+$/, '');
   const block = [`[${PINAKO_TABLE}]`, ...bodyLines].join(nl);
   const next = stripped
     ? stripped + nl + nl + block + nl
     : block + nl;
-  fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, next, 'utf8');
+  writeText(configPath, next);
 }
 
 // ─── YAML helper (Hermes) ───────────────────────────────────────────────────
@@ -190,8 +196,7 @@ function upsertPinakoTomlTable(configPath, bodyLines) {
 //     rather than risk corrupting the file.
 // YAML forbids tabs in indentation, so space-math on indents is safe.
 function upsertHermesYaml(configPath) {
-  let text = '';
-  try { text = fs.readFileSync(configPath, 'utf8'); } catch { text = ''; }
+  const text = readSettings(configPath) ?? '';
   const nl = /\r\n/.test(text) ? '\r\n' : '\n';
   const lines = text ? text.split(/\r?\n/) : [];
 
@@ -204,11 +209,7 @@ function upsertHermesYaml(configPath) {
     }
     const block = ['mcp_servers:', `  ${SERVER_KEY}:`, `    url: "${MCP_URL}"`, '    enabled: true'];
     const base = text.replace(/\s+$/, '');
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(
-      configPath,
-      (base ? base + nl + nl : '') + block.join(nl) + nl,
-      'utf8');
+    writeText(configPath, (base ? base + nl + nl : '') + block.join(nl) + nl);
     return;
   }
 
@@ -249,7 +250,7 @@ function upsertHermesYaml(configPath) {
     ...kept,
     ...lines.slice(end),
   ].join(nl).replace(/\s+$/, '') + nl;
-  fs.writeFileSync(configPath, next, 'utf8');
+  writeText(configPath, next);
 }
 
 // ─── Claude Code helpers ─────────────────────────────────────────────────────
@@ -290,7 +291,7 @@ function addViaClaudeCli() {
 }
 
 function addViaClaudeJsonMerge() {
-  const config = readJsonStrict(CLAUDE_JSON_PATH) || {};
+  const config = readJson(CLAUDE_JSON_PATH);
   config.mcpServers = config.mcpServers || {};
   putServerEntry(config.mcpServers, { type: 'http', url: MCP_URL });
   writeJson(CLAUDE_JSON_PATH, config);
@@ -334,7 +335,7 @@ function pruneLegacyKeys(filePath, mapKey) {
 function pruneKeys(filePath, mapKey, keys) {
   let config;
   try {
-    config = readJsonStrict(filePath);
+    config = readJson(filePath);
   } catch {
     return;
   }
@@ -482,8 +483,7 @@ const writers = {
       `    url: ${MCP_URL}`,
       '',
     ].join('\n');
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(configPath, yaml, 'utf8');
+    writeText(configPath, yaml);
   },
 
   'codex'(configPath) {
@@ -511,7 +511,7 @@ const writers = {
     // {}. Unlike Kimi/Hermes, the transport is NOT inferred from `url`;
     // "streamable-http" must be explicit. Gateway reads config at startup —
     // the client note tells the user to restart it.
-    const config = readJsonStrict(configPath) || {};
+    const config = readJson(configPath);
     config.mcp = config.mcp || {};
     config.mcp.servers = config.mcp.servers || {};
     putServerEntry(config.mcp.servers, {
@@ -534,7 +534,7 @@ const writers = {
     // top-level key is `servers`, not `mcpServers`. Fallback merges the
     // default profile's mcp.json directly.
     if (!addViaVscodeCli()) {
-      const config = readJsonStrict(VSCODE_MCP_PATH) || {};
+      const config = readJson(VSCODE_MCP_PATH);
       config.servers = config.servers || {};
       putServerEntry(config.servers, { type: 'http', url: MCP_URL });
       writeJson(VSCODE_MCP_PATH, config);
@@ -550,7 +550,7 @@ const writers = {
     // prefs) — strict read so a corrupt file is refused. Streamable HTTP
     // uses the `httpUrl` key (`url` means SSE here, and Antigravity's
     // `serverUrl` file is a different product that does not serve this CLI).
-    const config = readJsonStrict(configPath) || {};
+    const config = readJson(configPath);
     config.mcpServers = config.mcpServers || {};
     putServerEntry(config.mcpServers, { httpUrl: MCP_URL });
     writeJson(configPath, config);
@@ -596,4 +596,66 @@ export function configureClients(clients) {
     try { writer(client.configPath); return { client, ok: true }; }
     catch (e) { return { client, ok: false, error: e.message }; }
   });
+}
+
+/**
+ * An update: bring the connections that already exist up to date, and make no
+ * new ones. Only files that hold our entry are touched, and only the parts of
+ * it that make it connect (connections.js).
+ * Returns [{ client, status: 'current' | 'failed' | 'unreadable' | 'nokey', error? }],
+ * one per connected or unreadable app. 'nokey': there is no access key to
+ * write, so a working entry is left as it was.
+ */
+export function refreshClients() {
+  const url = refreshMcpUrl();
+  const token = readToken();
+  const target = token && url.includes(`token=${token}`) ? { url, token, service: SERVICE_PATH } : null;
+  const results = [];
+  for (const client of CLIENTS) {
+    const { seen, connected, unreadable } = inspectClient(client, target);
+    let error = null;
+    for (const f of target ? seen.filter(x => x.status === 'yes') : []) {
+      try { refreshFile(client, f, target); } catch (e) { error = e.message; }
+    }
+    if (error) results.push({ client, status: 'failed', error });
+    else if (unreadable) results.push({ client, status: 'unreadable' });
+    else if (connected === 'yes') results.push({ client, status: target ? 'current' : 'nokey' });
+  }
+  return results;
+}
+
+function refreshFile(client, f, target) {
+  if (client.id === 'claude-code') {
+    if (f.path === CLAUDE_SETTINGS_PATH) {
+      // The file Claude Code ignores: put the entry where it looks, once.
+      const real = inspectFile({ path: CLAUDE_JSON_PATH, kind: client.id }).status;
+      if (real === 'unreadable') throw new Error(`${CLAUDE_JSON_PATH} could not be read`);
+      if (real === 'no') writers['claude-code']();
+      else pruneStaleClaudeSettingsEntry();
+      return;
+    }
+    refreshViaClaudeCli(target);
+  }
+  // Read again: the app may have saved since the first look.
+  const now = inspectFile(f, target);
+  if (now.status === 'unreadable') throw new Error(`${f.path} could not be read`);
+  if (now.next !== null) writeText(f.path, now.next);
+}
+
+// Claude Code's own command owns the locking of its live file, so a plain entry
+// goes through it. Whatever it leaves undone is caught by the read that follows;
+// an entry it removed and could not add back is put back here.
+function refreshViaClaudeCli(target) {
+  const servers = readJson(CLAUDE_JSON_PATH).mcpServers || {};
+  for (const key of [SERVER_KEY, ...LEGACY_SERVER_KEYS]) {
+    const e = servers[key];
+    if (!isOurEntry(e) || Object.keys(e).some(k => k !== 'type' && k !== 'url')) continue;
+    if (String(e.url).includes(`token=${target.token}`)) continue;
+    runClaudeCli(['mcp', 'remove', key, '--scope', 'user']);
+    if (runClaudeCli(['mcp', 'add', '--scope', 'user', '--transport', 'http', key, target.url])) continue;
+    const config = readJson(CLAUDE_JSON_PATH);
+    if (config.mcpServers?.[key]) continue;
+    config.mcpServers = { ...config.mcpServers, [key]: { type: 'http', url: target.url } };
+    writeJson(CLAUDE_JSON_PATH, config);
+  }
 }

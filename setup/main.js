@@ -8,10 +8,10 @@
  * Flow:
  *   1. Banner
  *   2. Install service + native host
- *   3. Detect AI clients
- *   4. Prompt user to confirm / deselect
- *   5. Configure selected clients
- *   6. Show summary + copy URL to clipboard
+ *   3. First install: detect AI clients, ask, configure them.
+ *      Update: refresh the apps already connected, leave the rest alone, then
+ *      offer to connect more (none chosen beforehand).
+ *   4. Show summary + copy URL to clipboard
  */
 
 import readline from 'node:readline';
@@ -19,9 +19,9 @@ import fs from 'node:fs';
 import { execSync, spawnSync } from 'node:child_process';
 import { installNativeHost } from './native-host.js';
 import { detectClients } from './detect.js';
-import { configureClients } from './configure.js';
+import { configureClients, refreshClients } from './configure.js';
 import { PINAKO_DIR, SERVICE_PATH, PLATFORM } from './paths.js';
-import { replaceBinary, stopProcesses, deleteOldCopies } from './replace-binary.js';
+import { replaceBinary, stopProcesses, deleteOldCopies, hasProgram } from './replace-binary.js';
 import { readOrCreateToken, rotateToken, buildMcpUrl, TOKEN_PATH } from './token.js';
 // serviceExeBase64 is injected at build time by setup/build.js
 // (generates setup/_service-embedded.js before running esbuild)
@@ -109,6 +109,10 @@ async function main() {
   console.log(bold(cyan('  ╚══════════════════════════════════════════╝')));
   console.log('');
 
+  // Asked before anything is installed: the Bridge is already here, or an app
+  // is already connected to it. Either way the person's own choices stand.
+  const isUpdate = hasProgram(SERVICE_PATH) || detectClients().some(c => c.connected === 'yes');
+
   // ── Step 1: Extract service binary ──────────────────────────────────────────
   // Swap the new binary in, THEN stop the old one (replace-binary.js). On a
   // failure nothing else runs: going on used to look like a finished update.
@@ -176,6 +180,11 @@ async function main() {
     }
   }
 
+  if (isUpdate) {
+    await updateApps();
+    return;
+  }
+
   // ── Step 2: Detect AI clients ─────────────────────────────────────────────
   console.log('');
   console.log(bold('  Detected AI apps on this computer:'));
@@ -221,7 +230,23 @@ async function main() {
   }
 
   // ── Step 4: Configure clients ─────────────────────────────────────────────
-  const results = configureClients(found);
+  connectApps(found);
+
+  // ── Step 5: Final instructions ─────────────────────────────────────────────
+  await showFinalInstructions();
+
+  // ── Step 6: Restart prompt ────────────────────────────────────────────────
+  if (found.length > 0) {
+    console.log(dim('  Restart any configured apps to pick up the new settings.'));
+    console.log('');
+  }
+
+  await finish();
+}
+
+// Connect the given apps, and say how each one went.
+function connectApps(clients) {
+  const results = configureClients(clients);
 
   console.log(bold('  Configuring apps:'));
   console.log('');
@@ -236,7 +261,6 @@ async function main() {
     }
   }
 
-  // ── Step 4b: the Claude Code project-context plugin ───────────────────────
   // Claude Code gets one more artifact than the other clients: a small plugin
   // in the user's own skills directory that hands an AI session the context for
   // the folder it started in. The service binary does the work (see
@@ -245,16 +269,7 @@ async function main() {
   //
   // Only after Claude Code itself was configured, and never fatal: this is an
   // extra, and a user who cannot get it is still fully installed.
-  if (results.some((r) => r.client && r.client.id === 'claude-code' && r.ok)) {
-    const plugin = installClaudePlugin();
-    if (plugin.kind === 'ok') {
-      console.log(`    ${ok}  ${plugin.line}`);
-    } else if (plugin.kind === 'failed') {
-      console.log('');
-      console.log(yellow(`  ⚠  Automatic project context for Claude Code was not set up, because the AI Bridge program at ${SERVICE_PATH} could not be run. Everything else installed normally. Run the installer again after fixing this.`));
-    }
-    // plugin.kind === 'absent': this build carries no plugin. Say nothing.
-  }
+  if (results.some((r) => r.client && r.client.id === 'claude-code' && r.ok)) reportClaudePlugin();
 
   console.log('');
 
@@ -263,17 +278,62 @@ async function main() {
     console.log(dim('  You can configure them manually using the URL below.'));
     console.log('');
   }
+}
 
-  // ── Step 5: Final instructions ─────────────────────────────────────────────
+// An update: what is connected stays connected and current, nothing else is
+// touched, and adding an app is a choice the person makes here, not a default.
+async function updateApps() {
+  const results = refreshClients();
+  console.log('');
+  console.log(results.length ? bold('  Your connected AI apps:') : '  No AI apps are connected to Pinako.');
+  console.log('');
+  for (const { client, status, error } of results) {
+    if (status === 'current') {
+      console.log(`    ${ok}  ${client.label}`);
+    } else if (status === 'nokey') {
+      console.log(`    ${yellow('⚠')}  ${client.label}  ${dim('left as it was: the access key could not be read')}`);
+    } else if (status === 'unreadable') {
+      console.log(`    ${yellow('⚠')}  ${client.label}  ${dim('left as it was: its settings could not be read')}`);
+    } else {
+      console.log(`    ${err}  ${client.label}  ${c.red}— ${error}${c.reset}`);
+    }
+  }
+  if (results.some(r => r.client.id === 'claude-code' && r.status === 'current')) reportClaudePlugin();
+  console.log('');
+
+  const more = detectClients().filter(x => x.found && x.connected === 'no');
+  let added = [];
+  if (more.length && process.stdin.isTTY) {
+    const answer = await ask('  Connect more apps? [y/N]  ');
+    console.log('');
+    if (/^y(es)?$/i.test(answer.trim())) {
+      more.forEach((x, i) => console.log(`    ${String(i + 1).padStart(2)}. ${x.label}${x.note ? dim(`  (${x.note})`) : ''}`));
+      console.log('');
+      const picked = await ask('  Type the numbers of the apps to connect, or press Enter for none:  ');
+      console.log('');
+      const numbers = new Set(picked.split(/[\s,]+/).filter(Boolean).map(Number));
+      added = more.filter((x, i) => numbers.has(i + 1));
+      if (added.length) connectApps(added);
+    }
+  }
+
   await showFinalInstructions();
-
-  // ── Step 6: Restart prompt ────────────────────────────────────────────────
-  if (found.length > 0) {
+  if (added.length || results.some(r => r.status === 'current')) {
     console.log(dim('  Restart any configured apps to pick up the new settings.'));
     console.log('');
   }
-
   await finish();
+}
+
+function reportClaudePlugin() {
+  const plugin = installClaudePlugin();
+  if (plugin.kind === 'ok') {
+    console.log(`    ${ok}  ${plugin.line}`);
+  } else if (plugin.kind === 'failed') {
+    console.log('');
+    console.log(yellow(`  ⚠  Automatic project context for Claude Code was not set up, because the AI Bridge program at ${SERVICE_PATH} could not be run. Everything else installed normally. Run the installer again after fixing this.`));
+  }
+  // plugin.kind === 'absent': this build carries no plugin. Say nothing.
 }
 
 // Three outcomes, matching the ones the Windows GUI installer reads:

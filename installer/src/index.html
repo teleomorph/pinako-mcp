@@ -271,6 +271,8 @@
       transition: background 0.14s;
     }
 
+    .done-notices { margin-top: 12px; font-size: 13px; }
+
     .docs-btn:hover { background: var(--accent-dim); }
 
     /* ── Footer ───────────────────────────────────────────────────────────── */
@@ -343,30 +345,39 @@
 
     <!-- Screen 0: Welcome -->
     <div class="screen" id="s-welcome">
-      <h2>Welcome to Pinako AI Bridge</h2>
-      <p class="lead">
-        This connects your AI apps to your Pinako tab trees.
-      </p>
-      <p>
-        Your AI assistant will be able access and navigate your tabs,
-        libraries, notes, tags, memos and chronology, all through natural language.
-      </p>
-      <p>
-        The installer will detect your AI apps, write their MCP config files,
-        and install the Pinako MCP service to
-        <code style="font-size:12px;color:var(--sub)" id="install-path">%APPDATA%\Pinako\</code>.
-      </p>
+      <h2 id="welcome-title">Welcome to Pinako AI Bridge</h2>
+      <div id="welcome-install">
+        <p class="lead">
+          This connects your AI apps to your Pinako tab trees.
+        </p>
+        <p>
+          Your AI assistant will be able access and navigate your tabs,
+          libraries, notes, tags, memos and chronology, all through natural language.
+        </p>
+        <p>
+          The installer will detect your AI apps, write their MCP config files,
+          and install the Pinako MCP service to
+          <code style="font-size:12px;color:var(--sub)" id="install-path">%APPDATA%\Pinako\</code>.
+        </p>
+      </div>
+      <div id="welcome-update" class="hidden">
+        <p class="lead">
+          This updates the AI Bridge on this computer. The AI apps you have
+          connected stay connected, and no others are added.
+        </p>
+        <p id="welcome-connected"></p>
+      </div>
       <p class="terms">
-        By clicking Next, you agree to
+        By clicking <span id="terms-button">Next</span>, you agree to
         <a onclick="openLink('https://pinako.pro/terms')">pinako.pro/terms</a>.
       </p>
     </div>
 
     <!-- Screen 1: App selection -->
     <div class="screen" id="s-apps">
-      <h2>Configure AI Apps</h2>
+      <h2 id="apps-title">Configure AI Apps</h2>
       <div id="apps-detected">
-        <p>The following apps were detected. Select which to configure:</p>
+        <p id="apps-lead">The following apps were detected. Select which to configure:</p>
         <div class="app-list" id="app-list"></div>
       </div>
       <div id="apps-none" class="hidden">
@@ -394,8 +405,9 @@
 
     <!-- Screen 3: Done -->
     <div class="screen" id="s-done">
-      <h2>Installation Complete</h2>
-      <p class="lead">Pinako AI Bridge has been installed successfully.</p>
+      <h2 id="done-title">Installation Complete</h2>
+      <p class="lead" id="done-lead">Pinako AI Bridge has been installed successfully.</p>
+      <div id="done-notices" class="done-notices" role="status" hidden></div>
       <div class="mcp-box">
         <span class="mcp-label">MCP Server URL</span>
         <div class="mcp-url-row">

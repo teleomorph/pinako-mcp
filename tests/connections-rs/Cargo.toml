@@ -1,0 +1,16 @@
+# Runs the tests in installer/src-tauri/src/connections.rs without building the
+# installer (which embeds a 90 MB program):
+#   cargo test --manifest-path tests/connections-rs/Cargo.toml --target-dir <a temp folder>
+[package]
+name = "connections-rs"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+path = "../../installer/src-tauri/src/connections.rs"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"

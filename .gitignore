@@ -25,3 +25,6 @@ desktop.ini
 
 # Logs
 *.log
+
+tests/connections-rs/Cargo.lock
+tests/connections-rs/target/
