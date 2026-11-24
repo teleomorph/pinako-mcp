@@ -262,9 +262,10 @@ export function claudeDesktopFiles(client) {
   const inUse = (dir) => pathExists(dir) && !listDir(dir).some(n => n.startsWith('.user-data-left'));
   const settings = (dirs) => dirs.filter(inUse).map(d => path.join(d, 'claude_desktop_config.json'));
   const moved = settings(named(path.join(local, 'Claude-Data'), []));
-  if (moved.length) return moved;
   const store = settings(named(path.join(local, 'Packages'), ['LocalCache', 'Roaming', 'Claude']));
-  return [...store, ...(inUse(path.dirname(classic)) || !store.length ? [classic] : [])];
+  if (moved.length) return [...moved, ...store];
+  const left = listDir(path.dirname(classic)).some(n => n.startsWith('.user-data-left'));
+  return [...store, ...(left ? [] : [classic])];
 }
 
 /**
@@ -346,8 +347,8 @@ export function inspectClient(client, target = null) {
 export function detectClients() {
   return CLIENTS.map(client => ({
     ...client,
-    found: pathExists(client.detectPath)
-      || (client.id === 'claude-desktop' && claudeDesktopFiles(client).some(p => pathExists(path.dirname(p)))),
+    found: client.id === 'claude-desktop'
+      ? claudeDesktopFiles(client).some(p => pathExists(path.dirname(p))) : pathExists(client.detectPath),
     connected: inspectClient(client).connected,
   }));
 }

@@ -126,6 +126,12 @@ assert.equal(refreshClients().find(r => r.client.id === 'cursor').status, 'nokey
 assert.ok(fs.readFileSync(cursor, 'utf8').includes(token));
 fs.rmdirSync(TOKEN_PATH);
 
+// A sample of our table inside another server's text is that server's.
+const sample = 'x = 1\n[mcp_servers.a]\nargs = ["""\n[mcp_servers.Pinako]\n"""]\n[keep]\ny = 2\n';
+fs.writeFileSync(codex, sample);
+assert.equal(configureClient(of('codex')).ok, true);
+assert.ok(fs.readFileSync(codex, 'utf8').startsWith(sample.trimEnd()));
+
 // A servers map on one line cannot take a table: refused, not broken.
 fs.writeFileSync(codex, 'mcp_servers = { other = { url = "http://x" } }\n');
 assert.equal(configureClient(of('codex')).ok, false);

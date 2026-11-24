@@ -13,7 +13,7 @@ import { HOME, APPDATA, SERVICE_PATH } from './paths.js';
 import { buildMcpUrl, readToken } from './token.js';
 import { CLIENTS, claudeDesktopFiles, inspectClient, inspectFile, readSettings } from './detect.js';
 import {
-  SERVER_KEY, LEGACY_SERVER_KEYS, isOurEntry, parseJson, swapUrls, tomlHeader, tomlInlineEntry, tomlInlineMap,
+  SERVER_KEY, LEGACY_SERVER_KEYS, isOurEntry, parseJson, tomlHeader, tomlInlineEntry, tomlInlineMap, tomlStringLines, withKey,
 } from './connections.js';
 
 // ai-todo #67: the URL carries the machine-local access token.
@@ -158,8 +158,9 @@ function stripTomlTable(toml, key) {
   const nl = /\r\n/.test(toml) ? '\r\n' : '\n';
   const out = [];
   let skipping = false;
-  for (const line of toml.split(/\r?\n/)) {
-    const name = tomlHeader(line);
+  const inString = tomlStringLines(toml);
+  for (const [i, line] of toml.split(/\r?\n/).entries()) {
+    const name = inString[i] ? null : tomlHeader(line);
     if (name) {
       skipping = name[0] === 'mcp_servers' && name[1] === key;
       if (skipping) continue; // drop the table header itself
@@ -386,6 +387,7 @@ const writers = {
     // settings that are there.
     const files = claudeDesktopFiles({ configPath });
     const p = files.find(f => fs.existsSync(f)) || files[0];
+    if (!p) throw new Error('its settings could not be found');
     const config = readJson(p);
     config.mcpServers = config.mcpServers || {};
     // Claude Desktop only supports stdio MCP servers (command + args).
@@ -649,7 +651,7 @@ function refreshViaClaudeCli(target) {
   for (const key of [SERVER_KEY, ...LEGACY_SERVER_KEYS]) {
     const e = servers[key];
     if (!isOurEntry(e) || Object.keys(e).some(k => k !== 'type' && k !== 'url')) continue;
-    const url = swapUrls(String(e.url), target);
+    const url = withKey(String(e.url), target);
     if (url === e.url && e.type === 'http') continue;
     // The command line is a shell's on Windows: only our own address goes there.
     if (url !== target.url) continue;

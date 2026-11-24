@@ -18,69 +18,48 @@ export const LEGACY_SERVER_KEYS = ['pinako'];
 const OUR_KEYS = [SERVER_KEY, ...LEGACY_SERVER_KEYS];
 
 const URL_KEYS = ['url', 'httpUrl', 'serverUrl'];
-const HOSTS = ['http://127.0.0.1:37421', 'http://localhost:37421', 'http://[::1]:37421'];
+const ADDRESS = String.raw`http://(?:127\.0\.0\.1|localhost|\[::1\]):37421(?:[/?][^\s"'\x60\\<>]*)?`;
 const SERVICE_NAME = 'pinako-mcp-service';
 
 // ── The Bridge's own address ─────────────────────────────────────────────────
 // This computer only. An entry of our name that points anywhere else (the hosted
 // connector, another machine) is the user's, and must never be handed the key.
 
-function isUrlEnd(c) {
-  return /\s/.test(c) || '"\'`#,}]\\<>'.includes(c);
-}
+// And only as a WHOLE value: an address inside another one, a comment or a note
+// is not where an entry connects to.
 
-/** [start, end] of the first Bridge address at or after `from`, or null. */
-function findUrl(s, from = 0) {
-  let best = null;
-  for (const host of HOSTS) {
-    for (let at = s.indexOf(host, from); at !== -1; at = s.indexOf(host, at + 1)) {
-      if (best && at >= best[0]) break;
-      // Part of some other address (https://elsewhere/?to=http://127...).
-      if (at > 0 && !/[\s"'`]/.test(s[at - 1])) continue;
-      let end = at + host.length, open = 0;
-      // Another port (374210) or a name that only starts like ours.
-      if (end < s.length && !'/?'.includes(s[end]) && !isUrlEnd(s[end])) continue;
-      for (; end < s.length; end++) {
-        if (s[end] === '{') open++;
-        else if (s[end] === '}' && open) open--; // the end of a ${NAME}, not of the address
-        else if (isUrlEnd(s[end])) break;
-      }
-      best = [at, end];
-      break;
-    }
-  }
-  return best;
-}
-
-const hasUrl = (s) => typeof s === 'string' && findUrl(s) !== null;
+const WHOLE = new RegExp(`^${ADDRESS}$`);
+const ANYWHERE = new RegExp(ADDRESS);
+const QUOTED = new RegExp(`(["'])(${ADDRESS})\\1`, 'g');
+const isAddress = (s) => typeof s === 'string' && WHOLE.test(s);
 
 /**
  * One Bridge address with the current key. Only the key changes: the path may
- * pick a tool profile, and the host spelling is the person's. One that takes the
- * key from their own ${NAME} is left as written.
+ * pick a tool profile, and the host spelling is the person's. A key they take
+ * from their own ${NAME} is left as written.
  */
-function withKey(was, token) {
-  if (was.includes('${')) return was;
+export function withKey(was, target) {
   const cut = was.indexOf('?');
   let base = cut === -1 ? was : was.slice(0, cut);
-  const rest = cut === -1 ? [] : was.slice(cut + 1).split('&').filter(p => p && !p.startsWith('token='));
-  if (HOSTS.includes(base)) base += '/mcp';
-  else if (HOSTS.includes(base.slice(0, -1))) base += 'mcp';
-  return `${base}?${[`token=${token}`, ...rest].join('&')}`;
+  const parts = cut === -1 ? [] : was.slice(cut + 1).split('&').filter(Boolean);
+  if (parts.some(p => p.startsWith('token=${'))) return was;
+  if (/:37421$/.test(base)) base += '/mcp';
+  else if (/:37421\/$/.test(base)) base += 'mcp';
+  return `${base}?${[`token=${target.token}`, ...parts.filter(p => !p.startsWith('token='))].join('&')}`;
 }
 
-/** Every Bridge address in `s` made current. */
-export function swapUrls(s, target) {
-  let out = '', pos = 0;
-  for (let hit = findUrl(s); hit; hit = findUrl(s, hit[1])) {
-    out += s.slice(pos, hit[0]) + withKey(s.slice(hit[0], hit[1]), target.token);
-    pos = hit[1];
-  }
-  return out + s.slice(pos);
+/** The quoted addresses in one line of settings made current: [found, line]. */
+function keyQuoted(line, target) {
+  let found = false;
+  const next = line.replace(QUOTED, (all, q, address) => {
+    found = true;
+    return target ? q + withKey(address, target) + q : all;
+  });
+  return [found, next];
 }
 
 const isService = (s) => typeof s === 'string' && /pinako-mcp-service(\.exe)?$/i.test(s);
-const mentions = (s) => hasUrl(s) || s.toLowerCase().includes(SERVICE_NAME);
+const mentions = (s) => ANYWHERE.test(s) || s.toLowerCase().includes(SERVICE_NAME);
 
 // ── JSON settings ────────────────────────────────────────────────────────────
 
@@ -104,19 +83,22 @@ function shape(kind, target) {
 const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 
 export function isOurEntry(e) {
-  return isObj(e) && (URL_KEYS.some(k => hasUrl(e[k])) || isService(e.command)
-    || (Array.isArray(e.args) && e.args.some(hasUrl)));
+  if (!isObj(e)) return false;
+  // An entry that also names another server is not ours to change.
+  if (URL_KEYS.some(k => typeof e[k] === 'string' && e[k] && !isAddress(e[k]))) return false;
+  return URL_KEYS.some(k => isAddress(e[k])) || isService(e.command)
+    || (Array.isArray(e.args) && e.args.some(isAddress));
 }
 
 function refreshEntry(kind, e, target) {
-  const key = URL_KEYS.find(k => hasUrl(e[k]));
+  const key = URL_KEYS.find(k => isAddress(e[k]));
   if (!key) {
     const out = { ...e };
     if (isService(e.command)) out.command = target.service;
-    if (Array.isArray(e.args)) out.args = e.args.map(a => (hasUrl(a) ? swapUrls(a, target) : a));
+    if (Array.isArray(e.args)) out.args = e.args.map(a => (isAddress(a) ? withKey(a, target) : a));
     return out;
   }
-  const url = swapUrls(e[key], target);
+  const url = withKey(e[key], target);
   // Windsurf reads either spelling: keep the person's.
   const want = kind === 'windsurf' ? { [key]: url } : shape(kind, { ...target, url });
   const out = {};
@@ -150,9 +132,9 @@ function inspectJson(kind, text, target) {
   if (kind === 'continue-json') {
     const list = root?.experimental?.modelContextProtocolServers;
     for (const s of Array.isArray(list) ? list : []) {
-      if (!hasUrl(s?.transport?.url)) continue;
+      if (!isAddress(s?.transport?.url)) continue;
       found = true;
-      if (target) put(s.transport, 'url', swapUrls(s.transport.url, target));
+      if (target) put(s.transport, 'url', withKey(s.transport.url, target));
     }
   } else {
     let map = root;
@@ -176,46 +158,79 @@ export function tomlHeader(line) {
 
 const isOurTable = (h) => h.length === 2 && h[0] === 'mcp_servers' && OUR_KEYS.includes(h[1]);
 
+/** For each line: does it start inside a multi-line string, where nothing is a table or a key? */
+export function tomlStringLines(text) {
+  const out = [];
+  let open = null; // the quote a string was opened with
+  for (const line of text.split('\n')) {
+    out.push(open !== null);
+    for (let i = 0; i < line.length; i++) {
+      const three = line.slice(i, i + 3);
+      if (open === null) {
+        if (line[i] === '#') break;
+        if (three === '"""' || three === "'''") { open = three; i += 2; }
+        else if (line[i] === '"' || line[i] === "'") open = line[i];
+      } else if (open[0] === '"' && line[i] === '\\') i++;
+      else if (open.length === 3 ? three === open : line[i] === open) { i += open.length - 1; open = null; }
+    }
+    if (open !== null && open.length === 1) open = null; // a plain string ends with its line
+  }
+  return out;
+}
+
+function tomlLines(text) {
+  const masked = tomlStringLines(text);
+  return text.split('\n').filter((_, i) => !masked[i]);
+}
+
 /** Our entry written as an inline value or a dotted key, which we do not edit. */
 export function tomlInlineEntry(text) {
-  return text.split(/\r?\n/).some(l =>
+  return tomlLines(text).some(l =>
     /^\s*(?:["']?mcp_servers["']?\s*\.\s*)?["']?pinako["']?\s*[=.]/i.test(l)
     || /^\s*["']?mcp_servers["']?\s*=.*pinako/i.test(l));
 }
 
 /** A servers map written on one line: a table of ours cannot be added to it. */
 export function tomlInlineMap(text) {
-  return /^\s*["']?mcp_servers["']?\s*=/m.test(text);
+  return tomlLines(text).some(l => /^\s*["']?mcp_servers["']?\s*=/.test(l));
 }
 
 function inspectToml(text, target) {
-  let inside = false, found = false, quoted = null;
-  const lines = text.split('\n').map(line => {
-    // Inside a multi-line string nothing is a table or an address of ours.
-    for (const q of !quoted && line.trim().startsWith('#') ? [] : ['"""', "'''"]) {
-      if (quoted && quoted !== q) continue;
-      const ends = line.split(q).length - 1;
-      if (quoted === q) {
-        if (ends % 2) quoted = null;
-        return line;
-      }
-      if (ends % 2) quoted = q;
-    }
+  const masked = tomlStringLines(text);
+  let inside = false, found = false, hidden = false;
+  const lines = text.split('\n').map((line, i) => {
+    if (masked[i]) return line;
     const header = tomlHeader(line);
     if (header) { inside = isOurTable(header); return line; }
     if (!inside || line.trim().startsWith('#') || !mentions(line)) return line;
-    found = true;
-    return target ? swapUrls(line, target) : line;
+    const key = /^\s*(url|args|command)\s*=/.exec(line)?.[1];
+    const [code, note] = splitNote(line);
+    // `url` is one address and nothing else; `args` may hold it among others.
+    const [hit, next] = key === 'args' || (key === 'url' && ONE_QUOTED.test(code.replace(/^[^=]*=/, '').trim()))
+      ? keyQuoted(code, target) : [false, code];
+    if (hit || (key === 'command' && mentions(code))) found = true;
+    else hidden = true;
+    return next + note;
   });
-  if (!found) return { status: tomlInlineEntry(text) && mentions(text) ? 'unreadable' : 'no', next: null };
+  if (!found) {
+    return { status: hidden || (tomlInlineEntry(text) && mentions(text)) ? 'unreadable' : 'no', next: null };
+  }
   const next = lines.join('\n');
   return { status: 'yes', next: next === text ? null : next };
+}
+
+const ONE_QUOTED = new RegExp(`^(["'])${ADDRESS}\\1$`);
+
+/** A line's own text and the comment after it. */
+function splitNote(line) {
+  const m = /\s#.*$/s.exec(line);
+  return m ? [line.slice(0, m.index), line.slice(m.index)] : [line, ''];
 }
 
 // ── YAML settings (Hermes, Continue.dev) ─────────────────────────────────────
 
 function inspectHermes(text, target) {
-  let inBlock = false, childIndent = -1, inside = false, found = false, flow = false;
+  let inBlock = false, childIndent = -1, inside = false, found = false, hidden = false, flow = false;
   const lines = text.split('\n').map(line => {
     const bare = line.trim();
     if (!bare || bare.startsWith('#')) return line;
@@ -232,20 +247,41 @@ function inspectHermes(text, target) {
     if (childIndent === -1) childIndent = indent;
     if (indent <= childIndent) inside = /^["']?[Pp]inako["']?\s*:/.test(bare);
     if (!inside || !mentions(line)) return line;
-    found = true;
-    return target ? swapUrls(line, target) : line;
+    const [hit, next] = keyYaml(line, target);
+    if (hit) found = true;
+    else hidden = true;
+    return next;
   });
-  if (!found) return { status: flow && mentions(text) ? 'unreadable' : 'no', next: null };
+  if (!found) return { status: hidden || (flow && mentions(text)) ? 'unreadable' : 'no', next: null };
   const next = lines.join('\n');
   return { status: 'yes', next: next === text ? null : next };
 }
 
-/** Continue's file is ours alone: any Bridge address in it counts. */
+/**
+ * A YAML line that gives the address: `url: …`, `- …` in a list, or
+ * `Pinako: { url: "…" }` on one line. [found, line].
+ */
+function keyYaml(line, target) {
+  const [code, note] = splitNote(line);
+  const m = YAML_VALUE.exec(code);
+  if (m) return [true, target ? m[1] + m[2] + withKey(m[3], target) + m[2] + m[4] + note : line];
+  if (!/^\s*["']?[Pp]inako["']?\s*:\s*\{\s*["']?url["']?\s*:/.test(code)) return [false, line];
+  const [hit, next] = keyQuoted(code, target);
+  return [hit, next + note];
+}
+
+const YAML_VALUE = new RegExp(`^(\\s*(?:-\\s*)?(?:["']?url["']?\\s*:\\s*)?)(["']?)(${ADDRESS})\\2(\\s*)$`);
+
+/** Continue's file is ours alone: any line of it that gives the address counts. */
 function inspectOwnYaml(text, target) {
-  const live = text.split('\n').some(l => !l.trim().startsWith('#') && mentions(l));
-  if (!live) return { status: 'no', next: null };
-  const next = target ? swapUrls(text, target) : text;
-  return { status: 'yes', next: next === text ? null : next };
+  let found = false;
+  const next = text.split('\n').map(line => {
+    if (line.trim().startsWith('#')) return line;
+    const [hit, now] = keyYaml(line, target);
+    found ||= hit;
+    return now;
+  }).join('\n');
+  return { status: found ? 'yes' : 'no', next: found && next !== text ? next : null };
 }
 
 // ── The one entry point ──────────────────────────────────────────────────────

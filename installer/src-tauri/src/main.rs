@@ -4,7 +4,7 @@
 mod connections;
 mod replace;
 
-use connections::{inspect, is_our_entry, swap_urls, toml_header, toml_inline_entry, toml_inline_map, Inspected, Status, Target, LEGACY_SERVER_KEYS, SERVER_KEY};
+use connections::{inspect, is_our_entry, toml_header, toml_inline_entry, toml_inline_map, toml_string_lines, with_key, Inspected, Status, Target, LEGACY_SERVER_KEYS, SERVER_KEY};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -219,22 +219,18 @@ fn claude_desktop_files(appdata: &Path) -> Vec<PathBuf> {
     };
     let moved: Vec<PathBuf> = homes(local_appdata().join("Claude-Data")).iter()
         .filter(|d| d.is_dir() && !left(d)).map(|d| file(d)).collect();
-    if !moved.is_empty() {
-        return moved;
-    }
-    let mut files: Vec<PathBuf> = homes(local_appdata().join("Packages")).into_iter()
+    let store: Vec<PathBuf> = homes(local_appdata().join("Packages")).into_iter()
         .map(|d| d.join("LocalCache").join("Roaming").join("Claude"))
         .filter(|d| !left(d)).map(|d| file(&d)).collect();
-    if files.is_empty() || (classic.exists() && !left(&classic)) {
-        files.push(file(&classic));
-    }
-    files
+    let last = if moved.is_empty() && !left(&classic) { Some(file(&classic)) } else { None };
+    moved.into_iter().chain(store).chain(last).collect()
 }
 
 fn detect_claude_desktop(appdata: &Path) -> ClientInfo {
     let mut info = client("claude-desktop", "Claude Desktop", appdata.join("Claude"), None);
-    info.detected |= cfg!(windows) && claude_desktop_files(appdata).iter()
-        .any(|p| p.parent() != Some(appdata.join("Claude").as_path()));
+    let packages = local_appdata().join("Packages");
+    info.detected = claude_desktop_files(appdata).iter()
+        .any(|p| p.parent().is_some_and(Path::exists) || (cfg!(windows) && p.starts_with(&packages)));
     info
 }
 
@@ -401,7 +397,7 @@ fn refresh_via_claude_cli(path: &Path, target: &Target) -> Result<(), String> {
         let entry = &cfg["mcpServers"][*key];
         let Some(e) = entry.as_object().filter(|_| is_our_entry(entry)) else { continue };
         let url = e.get("url").and_then(|u| u.as_str()).unwrap_or("");
-        let now_url = swap_urls(url, target);
+        let now_url = with_key(url, target);
         if e.keys().any(|k| k != "type" && k != "url") || (now_url == url && entry["type"] == "http") {
             continue;
         }
@@ -1013,7 +1009,9 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
             // Only the file it reads: a new one in a home read earlier would
             // hide the settings that are there.
             let files = claude_desktop_files(appdata);
-            write_claude_desktop_config(files.iter().find(|f| f.exists()).unwrap_or(&files[0]))
+            let file = files.iter().find(|f| f.exists()).or(files.first())
+                .ok_or("its settings could not be found")?;
+            write_claude_desktop_config(file)
         }
         "cursor" => {
             let path = home.join(".cursor").join("mcp.json");
@@ -1200,8 +1198,8 @@ fn strip_toml_table(toml: &str, key: &str) -> String {
     let nl = if toml.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out: Vec<&str> = Vec::new();
     let mut skipping = false;
-    for line in toml.lines() {
-        if let Some(name) = toml_header(line) {
+    for (line, in_string) in toml.lines().zip(toml_string_lines(toml)) {
+        if let Some(name) = toml_header(line).filter(|_| !in_string) {
             skipping = name.len() > 1 && name[0] == "mcp_servers" && name[1] == key;
             if skipping { continue; } // drop the table header itself
         }

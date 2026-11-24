@@ -19,7 +19,6 @@ pub const LEGACY_SERVER_KEYS: &[&str] = &["pinako"];
 const OUR_KEYS: &[&str] = &["Pinako", "pinako"];
 
 const URL_KEYS: &[&str] = &["url", "httpUrl", "serverUrl"];
-const HOSTS: &[&str] = &["http://127.0.0.1:37421", "http://localhost:37421", "http://[::1]:37421"];
 const SERVICE_NAME: &str = "pinako-mcp-service";
 
 /// What a refreshed entry should carry.
@@ -46,6 +45,10 @@ fn answer(status: Status, next: Option<String>) -> Inspected {
     Inspected { status, next }
 }
 
+macro_rules! address {
+    () => { r#"http://(?:127\.0\.0\.1|localhost|\[::1\]):37421(?:[/?][^\s"'`\\<>]*)?"# };
+}
+
 macro_rules! re {
     ($text:expr) => {{
         static RE: OnceLock<Regex> = OnceLock::new();
@@ -57,80 +60,42 @@ macro_rules! re {
 // This computer only. An entry of our name that points anywhere else (the hosted
 // connector, another machine) is the user's, and must never be handed the key.
 
-fn is_url_end(c: char) -> bool {
-    c.is_whitespace() || "\"'`#,}]\\<>".contains(c)
-}
+// And only as a WHOLE value: an address inside another one, a comment or a note
+// is not where an entry connects to.
 
-/// Start and end of the first Bridge address at or after `from`.
-fn find_url(s: &str, from: usize) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize)> = None;
-    for host in HOSTS {
-        let mut pos = from;
-        while let Some(i) = s[pos..].find(host) {
-            let at = pos + i;
-            if best.is_some_and(|b| at >= b.0) {
-                break;
-            }
-            let end = at + host.len();
-            // Part of some other address (https://elsewhere/?to=http://127...).
-            if s[..at].chars().next_back().is_some_and(|c| !c.is_whitespace() && !"\"'`".contains(c)) {
-                pos = end;
-                continue;
-            }
-            // Another port (374210) or a name that only starts like ours.
-            if s[end..].chars().next().is_some_and(|c| c != '/' && c != '?' && !is_url_end(c)) {
-                pos = end;
-                continue;
-            }
-            let mut open = 0;
-            let stop = s[end..].char_indices().find(|(_, c)| match c {
-                '{' => { open += 1; false }
-                '}' if open > 0 => { open -= 1; false } // the end of a ${NAME}, not of the address
-                c => is_url_end(*c),
-            }).map_or(s.len(), |(n, _)| end + n);
-            best = Some((at, stop));
-            break;
-        }
-    }
-    best
-}
-
-fn has_url(s: &str) -> bool {
-    find_url(s, 0).is_some()
+fn is_address(s: &str) -> bool {
+    re!(concat!("^", address!(), "$")).is_match(s)
 }
 
 /// One Bridge address with the current key. Only the key changes: the path may
-/// pick a tool profile, and the host spelling is the person's. One that takes the
-/// key from their own ${NAME} is left as written.
-fn with_key(was: &str, token: &str) -> String {
-    if was.contains("${") {
+/// pick a tool profile, and the host spelling is the person's. A key they take
+/// from their own ${NAME} is left as written.
+pub fn with_key(was: &str, t: &Target) -> String {
+    let (base, query) = was.split_once('?').unwrap_or((was, ""));
+    let parts: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    if parts.iter().any(|p| p.starts_with("token=${")) {
         return was.to_string();
     }
-    let (base, query) = was.split_once('?').unwrap_or((was, ""));
-    let path = match base {
-        b if HOSTS.contains(&b) => "/mcp",
-        b if b.strip_suffix('/').is_some_and(|h| HOSTS.contains(&h)) => "mcp",
-        _ => "",
-    };
-    let mut out = format!("{base}{path}?token={token}");
-    for p in query.split('&').filter(|p| !p.is_empty() && !p.starts_with("token=")) {
+    let path = if base.ends_with(":37421") { "/mcp" } else if base.ends_with(":37421/") { "mcp" } else { "" };
+    let mut out = format!("{base}{path}?token={}", t.token);
+    for p in parts.iter().filter(|p| !p.starts_with("token=")) {
         out.push('&');
         out.push_str(p);
     }
     out
 }
 
-/// Every Bridge address in `s` made current.
-pub fn swap_urls(s: &str, t: &Target) -> String {
-    let mut out = String::new();
-    let mut pos = 0;
-    while let Some((at, end)) = find_url(s, pos) {
-        out.push_str(&s[pos..at]);
-        out.push_str(&with_key(&s[at..end], &t.token));
-        pos = end;
-    }
-    out.push_str(&s[pos..]);
-    out
+/// The quoted addresses in one line of settings made current: whether there were any, and the line.
+fn key_quoted(line: &str, target: Option<&Target>) -> (bool, String) {
+    let quoted = re!(concat!("\"(", address!(), ")\"|'(", address!(), ")'"));
+    let found = quoted.is_match(line);
+    let Some(t) = target else { return (found, line.to_string()) };
+    let next = quoted.replace_all(line, |c: &regex::Captures| {
+        let q = &c[0][..1];
+        let was = c.get(1).or_else(|| c.get(2)).map_or("", |m| m.as_str());
+        format!("{q}{}{q}", with_key(was, t))
+    });
+    (found, next.into_owned())
 }
 
 fn is_service(s: &str) -> bool {
@@ -139,7 +104,7 @@ fn is_service(s: &str) -> bool {
 }
 
 fn mentions(s: &str) -> bool {
-    has_url(s) || s.to_lowercase().contains(SERVICE_NAME)
+    re!(address!()).is_match(s) || s.to_lowercase().contains(SERVICE_NAME)
 }
 
 // ── JSON settings ────────────────────────────────────────────────────────────
@@ -172,15 +137,19 @@ fn str_of<'a>(e: &'a Map<String, Value>, key: &str) -> &'a str {
 }
 
 fn our_url_key(e: &Map<String, Value>) -> Option<&'static str> {
-    URL_KEYS.iter().copied().find(|k| has_url(str_of(e, k)))
+    URL_KEYS.iter().copied().find(|k| is_address(str_of(e, k)))
 }
 
 pub fn is_our_entry(v: &Value) -> bool {
     let Some(e) = v.as_object() else { return false };
+    // An entry that also names another server is not ours to change.
+    if URL_KEYS.iter().any(|k| !str_of(e, k).is_empty() && !is_address(str_of(e, k))) {
+        return false;
+    }
     our_url_key(e).is_some()
         || is_service(str_of(e, "command"))
         || e.get("args").and_then(Value::as_array)
-            .is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(has_url)))
+            .is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(is_address)))
 }
 
 fn refresh_entry(kind: &str, e: &Map<String, Value>, t: &Target) -> Map<String, Value> {
@@ -191,7 +160,7 @@ fn refresh_entry(kind: &str, e: &Map<String, Value>, t: &Target) -> Map<String, 
         }
         if let Some(args) = out.get_mut("args").and_then(Value::as_array_mut) {
             for a in args {
-                let now = a.as_str().filter(|s| has_url(s)).map(|s| swap_urls(s, t));
+                let now = a.as_str().filter(|s| is_address(s)).map(|s| with_key(s, t));
                 if let Some(now) = now {
                     *a = json!(now);
                 }
@@ -199,7 +168,7 @@ fn refresh_entry(kind: &str, e: &Map<String, Value>, t: &Target) -> Map<String, 
         }
         return out;
     };
-    let now = swap_urls(str_of(e, key), t);
+    let now = with_key(str_of(e, key), t);
     // Windsurf reads either spelling: keep the person's.
     let want = if kind == "windsurf" {
         Map::from_iter([(key.to_string(), json!(now))])
@@ -234,10 +203,10 @@ fn inspect_json(kind: &str, text: &str, target: Option<&Target>) -> Inspected {
         let list = root.pointer_mut("/experimental/modelContextProtocolServers").and_then(Value::as_array_mut);
         for s in list.into_iter().flatten() {
             let Some(url) = s.pointer_mut("/transport/url") else { continue };
-            let Some(was) = url.as_str().filter(|u| has_url(u)).map(String::from) else { continue };
+            let Some(was) = url.as_str().filter(|u| is_address(u)).map(String::from) else { continue };
             found = true;
             if let Some(t) = target {
-                let now = swap_urls(&was, t);
+                let now = with_key(&was, t);
                 changed |= now != was;
                 *url = json!(now);
             }
@@ -278,34 +247,69 @@ fn is_our_table(h: &[String]) -> bool {
     h.len() == 2 && h[0] == "mcp_servers" && OUR_KEYS.contains(&h[1].as_str())
 }
 
+/// For each line: does it start inside a multi-line string, where nothing is a table or a key?
+pub fn toml_string_lines(text: &str) -> Vec<bool> {
+    let mut out = Vec::new();
+    let mut open: Option<&str> = None; // the quote a string was opened with
+    for line in text.split('\n') {
+        out.push(open.is_some());
+        let mut rest = line;
+        while let Some(c) = rest.chars().next() {
+            let mut step = c.len_utf8();
+            match open {
+                None if c == '#' => break,
+                None => {
+                    if let Some(q) = ["\"\"\"", "'''", "\"", "'"].into_iter().find(|q| rest.starts_with(q)) {
+                        open = Some(q);
+                        step = q.len();
+                    }
+                }
+                Some(q) if q.starts_with('"') && c == '\\' => {
+                    step += rest[step..].chars().next().map_or(0, char::len_utf8);
+                }
+                Some(q) if rest.starts_with(q) => {
+                    open = None;
+                    step = q.len();
+                }
+                Some(_) => {}
+            }
+            rest = &rest[step..];
+        }
+        if open.is_some_and(|q| q.len() == 1) {
+            open = None; // a plain string ends with its line
+        }
+    }
+    out
+}
+
+fn toml_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\n').zip(toml_string_lines(text)).filter(|(_, masked)| !masked).map(|(l, _)| l)
+}
+
 /// Our entry written as an inline value or a dotted key, which we do not edit.
 pub fn toml_inline_entry(text: &str) -> bool {
     let dotted = re!(r#"(?i)^\s*(?:["']?mcp_servers["']?\s*\.\s*)?["']?pinako["']?\s*[=.]"#);
     let inline = re!(r#"(?i)^\s*["']?mcp_servers["']?\s*=.*pinako"#);
-    text.lines().any(|l| dotted.is_match(l) || inline.is_match(l))
+    toml_lines(text).any(|l| dotted.is_match(l) || inline.is_match(l))
 }
 
 /// A servers map written on one line: a table of ours cannot be added to it.
 pub fn toml_inline_map(text: &str) -> bool {
-    re!(r#"(?m)^\s*["']?mcp_servers["']?\s*="#).is_match(text)
+    toml_lines(text).any(|l| re!(r#"^\s*["']?mcp_servers["']?\s*="#).is_match(l))
+}
+
+/// A line's own text and the comment after it.
+fn split_note(line: &str) -> (&str, &str) {
+    line.split_at(re!(r"\s#").find(line).map_or(line.len(), |m| m.start()))
 }
 
 fn inspect_toml(text: &str, target: Option<&Target>) -> Inspected {
-    let mut inside = false;
-    let mut found = false;
-    let mut quoted: Option<&str> = None;
-    let lines: Vec<String> = text.split('\n').map(|line| {
-        // Inside a multi-line string nothing is a table or an address of ours.
-        for q in ["\"\"\"", "'''"] {
-            if quoted.is_some_and(|open| open != q) || (quoted.is_none() && line.trim().starts_with('#')) {
-                continue;
-            }
-            let odd = line.matches(q).count() % 2 == 1;
-            if quoted.is_some() {
-                if odd { quoted = None; }
-                return line.to_string();
-            }
-            if odd { quoted = Some(q); }
+    let field = re!(r"^\s*(url|args|command)\s*=(.*)$");
+    let one = re!(concat!("^(?:\"", address!(), "\"|'", address!(), "')$"));
+    let (mut inside, mut found, mut hidden) = (false, false, false);
+    let lines: Vec<String> = text.split('\n').zip(toml_string_lines(text)).map(|(line, masked)| {
+        if masked {
+            return line.to_string();
         }
         if let Some(h) = toml_header(line) {
             inside = is_our_table(&h);
@@ -314,12 +318,22 @@ fn inspect_toml(text: &str, target: Option<&Target>) -> Inspected {
         if !inside || line.trim().starts_with('#') || !mentions(line) {
             return line.to_string();
         }
-        found = true;
-        target.map_or_else(|| line.to_string(), |t| swap_urls(line, t))
+        let (code, note) = split_note(line);
+        let caps = field.captures(code);
+        let key = caps.as_ref().and_then(|c| c.get(1)).map_or("", |m| m.as_str());
+        let value = caps.as_ref().and_then(|c| c.get(2)).map_or("", |m| m.as_str()).trim();
+        // `url` is one address and nothing else; `args` may hold it among others.
+        let (hit, next) = if key == "args" || (key == "url" && one.is_match(value)) {
+            key_quoted(code, target)
+        } else {
+            (false, code.to_string())
+        };
+        if hit || (key == "command" && mentions(code)) { found = true } else { hidden = true }
+        next + note
     }).collect();
     if !found {
-        let hidden = toml_inline_entry(text) && mentions(text);
-        return answer(if hidden { Status::Unreadable } else { Status::No }, None);
+        let unseen = hidden || (toml_inline_entry(text) && mentions(text));
+        return answer(if unseen { Status::Unreadable } else { Status::No }, None);
     }
     let next = lines.join("\n");
     answer(Status::Yes, Some(next).filter(|n| n != text))
@@ -330,7 +344,7 @@ fn inspect_toml(text: &str, target: Option<&Target>) -> Inspected {
 fn inspect_hermes(text: &str, target: Option<&Target>) -> Inspected {
     let top = re!(r#"^["']?mcp_servers["']?\s*:(.*)$"#);
     let child = re!(r#"^["']?[Pp]inako["']?\s*:"#);
-    let (mut in_block, mut inside, mut found, mut flow) = (false, false, false, false);
+    let (mut in_block, mut inside, mut found, mut hidden, mut flow) = (false, false, false, false, false);
     let mut child_indent: Option<usize> = None;
     let lines: Vec<String> = text.split('\n').map(|line| {
         let bare = line.trim();
@@ -355,23 +369,49 @@ fn inspect_hermes(text: &str, target: Option<&Target>) -> Inspected {
         if !inside || !mentions(line) {
             return line.to_string();
         }
-        found = true;
-        target.map_or_else(|| line.to_string(), |t| swap_urls(line, t))
+        let (hit, next) = key_yaml(line, target);
+        if hit { found = true } else { hidden = true }
+        next
     }).collect();
     if !found {
-        return answer(if flow && mentions(text) { Status::Unreadable } else { Status::No }, None);
+        return answer(if hidden || (flow && mentions(text)) { Status::Unreadable } else { Status::No }, None);
     }
     let next = lines.join("\n");
     answer(Status::Yes, Some(next).filter(|n| n != text))
 }
 
-/// Continue's file is ours alone: any Bridge address in it counts.
+/// A YAML line that gives the address: `url: …`, `- …` in a list, or
+/// `Pinako: { url: "…" }` on one line. Whether it does, and the line.
+fn key_yaml(line: &str, target: Option<&Target>) -> (bool, String) {
+    let value = re!(concat!(r#"^(\s*(?:-\s*)?(?:["']?url["']?\s*:\s*)?)(["']?)("#, address!(), r#")(["']?)(\s*)$"#));
+    let (code, note) = split_note(line);
+    if let Some(c) = value.captures(code).filter(|c| c[2] == c[4]) {
+        let now = target.map_or_else(|| c[3].to_string(), |t| with_key(&c[3], t));
+        return (true, format!("{}{}{now}{}{}{note}", &c[1], &c[2], &c[4], &c[5]));
+    }
+    if !re!(r#"^\s*["']?[Pp]inako["']?\s*:\s*\{\s*["']?url["']?\s*:"#).is_match(code) {
+        return (false, line.to_string());
+    }
+    let (hit, next) = key_quoted(code, target);
+    (hit, next + note)
+}
+
+/// Continue's file is ours alone: any line of it that gives the address counts.
 fn inspect_own_yaml(text: &str, target: Option<&Target>) -> Inspected {
-    if !text.split('\n').any(|l| !l.trim().starts_with('#') && mentions(l)) {
+    let mut found = false;
+    let lines: Vec<String> = text.split('\n').map(|line| {
+        if line.trim().starts_with('#') {
+            return line.to_string();
+        }
+        let (hit, next) = key_yaml(line, target);
+        found |= hit;
+        next
+    }).collect();
+    if !found {
         return answer(Status::No, None);
     }
-    let next = target.map(|t| swap_urls(text, t)).filter(|n| n != text);
-    answer(Status::Yes, next)
+    let next = lines.join("\n");
+    answer(Status::Yes, Some(next).filter(|n| n != text))
 }
 
 // ── The one entry point ──────────────────────────────────────────────────────
