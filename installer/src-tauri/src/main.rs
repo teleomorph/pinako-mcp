@@ -215,7 +215,9 @@ fn claude_desktop_files(appdata: &Path) -> Vec<PathBuf> {
     };
     let left = |d: &Path| names(d).iter().any(|n| n.starts_with(".user-data-left"));
     let homes = |d: PathBuf| -> Vec<PathBuf> {
-        names(&d).into_iter().filter(|n| n.to_lowercase().starts_with("claude_")).map(|n| d.join(n)).collect()
+        names(&d).into_iter()
+            .filter(|n| { let n = n.to_lowercase(); n.starts_with("claude_") || n.contains(".claude_") })
+            .map(|n| d.join(n)).collect()
     };
     let moved: Vec<PathBuf> = homes(local_appdata().join("Claude-Data")).iter()
         .filter(|d| d.is_dir() && !left(d)).map(|d| file(d)).collect();

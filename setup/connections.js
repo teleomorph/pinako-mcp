@@ -171,7 +171,12 @@ export function tomlStringLines(text) {
         if (three === '"""' || three === "'''") { open = three; i += 2; }
         else if (line[i] === '"' || line[i] === "'") open = line[i];
       } else if (open[0] === '"' && line[i] === '\\') i++;
-      else if (open.length === 3 ? three === open : line[i] === open) { i += open.length - 1; open = null; }
+      else if (open.length === 3 ? three === open : line[i] === open) {
+        i += open.length - 1;
+        // Up to two more quotes right here are the string's own last characters.
+        for (let n = 0; open.length === 3 && n < 2 && line[i + 1] === open[0]; n++) i++;
+        open = null;
+      }
     }
     if (open !== null && open.length === 1) open = null; // a plain string ends with its line
   }
@@ -265,10 +270,14 @@ function keyYaml(line, target) {
   const [code, note] = splitNote(line);
   const m = YAML_VALUE.exec(code);
   if (m) return [true, target ? m[1] + m[2] + withKey(m[3], target) + m[2] + m[4] + note : line];
-  if (!/^\s*["']?[Pp]inako["']?\s*:\s*\{\s*["']?url["']?\s*:/.test(code)) return [false, line];
-  const [hit, next] = keyQuoted(code, target);
-  return [hit, next + note];
+  const one = YAML_ONE_LINE.exec(code);
+  if (!one) return [false, line];
+  const [hit, next] = keyQuoted(one[1], target);
+  return [hit, next + code.slice(one[1].length) + note];
 }
+
+// Only as far as the address: what follows it is not where the entry connects to.
+const YAML_ONE_LINE = new RegExp(`^(\\s*["']?[Pp]inako["']?\\s*:\\s*\\{\\s*["']?url["']?\\s*:\\s*(?:"${ADDRESS}"|'${ADDRESS}'))\\s*[,}]`);
 
 const YAML_VALUE = new RegExp(`^(\\s*(?:-\\s*)?(?:["']?url["']?\\s*:\\s*)?)(["']?)(${ADDRESS})\\2(\\s*)$`);
 

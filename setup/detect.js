@@ -258,7 +258,7 @@ export function claudeDesktopFiles(client) {
   const classic = client.configPath;
   if (process.platform !== 'win32') return [classic];
   const local = process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local');
-  const named = (dir, rest) => listDir(dir).filter(n => /^claude_/i.test(n)).map(n => path.join(dir, n, ...rest));
+  const named = (dir, rest) => listDir(dir).filter(n => /(^|\.)claude_/i.test(n)).map(n => path.join(dir, n, ...rest));
   const inUse = (dir) => pathExists(dir) && !listDir(dir).some(n => n.startsWith('.user-data-left'));
   const settings = (dirs) => dirs.filter(inUse).map(d => path.join(d, 'claude_desktop_config.json'));
   const moved = settings(named(path.join(local, 'Claude-Data'), []));

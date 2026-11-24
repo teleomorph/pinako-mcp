@@ -270,6 +270,10 @@ pub fn toml_string_lines(text: &str) -> Vec<bool> {
                 Some(q) if rest.starts_with(q) => {
                     open = None;
                     step = q.len();
+                    // Up to two more quotes right here are the string's own last characters.
+                    if q.len() == 3 {
+                        step += rest[step..].bytes().take(2).take_while(|b| *b == q.as_bytes()[0]).count();
+                    }
                 }
                 Some(_) => {}
             }
@@ -389,11 +393,13 @@ fn key_yaml(line: &str, target: Option<&Target>) -> (bool, String) {
         let now = target.map_or_else(|| c[3].to_string(), |t| with_key(&c[3], t));
         return (true, format!("{}{}{now}{}{}{note}", &c[1], &c[2], &c[4], &c[5]));
     }
-    if !re!(r#"^\s*["']?[Pp]inako["']?\s*:\s*\{\s*["']?url["']?\s*:"#).is_match(code) {
+    // Only as far as the address: what follows it is not where the entry connects to.
+    let one = re!(concat!(r#"^(\s*["']?[Pp]inako["']?\s*:\s*\{\s*["']?url["']?\s*:\s*(?:""#, address!(), r#""|'"#, address!(), r#"'))\s*[,}]"#));
+    let Some(head) = one.captures(code).and_then(|c| c.get(1)).map(|m| m.end()) else {
         return (false, line.to_string());
-    }
-    let (hit, next) = key_quoted(code, target);
-    (hit, next + note)
+    };
+    let (hit, next) = key_quoted(&code[..head], target);
+    (hit, next + &code[head..] + note)
 }
 
 /// Continue's file is ours alone: any line of it that gives the address counts.
