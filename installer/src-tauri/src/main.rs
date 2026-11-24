@@ -109,6 +109,11 @@ static SERVICE_BINARY: &[u8] = include_bytes!("../../../dist/pinako-mcp-service-
 // ── Platform paths ────────────────────────────────────────────────────────────
 
 fn home() -> PathBuf {
+    // On Windows the AI apps (and setup/paths.js) go by USERPROFILE; dirs does not.
+    #[cfg(target_os = "windows")]
+    if let Some(p) = std::env::var_os("USERPROFILE").map(PathBuf::from).filter(|p| p.is_absolute() && p.is_dir()) {
+        return p;
+    }
     dirs::home_dir().expect("could not determine home directory")
 }
 
