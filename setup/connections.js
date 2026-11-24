@@ -35,10 +35,16 @@ function findUrl(s, from = 0) {
   for (const host of HOSTS) {
     for (let at = s.indexOf(host, from); at !== -1; at = s.indexOf(host, at + 1)) {
       if (best && at >= best[0]) break;
-      let end = at + host.length;
+      // Part of some other address (https://elsewhere/?to=http://127...).
+      if (at > 0 && !/[\s"'`]/.test(s[at - 1])) continue;
+      let end = at + host.length, open = 0;
       // Another port (374210) or a name that only starts like ours.
       if (end < s.length && !'/?'.includes(s[end]) && !isUrlEnd(s[end])) continue;
-      while (end < s.length && !isUrlEnd(s[end])) end++;
+      for (; end < s.length; end++) {
+        if (s[end] === '{') open++;
+        else if (s[end] === '}' && open) open--; // the end of a ${NAME}, not of the address
+        else if (isUrlEnd(s[end])) break;
+      }
       best = [at, end];
       break;
     }
@@ -48,12 +54,26 @@ function findUrl(s, from = 0) {
 
 const hasUrl = (s) => typeof s === 'string' && findUrl(s) !== null;
 
-/** Every Bridge address in `s` made current. One that already carries the key is left as written. */
-function swapUrls(s, target) {
+/**
+ * One Bridge address with the current key. Only the key changes: the path may
+ * pick a tool profile, and the host spelling is the person's. One that takes the
+ * key from their own ${NAME} is left as written.
+ */
+function withKey(was, token) {
+  if (was.includes('${')) return was;
+  const cut = was.indexOf('?');
+  let base = cut === -1 ? was : was.slice(0, cut);
+  const rest = cut === -1 ? [] : was.slice(cut + 1).split('&').filter(p => p && !p.startsWith('token='));
+  if (HOSTS.includes(base)) base += '/mcp';
+  else if (HOSTS.includes(base.slice(0, -1))) base += 'mcp';
+  return `${base}?${[`token=${token}`, ...rest].join('&')}`;
+}
+
+/** Every Bridge address in `s` made current. */
+export function swapUrls(s, target) {
   let out = '', pos = 0;
   for (let hit = findUrl(s); hit; hit = findUrl(s, hit[1])) {
-    const was = s.slice(hit[0], hit[1]);
-    out += s.slice(pos, hit[0]) + (was.includes(`token=${target.token}`) ? was : target.url);
+    out += s.slice(pos, hit[0]) + withKey(s.slice(hit[0], hit[1]), target.token);
     pos = hit[1];
   }
   return out + s.slice(pos);
@@ -105,11 +125,18 @@ function refreshEntry(kind, e, target) {
   return { ...out, ...want };
 }
 
+/** JSON.parse, with every number written back exactly as it was. */
+export function parseJson(raw) {
+  return JSON.parse(raw, (key, value, context) =>
+    (typeof value === 'number' && context && JSON.rawJSON && String(value) !== context.source
+      ? JSON.rawJSON(context.source) : value));
+}
+
 function inspectJson(kind, text, target) {
   const raw = text.replace(/^﻿/, '');
   if (!raw.trim()) return { status: 'no', next: null };
   let root;
-  try { root = JSON.parse(raw); } catch {
+  try { root = parseJson(raw); } catch {
     return { status: mentions(raw) ? 'unreadable' : 'no', next: null };
   }
   let found = false, changed = false;
@@ -141,8 +168,8 @@ function inspectJson(kind, text, target) {
 
 /** The name parts of a `[table]` line, or null. Quotes, spaces and a trailing comment allowed. */
 export function tomlHeader(line) {
-  const m = /^\s*\[\[?\s*((?:"[^"]*"|'[^']*'|[A-Za-z0-9_-]+)(?:\s*\.\s*(?:"[^"]*"|'[^']*'|[A-Za-z0-9_-]+))*)\s*\]\]?\s*(?:#.*)?$/.exec(line.trimEnd());
-  return m ? m[1].match(/"[^"]*"|'[^']*'|[A-Za-z0-9_-]+/g).map(p => p.replace(/^["']|["']$/g, '')) : null;
+  const m = /^\s*\[\[?\s*((?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'.,=#[\]]+)(?:\s*\.\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'.,=#[\]]+))*)\s*\]\]?\s*(?:#.*)?$/.exec(line.trimEnd());
+  return m ? m[1].match(/"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'.,=#[\]]+/g).map(p => p.replace(/^["']|["']$/g, '')) : null;
 }
 
 const isOurTable = (h) => h.length === 2 && h[0] === 'mcp_servers' && OUR_KEYS.includes(h[1]);
@@ -154,9 +181,24 @@ export function tomlInlineEntry(text) {
     || /^\s*["']?mcp_servers["']?\s*=.*pinako/i.test(l));
 }
 
+/** A servers map written on one line: a table of ours cannot be added to it. */
+export function tomlInlineMap(text) {
+  return /^\s*["']?mcp_servers["']?\s*=/m.test(text);
+}
+
 function inspectToml(text, target) {
-  let inside = false, found = false;
+  let inside = false, found = false, quoted = null;
   const lines = text.split('\n').map(line => {
+    // Inside a multi-line string nothing is a table or an address of ours.
+    for (const q of ['"""', "'''"]) {
+      if (quoted && quoted !== q) continue;
+      const ends = line.split(q).length - 1;
+      if (quoted === q) {
+        if (ends % 2) quoted = null;
+        return line;
+      }
+      if (ends % 2) quoted = q;
+    }
     const header = tomlHeader(line);
     if (header) { inside = isOurTable(header); return line; }
     if (!inside || line.trim().startsWith('#') || !mentions(line)) return line;

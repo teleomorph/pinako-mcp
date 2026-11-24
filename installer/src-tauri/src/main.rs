@@ -4,7 +4,7 @@
 mod connections;
 mod replace;
 
-use connections::{inspect, is_our_entry, toml_header, toml_inline_entry, Inspected, Status, Target, LEGACY_SERVER_KEYS, SERVER_KEY};
+use connections::{inspect, is_our_entry, swap_urls, toml_header, toml_inline_entry, toml_inline_map, Inspected, Status, Target, LEGACY_SERVER_KEYS, SERVER_KEY};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -190,31 +190,46 @@ fn local_appdata() -> PathBuf {
     { home().join("Library").join("Application Support") }
 }
 
-/// Locate Claude Desktop's data directory when installed via MSIX (Microsoft Store).
-/// MSIX-packaged apps store data under %LOCALAPPDATA%\Packages\<family>\LocalCache\Roaming\Claude.
-/// std::path's exists() can fail for MSIX-virtualized paths even when the data is reachable,
-/// so detection falls back to checking the package directory directly.
-fn find_msix_claude_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        let packages = local_appdata().join("Packages");
-        if let Ok(entries) = std::fs::read_dir(&packages) {
-            for entry in entries.flatten() {
-                if let Ok(name) = entry.file_name().into_string() {
-                    if name.starts_with("Claude_") {
-                        return Some(packages.join(&name)
-                            .join("LocalCache").join("Roaming").join("Claude"));
-                    }
-                }
-            }
-        }
+/// Claude Desktop's settings files that are in use, the one it reads first.
+/// Windows: since 3.1623 (2026-10-20) everything but the Microsoft Store version
+/// lives in %LOCALAPPDATA%\Claude-Data\<package family>, and each home it moved
+/// out of holds a `.user-data-left.*` marker (and may hold a dead settings file).
+/// Before that: the package's own folder when there is one, else %APPDATA%\Claude.
+/// exists() can fail for a package's virtualized folder even when the data is
+/// reachable, so there only the marker rules a folder out.
+/// Mirrors claudeDesktopFiles() in setup/detect.js.
+fn claude_desktop_files(appdata: &Path) -> Vec<PathBuf> {
+    let file = |d: &Path| d.join("claude_desktop_config.json");
+    let classic = appdata.join("Claude");
+    if !cfg!(windows) {
+        return vec![file(&classic)];
     }
-    None
+    let names = |d: &Path| -> Vec<String> {
+        std::fs::read_dir(d).into_iter().flatten().flatten()
+            .filter_map(|e| e.file_name().into_string().ok()).collect()
+    };
+    let left = |d: &Path| names(d).iter().any(|n| n.starts_with(".user-data-left"));
+    let homes = |d: PathBuf| -> Vec<PathBuf> {
+        names(&d).into_iter().filter(|n| n.to_lowercase().starts_with("claude_")).map(|n| d.join(n)).collect()
+    };
+    let moved: Vec<PathBuf> = homes(local_appdata().join("Claude-Data")).iter()
+        .filter(|d| d.is_dir() && !left(d)).map(|d| file(d)).collect();
+    if !moved.is_empty() {
+        return moved;
+    }
+    let mut files: Vec<PathBuf> = homes(local_appdata().join("Packages")).into_iter()
+        .map(|d| d.join("LocalCache").join("Roaming").join("Claude"))
+        .filter(|d| !left(d)).map(|d| file(&d)).collect();
+    if files.is_empty() || (classic.exists() && !left(&classic)) {
+        files.push(file(&classic));
+    }
+    files
 }
 
 fn detect_claude_desktop(appdata: &Path) -> ClientInfo {
     let mut info = client("claude-desktop", "Claude Desktop", appdata.join("Claude"), None);
-    info.detected |= find_msix_claude_dir().is_some();
+    info.detected |= cfg!(windows) && claude_desktop_files(appdata).iter()
+        .any(|p| p.parent() != Some(appdata.join("Claude").as_path()));
     info
 }
 
@@ -232,14 +247,10 @@ fn client_files(id: &str) -> (Vec<(PathBuf, String)>, bool) {
     };
     let mut first = false;
     let paths: Vec<PathBuf> = match id {
-        // settings.json: where installers before 2026-07-23 wrote, and Claude
-        // Code never looked. A later install clears it, so an entry there is a
-        // connection the person asked for and never got.
-        "claude-code" => vec![h.join(".claude.json"), h.join(".claude").join("settings.json")],
+        "claude-code" => vec![h.join(".claude.json")],
         "claude-desktop" => {
             first = true;
-            find_msix_claude_dir().into_iter().chain([a.join("Claude")])
-                .map(|d| d.join("claude_desktop_config.json")).collect()
+            claude_desktop_files(&a)
         }
         "cursor" => vec![h.join(".cursor").join("mcp.json")],
         "windsurf" => vec![h.join(".codeium").join("windsurf").join("mcp_config.json")],
@@ -263,8 +274,12 @@ fn client_files(id: &str) -> (Vec<(PathBuf, String)>, bool) {
         "continue" => {
             first = true;
             let dir = h.join(".continue");
-            return (vec![(dir.join("mcpServers").join("pinako.yaml"), "continue".into()),
-                         (dir.join("config.json"), "continue-json".into())], first);
+            let mut files = vec![(dir.join("mcpServers").join("pinako.yaml"), "continue".to_string())];
+            // Continue ignores the old config.json once it has a config.yaml.
+            if !dir.join("config.yaml").exists() {
+                files.push((dir.join("config.json"), "continue-json".into()));
+            }
+            return (files, first);
         }
         "codex" => vec![h.join(".codex").join("config.toml")],
         "grok" => vec![grok_home().join("config.toml")],
@@ -296,7 +311,7 @@ fn inspect_file(path: &Path, kind: &str, target: Option<&Target>) -> Option<Insp
 }
 
 struct ClientState {
-    /// The files that hold our entry.
+    /// The files it reads that hold our entry.
     ours: Vec<(PathBuf, String)>,
     connected: Status,
     unreadable: bool,
@@ -304,16 +319,18 @@ struct ClientState {
 
 fn inspect_client(id: &str, target: Option<&Target>) -> ClientState {
     let (files, first) = client_files(id);
-    let seen: Vec<_> = files.into_iter()
+    let mut live: Vec<_> = files.into_iter()
         .filter_map(|(p, k)| inspect_file(&p, &k, target).map(|r| (p, k, r.status)))
         .collect();
-    let live = if first { &seen[..seen.len().min(1)] } else { &seen[..] };
+    if first {
+        live.truncate(1);
+    }
     let unreadable = live.iter().any(|f| f.2 == Status::Unreadable);
     let connected = if live.iter().any(|f| f.2 == Status::Yes) { Status::Yes }
         else if unreadable { Status::Unreadable }
         else { Status::No };
     ClientState {
-        ours: seen.into_iter().filter(|f| f.2 == Status::Yes).map(|f| (f.0, f.1)).collect(),
+        ours: live.into_iter().filter(|f| f.2 == Status::Yes).map(|f| (f.0, f.1)).collect(),
         connected,
         unreadable,
     }
@@ -327,7 +344,6 @@ fn refresh_clients(log: &mut Vec<String>, service_path: &Path) {
     let url = mcp_url_get();
     // Without the access key a working entry is left as it was.
     let target = url.split_once("?token=").map(|(_, token)| Target {
-        url: url.clone(),
         token: token.to_string(),
         service: service_path.to_string_lossy().into_owned(),
     });
@@ -361,17 +377,7 @@ fn refresh_clients(log: &mut Vec<String>, service_path: &Path) {
 
 fn refresh_file(id: &str, path: &Path, kind: &str, target: &Target) -> Result<(), String> {
     if id == "claude-code" {
-        let h = home();
-        let real = h.join(".claude.json");
-        if path != real {
-            // The file Claude Code ignores: put the entry where it looks, once.
-            return match inspect_file(&real, id, None).map(|r| r.status) {
-                Some(Status::Unreadable) => Err(format!("{} could not be read", real.display())),
-                Some(Status::Yes) => { prune_stale_claude_settings_entry(&h); Ok(()) }
-                _ => configure_claude_code(&h),
-            };
-        }
-        refresh_via_claude_cli(&real, target)?;
+        refresh_via_claude_cli(path, target)?;
     }
     // Read again: the app may have saved since the first look.
     match inspect_file(path, kind, Some(target)) {
@@ -390,11 +396,12 @@ fn refresh_via_claude_cli(path: &Path, target: &Target) -> Result<(), String> {
         let entry = &cfg["mcpServers"][*key];
         let Some(e) = entry.as_object().filter(|_| is_our_entry(entry)) else { continue };
         let url = e.get("url").and_then(|u| u.as_str()).unwrap_or("");
-        if e.keys().any(|k| k != "type" && k != "url") || url.contains(&format!("token={}", target.token)) {
+        let now_url = swap_urls(url, target);
+        if e.keys().any(|k| k != "type" && k != "url") || (now_url == url && entry["type"] == "http") {
             continue;
         }
         run_claude_cli(&["mcp", "remove", key, "--scope", "user"]);
-        if run_claude_cli(&["mcp", "add", "--scope", "user", "--transport", "http", key, &target.url]) {
+        if run_claude_cli(&["mcp", "add", "--scope", "user", "--transport", "http", key, &now_url]) {
             continue;
         }
         let mut now = read_json(path)?;
@@ -402,7 +409,7 @@ fn refresh_via_claude_cli(path: &Path, target: &Target) -> Result<(), String> {
             continue;
         }
         ensure_obj(&mut now, "mcpServers");
-        now["mcpServers"][*key] = serde_json::json!({ "type": "http", "url": target.url });
+        now["mcpServers"][*key] = serde_json::json!({ "type": "http", "url": now_url });
         write_json(path, &now)?;
     }
     Ok(())
@@ -614,6 +621,10 @@ fn install(update: bool, selected_ids: Vec<String>) -> Result<Vec<String>, Insta
 #[tauri::command]
 fn connect(selected_ids: Vec<String>) -> Vec<String> {
     let mut log = Vec::new();
+    if mcp_url_is_tokenless(&mcp_url_get()) {
+        // Without the key the apps would look connected and get nothing.
+        return vec!["⚠  No apps were connected: the access key could not be read.".into()];
+    }
     connect_clients(&selected_ids, &mut log, &pinako_dir().join(service_binary_name()));
     log
 }
@@ -990,26 +1001,10 @@ fn configure_client(id: &str, home: &Path, appdata: &Path) -> Result<(), String>
     match id {
         "claude-code" => configure_claude_code(home),
         "claude-desktop" => {
-            let mut errs: Vec<String> = Vec::new();
-            let mut wrote = false;
-
-            // Traditional installer location (used by Anthropic's standalone .exe install)
-            let trad = appdata.join("Claude").join("claude_desktop_config.json");
-            match write_claude_desktop_config(&trad) {
-                Ok(()) => wrote = true,
-                Err(e) => errs.push(format!("traditional: {e}")),
+            for path in claude_desktop_files(appdata) {
+                write_claude_desktop_config(&path)?;
             }
-
-            // MSIX (Microsoft Store) install also gets configured if present
-            if let Some(msix_dir) = find_msix_claude_dir() {
-                let msix = msix_dir.join("claude_desktop_config.json");
-                match write_claude_desktop_config(&msix) {
-                    Ok(()) => wrote = true,
-                    Err(e) => errs.push(format!("msix: {e}")),
-                }
-            }
-
-            if wrote { Ok(()) } else { Err(errs.join("; ")) }
+            Ok(())
         }
         "cursor" => {
             let path = home.join(".cursor").join("mcp.json");
@@ -1213,6 +1208,9 @@ fn upsert_pinako_toml_table(path: &Path, body_lines: &[&str]) -> Result<(), Stri
     let existing = read_settings(path)?.unwrap_or_default();
     if toml_inline_entry(&existing) {
         return Err(format!("{} already has a Pinako entry in a form this installer does not edit", path.display()));
+    }
+    if toml_inline_map(&existing) {
+        return Err(format!("{} lists its servers in a form this installer does not edit", path.display()));
     }
     let nl = if existing.contains("\r\n") { "\r\n" } else { "\n" };
     let table = pinako_table();

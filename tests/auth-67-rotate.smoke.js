@@ -18,7 +18,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'pinako-rot67-'));
+// Every root the writers look under: a missed one is the REAL app settings.
 process.env.APPDATA = DATA_DIR;
+process.env.LOCALAPPDATA = DATA_DIR;
+for (const v of ['GROK_HOME', 'KIMI_CODE_HOME', 'OPENCLAW_STATE_DIR', 'HERMES_HOME']) delete process.env[v];
 process.env.HOME = DATA_DIR;
 process.env.USERPROFILE = DATA_DIR;
 

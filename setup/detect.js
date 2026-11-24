@@ -248,6 +248,26 @@ function listDir(dir) {
 }
 
 /**
+ * Claude Desktop's settings files that are in use, the one it reads first.
+ * Windows: since 3.1623 (2026-10-20) everything but the Microsoft Store version
+ * lives in %LOCALAPPDATA%\\Claude-Data\\<package family>, and each home it moved
+ * out of holds a `.user-data-left.*` marker (and may hold a dead settings file).
+ * Before that: the package's own folder when there is one, else %APPDATA%\\Claude.
+ */
+export function claudeDesktopFiles(client) {
+  const classic = client.configPath;
+  if (process.platform !== 'win32') return [classic];
+  const local = process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local');
+  const named = (dir, rest) => listDir(dir).filter(n => /^claude_/i.test(n)).map(n => path.join(dir, n, ...rest));
+  const inUse = (dir) => pathExists(dir) && !listDir(dir).some(n => n.startsWith('.user-data-left'));
+  const settings = (dirs) => dirs.filter(inUse).map(d => path.join(d, 'claude_desktop_config.json'));
+  const moved = settings(named(path.join(local, 'Claude-Data'), []));
+  if (moved.length) return moved;
+  const store = settings(named(path.join(local, 'Packages'), ['LocalCache', 'Roaming', 'Claude']));
+  return [...store, ...(inUse(path.dirname(classic)) || !store.length ? [classic] : [])];
+}
+
+/**
  * Every settings file that may hold our entry for this client, in the order the
  * app prefers them. With `first`, only the first one that exists is what the app
  * reads; the others are older homes of the same settings.
@@ -255,26 +275,17 @@ function listDir(dir) {
 export function clientFiles(client) {
   const file = (p, kind = client.id) => ({ path: p, kind });
   switch (client.id) {
-    case 'claude-code':
-      // settings.json: where installers before 2026-07-23 wrote, and Claude
-      // Code never looked. A later install clears it, so an entry there is a
-      // connection the person asked for and never got.
-      return { files: [file(client.configPath), file(path.join(HOME, '.claude', 'settings.json'))], first: false };
-    case 'claude-desktop': {
-      const packages = path.join(process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local'), 'Packages');
-      const store = process.platform === 'win32' ? listDir(packages).filter(n => n.startsWith('Claude_')) : [];
-      return {
-        files: [
-          ...store.map(n => file(path.join(packages, n, 'LocalCache', 'Roaming', 'Claude', 'claude_desktop_config.json'))),
-          file(client.configPath),
-        ],
-        first: true,
-      };
-    }
+    case 'claude-desktop':
+      return { files: claudeDesktopFiles(client).map(p => file(p)), first: true };
     case 'antigravity':
       return { files: [file(client.configPath), file(path.join(HOME, '.gemini', 'antigravity', 'mcp_config.json'))], first: true };
     case 'continue':
-      return { files: [file(client.configPath), file(path.join(HOME, '.continue', 'config.json'), 'continue-json')], first: true };
+      // Continue ignores the old config.json once it has a config.yaml.
+      return {
+        files: [file(client.configPath), ...(pathExists(path.join(HOME, '.continue', 'config.yaml')) ? []
+          : [file(path.join(HOME, '.continue', 'config.json'), 'continue-json')])],
+        first: true,
+      };
     case 'cline':
       return {
         files: [file(client.configPath), file(path.join(HOME, '.cline', 'data', 'settings', 'cline_mcp_settings.json'))],
@@ -318,14 +329,14 @@ export function inspectFile({ path: p, kind }, target = null) {
   }
 }
 
-/** The files of one client that exist, each with its status, and the app's own standing. */
+/** The files of one client that it reads, each with its status, and the app's own standing. */
 export function inspectClient(client, target = null) {
   const { files, first } = clientFiles(client);
-  const seen = files.map(f => ({ ...f, ...inspectFile(f, target) })).filter(f => f.exists);
-  const live = first ? seen.slice(0, 1) : seen;
+  let live = files.map(f => ({ ...f, ...inspectFile(f, target) })).filter(f => f.exists);
+  if (first) live = live.slice(0, 1);
   const unreadable = live.some(f => f.status === 'unreadable');
   const connected = live.some(f => f.status === 'yes') ? 'yes' : unreadable ? 'unreadable' : 'no';
-  return { seen, connected, unreadable };
+  return { live, connected, unreadable };
 }
 
 /**
@@ -335,7 +346,8 @@ export function inspectClient(client, target = null) {
 export function detectClients() {
   return CLIENTS.map(client => ({
     ...client,
-    found: pathExists(client.detectPath),
+    found: pathExists(client.detectPath)
+      || (client.id === 'claude-desktop' && claudeDesktopFiles(client).some(p => pathExists(path.dirname(p)))),
     connected: inspectClient(client).connected,
   }));
 }

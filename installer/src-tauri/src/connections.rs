@@ -24,7 +24,6 @@ const SERVICE_NAME: &str = "pinako-mcp-service";
 
 /// What a refreshed entry should carry.
 pub struct Target {
-    pub url: String,
     pub token: String,
     pub service: String,
 }
@@ -73,12 +72,22 @@ fn find_url(s: &str, from: usize) -> Option<(usize, usize)> {
                 break;
             }
             let end = at + host.len();
+            // Part of some other address (https://elsewhere/?to=http://127...).
+            if s[..at].chars().next_back().is_some_and(|c| !c.is_whitespace() && !"\"'`".contains(c)) {
+                pos = end;
+                continue;
+            }
             // Another port (374210) or a name that only starts like ours.
             if s[end..].chars().next().is_some_and(|c| c != '/' && c != '?' && !is_url_end(c)) {
                 pos = end;
                 continue;
             }
-            let stop = s[end..].find(is_url_end).map_or(s.len(), |n| end + n);
+            let mut open = 0;
+            let stop = s[end..].char_indices().find(|(_, c)| match c {
+                '{' => { open += 1; false }
+                '}' if open > 0 => { open -= 1; false } // the end of a ${NAME}, not of the address
+                c => is_url_end(*c),
+            }).map_or(s.len(), |(n, _)| end + n);
             best = Some((at, stop));
             break;
         }
@@ -90,15 +99,34 @@ fn has_url(s: &str) -> bool {
     find_url(s, 0).is_some()
 }
 
-/// Every Bridge address in `s` made current. One that already carries the key is left as written.
-fn swap_urls(s: &str, t: &Target) -> String {
+/// One Bridge address with the current key. Only the key changes: the path may
+/// pick a tool profile, and the host spelling is the person's. One that takes the
+/// key from their own ${NAME} is left as written.
+fn with_key(was: &str, token: &str) -> String {
+    if was.contains("${") {
+        return was.to_string();
+    }
+    let (base, query) = was.split_once('?').unwrap_or((was, ""));
+    let path = match base {
+        b if HOSTS.contains(&b) => "/mcp",
+        b if b.strip_suffix('/').is_some_and(|h| HOSTS.contains(&h)) => "mcp",
+        _ => "",
+    };
+    let mut out = format!("{base}{path}?token={token}");
+    for p in query.split('&').filter(|p| !p.is_empty() && !p.starts_with("token=")) {
+        out.push('&');
+        out.push_str(p);
+    }
+    out
+}
+
+/// Every Bridge address in `s` made current.
+pub fn swap_urls(s: &str, t: &Target) -> String {
     let mut out = String::new();
     let mut pos = 0;
-    let key = format!("token={}", t.token);
     while let Some((at, end)) = find_url(s, pos) {
         out.push_str(&s[pos..at]);
-        let was = &s[at..end];
-        out.push_str(if was.contains(&key) { was } else { &t.url });
+        out.push_str(&with_key(&s[at..end], &t.token));
         pos = end;
     }
     out.push_str(&s[pos..]);
@@ -232,8 +260,8 @@ fn inspect_json(kind: &str, text: &str, target: Option<&Target>) -> Inspected {
 
 /// The name parts of a `[table]` line. Quotes, spaces and a trailing comment allowed.
 pub fn toml_header(line: &str) -> Option<Vec<String>> {
-    let whole = re!(r#"^\s*\[\[?\s*((?:"[^"]*"|'[^']*'|[A-Za-z0-9_-]+)(?:\s*\.\s*(?:"[^"]*"|'[^']*'|[A-Za-z0-9_-]+))*)\s*\]\]?\s*(?:#.*)?$"#);
-    let part = re!(r#""[^"]*"|'[^']*'|[A-Za-z0-9_-]+"#);
+    let whole = re!(r#"^\s*\[\[?\s*((?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'.,=#\[\]]+)(?:\s*\.\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'.,=#\[\]]+))*)\s*\]\]?\s*(?:#.*)?$"#);
+    let part = re!(r#""(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'.,=#\[\]]+"#);
     let name = whole.captures(line)?.get(1)?.as_str().to_string();
     Some(part.find_iter(&name)
         .map(|p| p.as_str().trim_matches(|c| c == '"' || c == '\'').to_string())
@@ -251,10 +279,28 @@ pub fn toml_inline_entry(text: &str) -> bool {
     text.lines().any(|l| dotted.is_match(l) || inline.is_match(l))
 }
 
+/// A servers map written on one line: a table of ours cannot be added to it.
+pub fn toml_inline_map(text: &str) -> bool {
+    re!(r#"(?m)^\s*["']?mcp_servers["']?\s*="#).is_match(text)
+}
+
 fn inspect_toml(text: &str, target: Option<&Target>) -> Inspected {
     let mut inside = false;
     let mut found = false;
+    let mut quoted: Option<&str> = None;
     let lines: Vec<String> = text.split('\n').map(|line| {
+        // Inside a multi-line string nothing is a table or an address of ours.
+        for q in ["\"\"\"", "'''"] {
+            if quoted.is_some_and(|open| open != q) {
+                continue;
+            }
+            let odd = line.matches(q).count() % 2 == 1;
+            if quoted.is_some() {
+                if odd { quoted = None; }
+                return line.to_string();
+            }
+            if odd { quoted = Some(q); }
+        }
         if let Some(h) = toml_header(line) {
             inside = is_our_table(&h);
             return line.to_string();
@@ -344,7 +390,6 @@ mod tests {
         let cases: Value = serde_json::from_str(include_str!("../../../tests/connections-cases.json")).unwrap();
         let t = &cases["target"];
         let target = Target {
-            url: t["url"].as_str().unwrap().into(),
             token: t["token"].as_str().unwrap().into(),
             service: t["service"].as_str().unwrap().into(),
         };

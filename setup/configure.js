@@ -11,8 +11,10 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { HOME, APPDATA, SERVICE_PATH } from './paths.js';
 import { buildMcpUrl, readToken } from './token.js';
-import { CLIENTS, inspectClient, inspectFile, readSettings } from './detect.js';
-import { SERVER_KEY, LEGACY_SERVER_KEYS, isOurEntry, tomlHeader, tomlInlineEntry } from './connections.js';
+import { CLIENTS, claudeDesktopFiles, inspectClient, inspectFile, readSettings } from './detect.js';
+import {
+  SERVER_KEY, LEGACY_SERVER_KEYS, isOurEntry, parseJson, swapUrls, tomlHeader, tomlInlineEntry, tomlInlineMap,
+} from './connections.js';
 
 // ai-todo #67: the URL carries the machine-local access token.
 //
@@ -125,7 +127,7 @@ function readJson(filePath) {
   if (!raw.trim()) return {};
   let value;
   try {
-    value = JSON.parse(raw);
+    value = parseJson(raw);
   } catch (e) {
     throw new Error(`${filePath} exists but is not valid JSON (${e.message}) — refusing to overwrite it`);
   }
@@ -174,6 +176,9 @@ function upsertPinakoTomlTable(configPath, bodyLines) {
   const existing = readSettings(configPath) ?? '';
   if (tomlInlineEntry(existing)) {
     throw new Error(`${configPath} already has a Pinako entry in a form this installer does not edit`);
+  }
+  if (tomlInlineMap(existing)) {
+    throw new Error(`${configPath} lists its servers in a form this installer does not edit`);
   }
   const nl = /\r\n/.test(existing) ? '\r\n' : '\n';
   let stripped = existing;
@@ -377,17 +382,19 @@ const writers = {
   },
 
   'claude-desktop'(configPath) {
-    const config = readJson(configPath);
-    config.mcpServers = config.mcpServers || {};
-    // Claude Desktop only supports stdio MCP servers (command + args).
-    // Use the bundled pinako-mcp-service binary in --stdio-mcp mode as a
-    // self-contained stdio↔HTTP bridge — no Node.js dependency on the
-    // end user's machine.
-    putServerEntry(config.mcpServers, {
-      command: SERVICE_PATH,
-      args: ['--stdio-mcp', MCP_URL],
-    });
-    writeJson(configPath, config);
+    for (const p of claudeDesktopFiles({ configPath })) {
+      const config = readJson(p);
+      config.mcpServers = config.mcpServers || {};
+      // Claude Desktop only supports stdio MCP servers (command + args).
+      // Use the bundled pinako-mcp-service binary in --stdio-mcp mode as a
+      // self-contained stdio↔HTTP bridge — no Node.js dependency on the
+      // end user's machine.
+      putServerEntry(config.mcpServers, {
+        command: SERVICE_PATH,
+        args: ['--stdio-mcp', MCP_URL],
+      });
+      writeJson(p, config);
+    }
   },
 
   'cursor'(configPath) {
@@ -612,9 +619,9 @@ export function refreshClients() {
   const target = token && url.includes(`token=${token}`) ? { url, token, service: SERVICE_PATH } : null;
   const results = [];
   for (const client of CLIENTS) {
-    const { seen, connected, unreadable } = inspectClient(client, target);
+    const { live, connected, unreadable } = inspectClient(client, target);
     let error = null;
-    for (const f of target ? seen.filter(x => x.status === 'yes') : []) {
+    for (const f of target ? live.filter(x => x.status === 'yes') : []) {
       try { refreshFile(client, f, target); } catch (e) { error = e.message; }
     }
     if (error) results.push({ client, status: 'failed', error });
@@ -625,17 +632,7 @@ export function refreshClients() {
 }
 
 function refreshFile(client, f, target) {
-  if (client.id === 'claude-code') {
-    if (f.path === CLAUDE_SETTINGS_PATH) {
-      // The file Claude Code ignores: put the entry where it looks, once.
-      const real = inspectFile({ path: CLAUDE_JSON_PATH, kind: client.id }).status;
-      if (real === 'unreadable') throw new Error(`${CLAUDE_JSON_PATH} could not be read`);
-      if (real === 'no') writers['claude-code']();
-      else pruneStaleClaudeSettingsEntry();
-      return;
-    }
-    refreshViaClaudeCli(target);
-  }
+  if (client.id === 'claude-code') refreshViaClaudeCli(target);
   // Read again: the app may have saved since the first look.
   const now = inspectFile(f, target);
   if (now.status === 'unreadable') throw new Error(`${f.path} could not be read`);
@@ -650,12 +647,13 @@ function refreshViaClaudeCli(target) {
   for (const key of [SERVER_KEY, ...LEGACY_SERVER_KEYS]) {
     const e = servers[key];
     if (!isOurEntry(e) || Object.keys(e).some(k => k !== 'type' && k !== 'url')) continue;
-    if (String(e.url).includes(`token=${target.token}`)) continue;
+    const url = swapUrls(String(e.url), target);
+    if (url === e.url && e.type === 'http') continue;
     runClaudeCli(['mcp', 'remove', key, '--scope', 'user']);
-    if (runClaudeCli(['mcp', 'add', '--scope', 'user', '--transport', 'http', key, target.url])) continue;
+    if (runClaudeCli(['mcp', 'add', '--scope', 'user', '--transport', 'http', key, url])) continue;
     const config = readJson(CLAUDE_JSON_PATH);
     if (config.mcpServers?.[key]) continue;
-    config.mcpServers = { ...config.mcpServers, [key]: { type: 'http', url: target.url } };
+    config.mcpServers = { ...config.mcpServers, [key]: { type: 'http', url } };
     writeJson(CLAUDE_JSON_PATH, config);
   }
 }

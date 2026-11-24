@@ -46,13 +46,15 @@ const windsurf = put(of('windsurf').configPath, { mcpServers: { other: { url: 'h
 const kimi = put(of('kimi-code').configPath, `{ "mcpServers": { "Pinako": { "url": "${old}" }, } }`);
 const codex = put(of('codex').configPath, `[mcp_servers.Pinako]\nurl = "${old}"\nenabled = false\n`);
 fs.mkdirSync(path.join(dir, '.grok'));
-const claude = put(of('claude-code').configPath, { big: 1, mcpServers: { Pinako: { type: 'http', url: old } } });
+const claude = put(of('claude-code').configPath, { big: 'BIG', mcpServers: { Pinako: { type: 'http', url: old } } });
+fs.writeFileSync(claude, fs.readFileSync(claude, 'utf8').replace('"BIG"', '9007199254740993'));
 const oldClaude = put(path.join(dir, '.claude', 'settings.json'), { keep: 1, mcpServers: { pinako: { type: 'http', url: old } } });
 const profile = put(path.join(APPDATA, 'Code', 'User', 'profiles', 'abc', 'mcp.json'), { servers: { Pinako: { type: 'http', url: old } } });
 // The store app's own file is the one it reads; the older home holds a leftover.
 const desk = of('claude-desktop');
 const deskOld = put(desk.configPath, { mcpServers: { Pinako: { command: 'pinako-mcp-service.exe', args: ['--stdio-mcp', old] } } });
-if (process.platform === 'win32') put(path.join(dir, 'local', 'Packages', 'Claude_x', 'LocalCache', 'Roaming', 'Claude', 'claude_desktop_config.json'), { mcpServers: {} });
+const storeDir = path.join(dir, 'local', 'Packages', 'Claude_x', 'LocalCache', 'Roaming', 'Claude');
+if (process.platform === 'win32') put(path.join(storeDir, 'claude_desktop_config.json'), { mcpServers: {} });
 put(path.join(dir, '.gemini', 'antigravity', 'mcp_config.json'), { mcpServers: { pinako: { serverUrl: old } } });
 
 const standing = () => Object.fromEntries(detectClients().map(c => [c.id, c.connected]));
@@ -76,14 +78,33 @@ assert.ok(!('windsurf' in report) && !('grok' in report) && !('gemini-cli' in re
 for (const [p, text] of kept) assert.equal(fs.readFileSync(p, 'utf8'), text, p);
 assert.ok(!fs.existsSync(path.join(dir, '.grok', 'config.toml')), 'connected an app that was left out');
 assert.ok(!fs.existsSync(of('antigravity').configPath), 'made a settings file that was not there');
-for (const p of [cursor, codex, claude, profile, deskOld]) assert.ok(fs.readFileSync(p, 'utf8').includes(token), p);
+for (const p of [cursor, codex, claude, profile]) assert.ok(fs.readFileSync(p, 'utf8').includes(token), p);
 assert.match(fs.readFileSync(codex, 'utf8'), /enabled = false/);
-assert.equal(JSON.parse(fs.readFileSync(claude, 'utf8')).big, 1);
-assert.deepEqual(JSON.parse(fs.readFileSync(oldClaude, 'utf8')), { keep: 1 });
+assert.match(fs.readFileSync(claude, 'utf8'), /"big": 9007199254740993,/);
+// The file Claude Code never read is no connection: left as it is.
+assert.ok(!fs.readFileSync(oldClaude, 'utf8').includes(token));
+// A leftover in an older home of an app that is not connected gets no key.
+if (process.platform === 'win32') assert.ok(!fs.readFileSync(deskOld, 'utf8').includes(token));
 // A second update has nothing to write.
 const stamps = [cursor, codex, claude, profile].map(p => fs.statSync(p).mtimeMs);
 refreshClients();
 assert.deepEqual([cursor, codex, claude, profile].map(p => fs.statSync(p).mtimeMs), stamps);
+
+// Claude Desktop moved out of both old homes: only its new one counts.
+if (process.platform === 'win32') {
+  put(path.join(storeDir, '.user-data-left.claude_x'), '');
+  put(path.join(path.dirname(deskOld), '.user-data-left.claude_x'), '');
+  const moved = put(path.join(dir, 'local', 'Claude-Data', 'claude_x', 'claude_desktop_config.json'), { keep: 1 });
+  assert.equal(standing()['claude-desktop'], 'no');
+  const dead = fs.readFileSync(deskOld, 'utf8');
+  put(deskOld, dead.replace(token, 'OLD'));
+  assert.ok(!refreshClients().some(r => r.client.id === 'claude-desktop'));
+  assert.equal(configureClient(desk).ok, true);
+  assert.equal(standing()['claude-desktop'], 'yes');
+  assert.equal(JSON.parse(fs.readFileSync(moved, 'utf8')).keep, 1);
+  assert.ok(fs.readFileSync(moved, 'utf8').includes(token));
+  assert.ok(!fs.readFileSync(deskOld, 'utf8').includes(token), 'wrote to a home the app left');
+}
 
 // No access key: a working entry is not traded for one without it.
 fs.rmSync(TOKEN_PATH);
@@ -91,6 +112,10 @@ fs.mkdirSync(TOKEN_PATH);
 assert.equal(refreshClients().find(r => r.client.id === 'cursor').status, 'nokey');
 assert.ok(fs.readFileSync(cursor, 'utf8').includes(token));
 fs.rmdirSync(TOKEN_PATH);
+
+// A servers map on one line cannot take a table: refused, not broken.
+fs.writeFileSync(codex, 'mcp_servers = { other = { url = "http://x" } }\n');
+assert.equal(configureClient(of('codex')).ok, false);
 
 // Connecting never replaces settings it cannot read.
 assert.equal(configureClient(of('kimi-code')).ok, false);
